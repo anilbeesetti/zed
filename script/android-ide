@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repository=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+build_profile=debug
+build=true
+profile="$repository/target/android-ide/profile"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --release) build_profile=release; shift ;;
+        --skip-build) build=false; shift ;;
+        --profile)
+            [[ $# -ge 2 && -n "$2" ]] || { echo "--profile requires a directory" >&2; exit 2; }
+            profile=$2
+            shift 2
+            ;;
+        --help|-h)
+            cat <<'USAGE'
+Usage: script/android-ide [--release] [--skip-build] [--profile DIR] [--] [PATH ...]
+
+Build and run the Android IDE development app on macOS. Paths are resolved from
+your current directory. Settings and extensions use target/android-ide/profile
+unless --profile is supplied. Existing profile settings are preserved.
+
+Prerequisites: the repository's Rust toolchain, Xcode with Metal tools, Android
+CLI, Android SDK, and a Gradle-compatible JDK. Kotlin setup additionally needs
+JDK 21. The Android Studio runtime is used for Gradle when JAVA_HOME is unset.
+
+The launcher honors CARGO_TARGET_DIR and LK_CUSTOM_WEBRTC. Set CARGO_BUILD_JOBS
+to limit build concurrency. Quit this development app before rebuilding it.
+USAGE
+            exit 0
+            ;;
+        --) shift; break ;;
+        -*) echo "Unknown launcher option: $1" >&2; exit 2 ;;
+        *) break ;;
+    esac
+done
+
+[[ $(uname -s) == Darwin ]] || { echo "This development launcher currently supports macOS." >&2; exit 1; }
+case "$profile" in /*) ;; *) profile="$PWD/$profile" ;; esac
+target_directory=${CARGO_TARGET_DIR:-"$repository/target"}
+case "$target_directory" in /*) ;; *) target_directory="$PWD/$target_directory" ;; esac
+export CARGO_TARGET_DIR="$target_directory"
+
+bundle="$repository/target/android-ide/$build_profile/Android IDE Dev.app"
+executable="$bundle/Contents/MacOS/zed"
+if ps -axo command= | /usr/bin/grep -F "$executable" | /usr/bin/grep -v '[g]rep' >/dev/null; then
+    echo "Quit the $build_profile Android IDE Dev app before running this launcher again." >&2
+    exit 1
+fi
+
+if $build; then
+    arguments=(build --locked -p zed --bin zed)
+    if [[ $build_profile == release ]]; then arguments+=(--release); fi
+    (cd "$repository" && cargo "${arguments[@]}")
+fi
+binary="$target_directory/$build_profile/zed"
+[[ -x "$binary" ]] || { echo "Missing $binary; run again without --skip-build." >&2; exit 1; }
+
+mkdir -p "$bundle/Contents/MacOS" "$profile/config"
+cat > "$bundle/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>dev.zed.android-ide-$build_profile</string>
+<key>CFBundleName</key><string>Android IDE Dev</string>
+<key>CFBundleExecutable</key><string>zed</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+<key>CFBundleVersion</key><string>0.1</string>
+<key>NSHighResolutionCapable</key><true/>
+</dict></plist>
+PLIST
+# A real executable keeps macOS app discovery attached to this bundle.
+cp -c "$binary" "$executable" || cp "$binary" "$executable"
+
+if [[ ! -e "$profile/config/settings.json" ]]; then
+    cat > "$profile/config/settings.json" <<'SETTINGS'
+{
+  "auto_update": false,
+  "telemetry": { "diagnostics": false, "metrics": false },
+  "auto_install_extensions": { "kotlin": true },
+  "languages": { "Kotlin": { "language_servers": ["kotlin-language-server"] } }
+}
+SETTINGS
+fi
+
+studio_java="/Applications/Android Studio.app/Contents/jbr/Contents/Home"
+if [[ -z ${JAVA_HOME:-} && -x "$studio_java/bin/java" ]]; then
+    export JAVA_HOME="$studio_java"
+fi
+
+echo "App: $bundle"
+echo "Profile: $profile"
+exec "$executable" --user-data-dir "$profile" "$@"
