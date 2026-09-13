@@ -1,6 +1,6 @@
 use android_tools::{
-    AndroidTarget, Device, adb_path, android_cli_path, is_gradle_project, parse_devices,
-    parse_targets,
+    AndroidTarget, Device, adb_path, android_cli_path, emulator_path, is_gradle_project,
+    parse_devices, parse_emulators, parse_targets,
 };
 use anyhow::{Context as _, Result, bail, ensure};
 use db::kvp::KeyValueStore;
@@ -128,9 +128,10 @@ enum GradleOperation {
     Kotlin,
 }
 
-enum AfterBuild {
+enum AfterTask {
     Deploy(AndroidTarget, String),
     Kotlin(AndroidTarget),
+    RefreshDevices,
 }
 
 #[derive(RegisterSetting)]
@@ -163,6 +164,8 @@ pub struct AndroidPanel {
     targets: Vec<AndroidTarget>,
     selected_target: Option<AndroidTarget>,
     devices: Vec<Device>,
+    emulators: Vec<String>,
+    emulator_error: Option<String>,
     selected_serial: Option<String>,
     status: SharedString,
     error: Option<String>,
@@ -198,6 +201,8 @@ impl AndroidPanel {
             targets: Vec::new(),
             selected_target: None,
             devices: Vec::new(),
+            emulators: Vec::new(),
+            emulator_error: None,
             selected_serial: None,
             status: "Sync an Android project to discover its build variants.".into(),
             error: None,
@@ -418,23 +423,38 @@ impl AndroidPanel {
         self.refreshing_devices = true;
         let executor = cx.background_executor().clone();
         self.device_task = Some(cx.spawn(async move |panel, cx| {
-            let result = cx
+            let (devices, emulators) = cx
                 .background_spawn(async move {
-                    let output = tool_output(
-                        adb_path()?,
-                        vec!["devices".into(), "-l".into()],
-                        Path::new("."),
-                        &executor,
-                        Duration::from_secs(15),
+                    futures::join!(
+                        async {
+                            let output = tool_output(
+                                adb_path()?,
+                                vec!["devices".into(), "-l".into()],
+                                Path::new("."),
+                                &executor,
+                                Duration::from_secs(15),
+                            )
+                            .await?;
+                            parse_devices(&output)
+                        },
+                        async {
+                            let output = tool_output(
+                                emulator_path()?,
+                                vec!["-list-avds".into()],
+                                Path::new("."),
+                                &executor,
+                                Duration::from_secs(15),
+                            )
+                            .await?;
+                            parse_emulators(&output)
+                        }
                     )
-                    .await?;
-                    parse_devices(&output)
                 })
                 .await;
             panel
                 .update(cx, |panel, cx| {
                     panel.refreshing_devices = false;
-                    match result {
+                    match devices {
                         Ok(devices) => {
                             panel.device_error = None;
                             if panel.selected_serial.is_none() {
@@ -452,6 +472,16 @@ impl AndroidPanel {
                         Err(error) => {
                             panel.devices.clear();
                             panel.device_error = Some(format!("{error:#}"));
+                        }
+                    }
+                    match emulators {
+                        Ok(emulators) => {
+                            panel.emulators = emulators;
+                            panel.emulator_error = None;
+                        }
+                        Err(error) => {
+                            panel.emulators.clear();
+                            panel.emulator_error = Some(format!("{error:#}"));
                         }
                     }
                     cx.notify();
@@ -476,12 +506,12 @@ impl AndroidPanel {
                 .selected_target
                 .clone()
                 .context("Sync the Android project and select a build variant first.")?;
-            let after_build = match operation {
-                GradleOperation::Run => Some(AfterBuild::Deploy(
+            let after_task = match operation {
+                GradleOperation::Run => Some(AfterTask::Deploy(
                     target.clone(),
                     self.selected_device()?.serial.clone(),
                 )),
-                GradleOperation::Kotlin => Some(AfterBuild::Kotlin(target.clone())),
+                GradleOperation::Kotlin => Some(AfterTask::Kotlin(target.clone())),
                 _ => None,
             };
             let (name, gradle_task) = match operation {
@@ -507,7 +537,7 @@ impl AndroidPanel {
                 program,
                 args,
                 root,
-                after_build,
+                after_task,
                 window,
                 cx,
             )
@@ -523,7 +553,7 @@ impl AndroidPanel {
         program: PathBuf,
         args: Vec<String>,
         root: PathBuf,
-        after_build: Option<AfterBuild>,
+        after_task: Option<AfterTask>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<()> {
@@ -547,9 +577,10 @@ impl AndroidPanel {
                     match result {
                         ScheduledTaskResult::Success => {
                             panel.status = "Task completed successfully".into();
-                            match after_build {
-                                Some(AfterBuild::Deploy(target, serial)) => panel.deploy(target, serial, window, cx),
-                                Some(AfterBuild::Kotlin(target)) => panel.configure_kotlin(target, window, cx),
+                            match after_task {
+                                Some(AfterTask::Deploy(target, serial)) => panel.deploy(target, serial, window, cx),
+                                Some(AfterTask::Kotlin(target)) => panel.configure_kotlin(target, window, cx),
+                                Some(AfterTask::RefreshDevices) => panel.refresh_devices(cx),
                                 None => {}
                             }
                         }
@@ -855,6 +886,54 @@ impl AndroidPanel {
             })
     }
 
+    fn start_emulator(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.running || self.syncing {
+            return;
+        }
+        let result = (|| {
+            let root = self.trusted_root(cx)?;
+            ensure!(
+                self.emulators.contains(&name),
+                "Refresh devices and select an available emulator first."
+            );
+            self.schedule(
+                format!("Android Emulator · {name}"),
+                android_cli_path()?,
+                vec!["emulator".into(), "start".into(), name],
+                root,
+                Some(AfterTask::RefreshDevices),
+                window,
+                cx,
+            )
+        })();
+        if let Err(error) = result {
+            self.fail(error, window, cx);
+        }
+    }
+
+    fn emulator_picker(&self, cx: &Context<Self>) -> impl IntoElement {
+        let emulators = self.emulators.clone();
+        let panel = cx.weak_entity();
+        PopoverMenu::new("start-emulator")
+            .trigger(Button::new("start-emulator", "Start emulator…")
+                .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall))
+                .disabled(self.running || self.syncing || self.refreshing_devices || emulators.is_empty())
+                .tab_index(0isize)
+                .tooltip(Tooltip::text("Start an existing Android Virtual Device and refresh connected devices when it is ready.")))
+            .menu(move |window, cx| {
+                Some(ContextMenu::build(window, cx, |mut menu, _, _| {
+                    for name in &emulators {
+                        let panel = panel.clone();
+                        let name = name.clone();
+                        menu = menu.entry(name.clone(), None, move |window, cx| {
+                            panel.update(cx, |panel, cx| panel.start_emulator(name.clone(), window, cx)).log_err();
+                        });
+                    }
+                    menu
+                }))
+            })
+    }
+
     fn render_toolbar(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         h_flex()
             .gap_1()
@@ -1007,6 +1086,10 @@ impl Render for AndroidPanel {
             .when(self.devices.is_empty(), |this| {
                 this.child(div().text_sm().text_color(cx.theme().colors().text_muted)
                     .child("Start an Android emulator or connect a device with USB debugging, then refresh."))
+            })
+            .child(self.emulator_picker(cx))
+            .when_some(self.emulator_error.clone(), |this, error| {
+                this.child(div().text_sm().text_color(cx.theme().status().error).child(error))
             })
             .child(h_flex().flex_wrap().gap_1().children(commands))
             .child(Button::new("configure-kotlin", "Configure Kotlin")
@@ -1311,6 +1394,16 @@ mod tests {
             assert!(panel.selected_device().is_err());
             panel.selected_serial = Some("emulator-2".into());
             assert_eq!(panel.selected_device().map(|device| device.serial.as_str()).ok(), Some("emulator-2"));
+        });
+        panel.update_in(cx, |panel, window, cx| {
+            panel.start_emulator("--help".into(), window, cx);
+            assert!(!panel.running);
+            assert!(
+                panel
+                    .error
+                    .as_ref()
+                    .is_some_and(|error| error.contains("select an available emulator"))
+            );
         });
         workspace.update_in(cx, |workspace, window, cx| {
             with_panel(workspace, window, cx, |panel, window, cx| {

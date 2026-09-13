@@ -77,18 +77,30 @@ pub fn parse_devices(output: &str) -> Result<Vec<Device>> {
 }
 
 pub fn adb_path() -> Result<PathBuf> {
-    let executable = if cfg!(windows) { "adb.exe" } else { "adb" };
+    sdk_tool_path("platform-tools", "adb")
+}
+
+pub fn emulator_path() -> Result<PathBuf> {
+    sdk_tool_path("emulator", "emulator")
+}
+
+fn sdk_tool_path(directory: &str, name: &str) -> Result<PathBuf> {
+    let executable = if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_owned()
+    };
     for variable in ["ANDROID_HOME", "ANDROID_SDK_ROOT"] {
         if let Some(root) = env::var_os(variable).filter(|value| !value.is_empty()) {
-            let path = PathBuf::from(root).join("platform-tools").join(executable);
+            let path = PathBuf::from(root).join(directory).join(&executable);
             ensure!(
                 path.is_file(),
-                "{variable} does not contain platform-tools/{executable}"
+                "{variable} does not contain {directory}/{executable}"
             );
             return Ok(path);
         }
     }
-    if let Ok(path) = which::which(executable) {
+    if let Ok(path) = which::which(&executable) {
         return Ok(path);
     }
     if let Some(home) = dirs::home_dir() {
@@ -99,12 +111,33 @@ pub fn adb_path() -> Result<PathBuf> {
         } else {
             home.join("Android/Sdk")
         };
-        let path = root.join("platform-tools").join(executable);
+        let path = root.join(directory).join(&executable);
         if path.is_file() {
             return Ok(path);
         }
     }
-    bail!("ADB was not found. Install Android SDK Platform Tools and set ANDROID_HOME.")
+    bail!("{executable} was not found. Install Android SDK {directory} and set ANDROID_HOME.")
+}
+
+pub fn parse_emulators(output: &str) -> Result<Vec<String>> {
+    let mut names = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|name| {
+            ensure!(
+                !name.starts_with('-')
+                    && name.chars().all(|character| {
+                        character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
+                    }),
+                "Invalid Android virtual device name: {name}"
+            );
+            Ok(name.to_owned())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    names.sort();
+    names.dedup();
+    Ok(names)
 }
 
 pub fn android_cli_path() -> Result<PathBuf> {
@@ -319,6 +352,14 @@ mod tests {
 
     #[test]
     fn android_targets_devices_and_artifacts() -> Result<()> {
+        assert_eq!(
+            parse_emulators("Pixel_6a\r\nmedium_phone\nPixel_6a\n")?,
+            ["Pixel_6a", "medium_phone"]
+        );
+        assert!(parse_emulators("")?.is_empty());
+        assert!(parse_emulators("--help").is_err());
+        assert!(parse_emulators("../outside").is_err());
+        assert!(parse_emulators("unexpected tool output").is_err());
         let devices = parse_devices(
             "* daemon started successfully *\nList of devices attached\nemulator-5554 device product:sdk model:Pixel_6 transport_id:1\nusb-123 unauthorized usb:1\nremote:5555 offline\n",
         )?;
