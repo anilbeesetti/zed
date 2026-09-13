@@ -17,9 +17,14 @@ const GRADLE_INIT: &str = r#"gradle.projectsEvaluated {
     allprojects { project ->
         def compile = project.tasks.findByName(System.getProperty('zed.android.compileTask'))
         if (compile != null && compile.hasProperty('libraries')) {
+            def javaCompile = project.tasks.findByName(compile.name.replaceFirst(/Kotlin$/, 'JavaWithJavac'))
+            def javaClasses = javaCompile == null ? project.files() :
+                project.files(javaCompile.destinationDirectory).filter { it.isDirectory() }
             project.tasks.register('zedAndroidKotlinClasspath') {
                 dependsOn(compile)
-                inputs.files(compile.libraries)
+                if (javaCompile != null) { dependsOn(javaCompile) }
+                // BuildConfig and other generated Java symbols are absent from compile.libraries.
+                inputs.files(compile.libraries, javaClasses)
                 doLast { task ->
                     println('ZED_ANDROID_KOTLIN_CLASSPATH=' + groovy.json.JsonOutput.toJson(
                         task.inputs.files.files.collect { it.absolutePath }))
