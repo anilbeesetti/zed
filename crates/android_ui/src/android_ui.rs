@@ -933,6 +933,58 @@ mod tests {
             init(cx);
             state
         });
+        cx.update(|cx| {
+            for (platform, shortcuts) in [
+                (
+                    "macos",
+                    [
+                        ("cmd-f9", "android::Build"),
+                        ("ctrl-r", "android::Run"),
+                        ("cmd-6", "android::Logcat"),
+                        ("cmd-alt-y", "android::SyncProject"),
+                    ],
+                ),
+                (
+                    "linux",
+                    [
+                        ("ctrl-f9", "android::Build"),
+                        ("shift-f10", "android::Run"),
+                        ("alt-6", "android::Logcat"),
+                        ("ctrl-alt-y", "android::SyncProject"),
+                    ],
+                ),
+            ] {
+                let mut bindings = settings::KeymapFile::load_asset_allow_partial_failure(
+                    &format!("keymaps/default-{platform}.json"),
+                    cx,
+                )
+                .expect("Default keymap should load");
+                for binding in &mut bindings {
+                    binding.set_meta(settings::KeybindSource::Default.meta());
+                }
+                let mut studio = settings::KeymapFile::load_asset_allow_partial_failure(
+                    &format!("keymaps/{platform}/jetbrains.json"),
+                    cx,
+                )
+                .expect("JetBrains keymap should load");
+                for binding in &mut studio {
+                    binding.set_meta(settings::KeybindSource::Base.meta());
+                }
+                bindings.extend(studio);
+                let keymap = gpui::Keymap::new(bindings);
+                let contexts = ["Workspace", "Pane", "Editor mode=full"]
+                    .map(|context| gpui::KeyContext::parse(context).expect("Valid key context"));
+                for (shortcut, action) in shortcuts {
+                    let keystroke = gpui::Keystroke::parse(shortcut).expect("Valid shortcut");
+                    let (matches, _) = keymap.bindings_for_input(&[keystroke], &contexts);
+                    assert_eq!(
+                        matches.first().map(|binding| binding.action().name()),
+                        Some(action),
+                        "{platform}: {shortcut}"
+                    );
+                }
+            }
+        });
         let filesystem = FakeFs::new(cx.executor());
         filesystem
             .insert_tree(

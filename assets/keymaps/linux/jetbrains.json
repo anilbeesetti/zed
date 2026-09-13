@@ -234,7 +234,8 @@
     },
   },
   {
-    "context": "Workspace",
+    "context": "Workspace || (Editor && mode == full)",
+    "use_key_equivalents": true,
     "bindings": {
       "ctrl-f9": "android::Build",
       "shift-f10": "android::Run",
