@@ -18,6 +18,4 @@ dirs.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 which.workspace = true
-
-[dev-dependencies]
 tempfile.workspace = true

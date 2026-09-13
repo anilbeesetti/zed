@@ -42,6 +42,8 @@ actions!(
         Test,
         /// Runs Android lint for the selected variant.
         Lint,
+        /// Builds the selected variant and configures the community Kotlin server with JDK 21.
+        ConfigureKotlin,
     ]
 );
 
@@ -86,6 +88,11 @@ pub fn init(cx: &mut App) {
             })
             .register_action(|workspace, _: &Logcat, window, cx| {
                 with_panel(workspace, window, cx, AndroidPanel::logcat)
+            })
+            .register_action(|workspace, _: &ConfigureKotlin, window, cx| {
+                with_panel(workspace, window, cx, |panel, window, cx| {
+                    panel.gradle(GradleOperation::Kotlin, window, cx)
+                })
             });
         cx.notify();
     })
@@ -118,6 +125,12 @@ enum GradleOperation {
     Run,
     Test,
     Lint,
+    Kotlin,
+}
+
+enum AfterBuild {
+    Deploy(AndroidTarget, String),
+    Kotlin(AndroidTarget),
 }
 
 #[derive(RegisterSetting)]
@@ -162,6 +175,7 @@ pub struct AndroidPanel {
     deploy_task: Option<Task<()>>,
     auto_sync_root: Option<PathBuf>,
     _startup_subscriptions: Vec<Subscription>,
+    kotlin_task: Option<Task<()>>,
 }
 
 impl AndroidPanel {
@@ -196,6 +210,7 @@ impl AndroidPanel {
             deploy_task: None,
             auto_sync_root: None,
             _startup_subscriptions: Vec::new(),
+            kotlin_task: None,
         }
     }
 
@@ -461,13 +476,16 @@ impl AndroidPanel {
                 .selected_target
                 .clone()
                 .context("Sync the Android project and select a build variant first.")?;
-            let run_after = if matches!(operation, GradleOperation::Run) {
-                Some((target.clone(), self.selected_device()?.serial.clone()))
-            } else {
-                None
+            let after_build = match operation {
+                GradleOperation::Run => Some(AfterBuild::Deploy(
+                    target.clone(),
+                    self.selected_device()?.serial.clone(),
+                )),
+                GradleOperation::Kotlin => Some(AfterBuild::Kotlin(target.clone())),
+                _ => None,
             };
             let (name, gradle_task) = match operation {
-                GradleOperation::Build | GradleOperation::Run => {
+                GradleOperation::Build | GradleOperation::Run | GradleOperation::Kotlin => {
                     ("Build", target.gradle_task("assemble", ""))
                 }
                 GradleOperation::Test => ("Test", target.gradle_task("test", "UnitTest")),
@@ -489,7 +507,7 @@ impl AndroidPanel {
                 program,
                 args,
                 root,
-                run_after,
+                after_build,
                 window,
                 cx,
             )
@@ -505,7 +523,7 @@ impl AndroidPanel {
         program: PathBuf,
         args: Vec<String>,
         root: PathBuf,
-        run_after: Option<(AndroidTarget, String)>,
+        after_build: Option<AfterBuild>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<()> {
@@ -529,7 +547,11 @@ impl AndroidPanel {
                     match result {
                         ScheduledTaskResult::Success => {
                             panel.status = "Task completed successfully".into();
-                            if let Some((target, serial)) = run_after { panel.deploy(target, serial, window, cx); }
+                            match after_build {
+                                Some(AfterBuild::Deploy(target, serial)) => panel.deploy(target, serial, window, cx),
+                                Some(AfterBuild::Kotlin(target)) => panel.configure_kotlin(target, window, cx),
+                                None => {}
+                            }
                         }
                         ScheduledTaskResult::Cancelled => panel.status = "Task cancelled".into(),
                         ScheduledTaskResult::Failure | ScheduledTaskResult::SpawnFailed => {
@@ -600,6 +622,62 @@ impl AndroidPanel {
                 })
                 .log_err();
         }));
+    }
+
+    fn configure_kotlin(
+        &mut self,
+        target: AndroidTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use android_tools::kotlin;
+        let root = match self.trusted_root(cx) {
+            Ok(root) => root,
+            Err(error) => {
+                self.fail(error, window, cx);
+                return;
+            }
+        };
+        self.running = true;
+        self.status = "Preparing Kotlin classpath and JDK 21…".into();
+        let executor = cx.background_executor().clone();
+        self.kotlin_task = Some(cx.spawn_in(window, async move |panel, cx| {
+            let result = async {
+                let (paths, java_home, previous_settings) = cx.background_spawn({
+                    let root = root.clone();
+                    async move {
+                        let java_home = kotlin::java_home()?;
+                        let init = kotlin::prepare(&root)?;
+                        let compile = target.gradle_task("compile", "Kotlin");
+                        let compile = compile.rsplit(':').next().context("Invalid Kotlin compile task")?;
+                        let task = format!("{}:{}", target.module.trim_end_matches(':'), kotlin::CLASSPATH_TASK);
+                        let program = if cfg!(windows) { root.join("gradlew.bat") } else { PathBuf::from("/bin/sh") };
+                        let mut args = if cfg!(windows) { Vec::new() } else { vec!["./gradlew".into()] };
+                        args.extend(["--init-script".into(), init.to_string_lossy().into_owned(),
+                            format!("-Dzed.android.compileTask={compile}"), task, "--console=plain".into()]);
+                        let output = tool_output(program, args, &root, &executor, Duration::from_secs(300)).await?;
+                        Ok::<_, anyhow::Error>((kotlin::parse_classpath(&output)?, java_home, kotlin::read_settings(&root)?))
+                    }
+                }).await?;
+                let updated_settings = panel.update_in(cx, |panel, _, cx| {
+                    ensure!(panel.trusted_root(cx)? == root, "The Android project changed during Kotlin setup");
+                    kotlin_settings(previous_settings.clone(), &java_home, cx)
+                })??;
+                cx.background_spawn(async move { kotlin::finish(&root, &paths, &previous_settings, &updated_settings) }).await
+            }.await;
+            panel.update_in(cx, |panel, window, cx| {
+                panel.running = false;
+                match result {
+                    Ok(()) => {
+                        panel.status = "Kotlin configured for the selected variant. Run setup again after changing dependencies or variants.".into();
+                        panel.project.read(cx).lsp_store().update(cx, |store, cx| store.restart_all_language_servers(cx));
+                    }
+                    Err(error) => panel.fail(error, window, cx),
+                }
+                cx.notify();
+            }).log_err();
+        }));
+        cx.notify();
     }
 
     fn logcat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -931,6 +1009,11 @@ impl Render for AndroidPanel {
                     .child("Start an Android emulator or connect a device with USB debugging, then refresh."))
             })
             .child(h_flex().flex_wrap().gap_1().children(commands))
+            .child(Button::new("configure-kotlin", "Configure Kotlin")
+                .disabled(self.syncing || self.running || self.selected_target.is_none())
+                .tab_index(0isize)
+                .tooltip(Tooltip::text("Build the selected variant, create a project classpath hook, and configure the community Kotlin server with JDK 21 in .zed/settings.json."))
+                .on_click(cx.listener(|panel, _, window, cx| panel.gradle(GradleOperation::Kotlin, window, cx))))
             .child(Button::new("logcat", "Open Logcat")
                 .disabled(self.selected_device().is_err()).tab_index(0isize)
                 .on_click(cx.listener(|panel, _, window, cx| panel.logcat(window, cx))))
@@ -1007,6 +1090,31 @@ impl Render for AndroidToolbar {
                 .log_err(),
         )
     }
+}
+
+fn kotlin_settings(previous: String, java_home: &Path, cx: &App) -> Result<String> {
+    cx.global::<settings::SettingsStore>()
+        .new_text_for_update(previous, |content| {
+            content
+                .project
+                .all_languages
+                .languages
+                .0
+                .entry("Kotlin".into())
+                .or_default()
+                .language_servers = Some(vec!["kotlin-language-server".into()]);
+            content
+                .project
+                .lsp
+                .0
+                .entry("kotlin-language-server".into())
+                .or_default()
+                .binary
+                .get_or_insert_default()
+                .env
+                .get_or_insert_default()
+                .insert("JAVA_HOME".into(), java_home.to_string_lossy().into_owned());
+        })
 }
 
 async fn tool_output(
@@ -1124,6 +1232,14 @@ mod tests {
                     );
                 }
             }
+            let previous = "{\n// keep this comment\n\"tab_size\": 2, \"languages\": {\"Rust\": {\"format_on_save\": \"off\"}}\n}";
+            let updated = kotlin_settings(previous.into(), Path::new("/jdk 21"), cx).expect("Kotlin settings update should succeed");
+            assert!(updated.contains("// keep this comment"));
+            let parsed: serde_json::Value = settings::parse_json_with_comments(&updated).expect("Generated settings should parse");
+            assert_eq!(parsed["tab_size"], 2);
+            assert_eq!(parsed["languages"]["Rust"]["format_on_save"], "off");
+            assert_eq!(parsed["languages"]["Kotlin"]["language_servers"], json!(["kotlin-language-server"]));
+            assert_eq!(parsed["lsp"]["kotlin-language-server"]["binary"]["env"]["JAVA_HOME"], "/jdk 21");
         });
         let filesystem = FakeFs::new(cx.executor());
         filesystem

@@ -1,4 +1,5 @@
 use anyhow::{Context as _, Result, bail, ensure};
+pub mod kotlin;
 use serde::Deserialize;
 use std::{
     env, fs,
