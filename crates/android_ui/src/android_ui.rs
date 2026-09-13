@@ -3,6 +3,7 @@ use android_tools::{
     parse_targets,
 };
 use anyhow::{Context as _, Result, bail, ensure};
+use db::kvp::KeyValueStore;
 use futures::future::{Either, select};
 use gpui::{
     Action, App, BackgroundExecutor, Context, Entity, EventEmitter, FocusHandle, Focusable,
@@ -289,26 +290,7 @@ impl AndroidPanel {
                     panel.syncing = false;
                     match result {
                         Ok(targets) => {
-                            panel.selected_target = panel
-                                .selected_target
-                                .take()
-                                .filter(|selected| targets.contains(selected));
-                            if panel.selected_target.is_none() {
-                                let debug_targets = targets
-                                    .iter()
-                                    .filter(|target| target.variant == "debug")
-                                    .collect::<Vec<_>>();
-                                panel.selected_target = if debug_targets.len() == 1 {
-                                    debug_targets.first().map(|target| (*target).clone())
-                                } else if targets.len() == 1 {
-                                    targets.first().cloned()
-                                } else {
-                                    None
-                                };
-                            }
-                            panel.status =
-                                format!("Sync complete · {} build variants", targets.len()).into();
-                            panel.targets = targets;
+                            panel.apply_targets(targets, cx);
                             cx.notify();
                         }
                         Err(error) => {
@@ -566,6 +548,64 @@ impl AndroidPanel {
         }
     }
 
+    fn target_selection_key(&self) -> Option<String> {
+        let root = serde_json::to_string(self.root.as_ref()?).log_err()?;
+        Some(format!("android-selected-target:{root}"))
+    }
+
+    fn remember_target(&self, cx: &App) {
+        let Some(key) = self.target_selection_key() else {
+            return;
+        };
+        let Some(target) = &self.selected_target else {
+            return;
+        };
+        let Some(value) = serde_json::to_string(&(&target.module, &target.variant)).log_err()
+        else {
+            return;
+        };
+        let database = KeyValueStore::global(cx);
+        db::write_and_log(
+            cx,
+            move || async move { database.write_kvp(key, value).await },
+        );
+    }
+
+    fn apply_targets(&mut self, targets: Vec<AndroidTarget>, cx: &App) {
+        let preferred = self
+            .selected_target
+            .as_ref()
+            .map(|target| (target.module.clone(), target.variant.clone()))
+            .or_else(|| {
+                let key = self.target_selection_key()?;
+                let value = KeyValueStore::global(cx).read_kvp(&key).log_err()??;
+                serde_json::from_str::<(String, String)>(&value).log_err()
+            });
+        // Restore only identity; build tasks and artifact paths must come from the fresh model.
+        self.selected_target = if let Some((module, variant)) = &preferred {
+            targets
+                .iter()
+                .find(|target| &target.module == module && &target.variant == variant)
+                .cloned()
+        } else {
+            let mut debug_targets = targets.iter().filter(|target| target.variant == "debug");
+            let debug_target = debug_targets.next();
+            if debug_target.is_some() && debug_targets.next().is_none() {
+                debug_target.cloned()
+            } else if targets.len() == 1 {
+                targets.first().cloned()
+            } else {
+                None
+            }
+        };
+        self.status = if preferred.is_some() && self.selected_target.is_none() {
+            "The previous build variant is unavailable. Select a build variant to continue.".into()
+        } else {
+            format!("Sync complete · {} build variants", targets.len()).into()
+        };
+        self.targets = targets;
+    }
+
     fn target_picker(&self, id: &'static str, cx: &Context<Self>) -> impl IntoElement {
         let targets = self.targets.clone();
         let panel = cx.weak_entity();
@@ -591,6 +631,7 @@ impl AndroidPanel {
                             panel
                                 .update(cx, |panel, cx| {
                                     panel.selected_target = Some(target.clone());
+                                    panel.remember_target(cx);
                                     cx.notify();
                                 })
                                 .log_err();
@@ -1051,6 +1092,53 @@ mod tests {
         assert!(workspace.read_with(cx, |workspace, cx| {
             toolbar(&workspace.weak_handle(), cx).is_some()
         }));
+        let (database, key) = panel.update(cx, |panel, cx| {
+            panel.root = Some(PathBuf::from("/android"));
+            (
+                KeyValueStore::global(cx),
+                panel.target_selection_key().expect("Project key"),
+            )
+        });
+        database
+            .write_kvp(
+                key,
+                serde_json::to_string(&(":mobile", "fullDebug")).expect("Target identity"),
+            )
+            .await
+            .expect("Remember selected variant");
+        panel.update(cx, |panel, cx| {
+            let full = AndroidTarget {
+                module: ":mobile".into(),
+                variant: "fullDebug".into(),
+                output_listing: PathBuf::from("/android/fresh/output.json"),
+            };
+            let demo = AndroidTarget {
+                variant: "demoDebug".into(),
+                ..full.clone()
+            };
+            panel.selected_target = None;
+            panel.apply_targets(vec![demo.clone(), full.clone()], cx);
+            assert_eq!(panel.selected_target, Some(full.clone()));
+            let changed = AndroidTarget {
+                output_listing: PathBuf::from("/android/new/output.json"),
+                ..full
+            };
+            panel.apply_targets(vec![changed.clone()], cx);
+            assert_eq!(panel.selected_target, Some(changed));
+            panel.apply_targets(vec![demo], cx);
+            assert!(panel.selected_target.is_none());
+            assert!(panel.status.contains("unavailable"));
+            panel.selected_target = None;
+            panel.root = Some(PathBuf::from("/another-project"));
+            let debug = AndroidTarget {
+                module: ":app".into(),
+                variant: "debug".into(),
+                output_listing: PathBuf::from("/another-project/output.json"),
+            };
+            panel.apply_targets(vec![debug.clone()], cx);
+            assert_eq!(panel.selected_target, Some(debug));
+            panel.root = None;
+        });
         panel.update_in(cx, |panel, window, cx| {
             panel.set_position(DockPosition::Left, window, cx)
         });
