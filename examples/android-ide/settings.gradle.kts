@@ -15,4 +15,4 @@ dependencyResolutionManagement {
 }
 
 rootProject.name = "Android IDE Sample"
-include(":mobile")
+include(":mobile", ":greeting")

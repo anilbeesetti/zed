@@ -1,7 +1,8 @@
 # Android IDE smoke project
 
 This small Compose app tests a module named `mobile`, two product flavors,
-generated `R` and `BuildConfig` symbols, and a Kotlin call into Java.
+generated `R` and `BuildConfig` symbols, a Kotlin call into Java, and an Android
+library dependency named `greeting`.
 
 From the repository root, run:
 
@@ -13,7 +14,8 @@ Use the Android tools panel to **Sync project**, select **:mobile · demoDebug**
 and **Configure Kotlin**. Install the Kotlin extension from Extensions if it is
 not already installed. Select a connected device or use **Start emulator…**,
 then **Run**. The app should display `dev.zed.androidsample.demo`. Repeat with
-`fullDebug`; it should display `dev.zed.androidsample.full`. Run **Configure
+`fullDebug`; it should display `dev.zed.androidsample.full`. Both variants should
+also display `Android library connected`. Run **Configure
 Kotlin** again after switching variants so generated symbols use that variant.
 Use **Stop emulator** when finished to release the VM's memory.
 

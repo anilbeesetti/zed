@@ -14,6 +14,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
+import dev.zed.greeting.LibraryGreeting
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -31,6 +32,7 @@ fun SampleScreen() {
             Text(stringResource(R.string.app_name), style = MaterialTheme.typography.headlineSmall)
             Text(Greeting.message(BuildConfig.FLAVOR))
             Text(BuildConfig.APPLICATION_ID)
+            Text(LibraryGreeting.message())
         }
     }
 }
