@@ -7325,6 +7325,51 @@ impl Render for ProjectPanel {
                 .child(
                     v_flex()
                         .child(
+                            h_flex()
+                                .h_8()
+                                .flex_none()
+                                .px_2()
+                                .justify_between()
+                                .child(Label::new("Project").weight(FontWeight::MEDIUM))
+                                .child(
+                                    h_flex()
+                                        .gap_1()
+                                        .child(
+                                            IconButton::new(
+                                                "collapse-project",
+                                                IconName::ListCollapse,
+                                            )
+                                            .tab_index(0isize)
+                                            .aria_label("Collapse all folders")
+                                            .tooltip(|_, cx| {
+                                                Tooltip::for_action(
+                                                    "Collapse All",
+                                                    &CollapseAllEntries,
+                                                    cx,
+                                                )
+                                            })
+                                            .on_click(
+                                                cx.listener(|panel, _, window, cx| {
+                                                    panel.collapse_all_entries(
+                                                        &CollapseAllEntries,
+                                                        window,
+                                                        cx,
+                                                    );
+                                                }),
+                                            ),
+                                        )
+                                        .child(
+                                            IconButton::new("hide-project", IconName::Close)
+                                                .tab_index(0isize)
+                                                .aria_label("Hide Project")
+                                                .tooltip(Tooltip::text("Hide Project"))
+                                                .on_click(cx.listener(|_, _, _, cx| {
+                                                    cx.emit(PanelEvent::Close)
+                                                })),
+                                        ),
+                                ),
+                        )
+                        .child(
                             uniform_list("entries", item_count, {
                                 cx.processor(|this, range: Range<usize>, window, cx| {
                                     this.rendered_entries_len = range.end - range.start;

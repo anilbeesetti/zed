@@ -1587,6 +1587,9 @@ pub struct Workspace {
     left_dock: Entity<Dock>,
     bottom_dock: Entity<Dock>,
     right_dock: Entity<Dock>,
+    left_dock_buttons: Entity<PanelButtons>,
+    bottom_dock_buttons: Entity<PanelButtons>,
+    right_dock_buttons: Entity<PanelButtons>,
     panes: Vec<Entity<Pane>>,
     panes_by_item: HashMap<EntityId, WeakEntity<Pane>>,
     active_pane: Entity<Pane>,
@@ -1977,14 +1980,8 @@ impl Workspace {
             .root::<MultiWorkspace>()
             .flatten()
             .map(|mw| mw.downgrade());
-        let status_bar = cx.new(|cx| {
-            let mut status_bar =
-                StatusBar::new(&center_pane.clone(), multi_workspace.clone(), window, cx);
-            status_bar.add_left_item(left_dock_buttons, window, cx);
-            status_bar.add_right_item(right_dock_buttons, window, cx);
-            status_bar.add_right_item(bottom_dock_buttons, window, cx);
-            status_bar
-        });
+        let status_bar =
+            cx.new(|cx| StatusBar::new(&center_pane.clone(), multi_workspace.clone(), window, cx));
 
         let session_id = app_state.session.read(cx).id().to_owned();
 
@@ -2108,6 +2105,9 @@ impl Workspace {
             left_dock,
             bottom_dock,
             right_dock,
+            left_dock_buttons,
+            bottom_dock_buttons,
+            right_dock_buttons,
             _panels_task: None,
             project: project.clone(),
             follower_states: Default::default(),
@@ -10004,7 +10004,40 @@ impl Render for Workspace {
                                     None => div.top_2().bottom_2().left_2().right_2().border_1(),
                                 })
                             }))
-                            .children(self.render_notifications(window, cx)),
+                            .children(self.render_notifications(window, cx))
+                            .map(|content| {
+                                h_flex()
+                                    .flex_1()
+                                    .w_full()
+                                    .overflow_hidden()
+                                    .child(
+                                        v_flex()
+                                            .id("left-tool-window-rail")
+                                            .w(px(40.))
+                                            .h_full()
+                                            .flex_none()
+                                            .py_2()
+                                            .justify_between()
+                                            .bg(colors.title_bar_background)
+                                            .border_r_1()
+                                            .border_color(colors.border)
+                                            .child(self.left_dock_buttons.clone())
+                                            .child(self.bottom_dock_buttons.clone()),
+                                    )
+                                    .child(content.h_full())
+                                    .child(
+                                        v_flex()
+                                            .id("right-tool-window-rail")
+                                            .w(px(40.))
+                                            .h_full()
+                                            .flex_none()
+                                            .py_2()
+                                            .bg(colors.title_bar_background)
+                                            .border_l_1()
+                                            .border_color(colors.border)
+                                            .child(self.right_dock_buttons.clone()),
+                                    )
+                            }),
                     )
                     .when(self.status_bar_visible(cx), |parent| {
                         parent.child(self.status_bar.clone())
@@ -14581,6 +14614,12 @@ mod tests {
         pane.update_in(cx, |pane, window, cx| {
             let item = cx.new(TestItem::new);
             pane.add_item(Box::new(item), true, true, None, window, cx);
+        });
+
+        cx.run_until_parked();
+        workspace.update_in(cx, |workspace, window, _| {
+            assert!(workspace.bounds.size.height > window.viewport_size().height / 2.);
+            assert!(workspace.bounds.size.width > window.viewport_size().width / 2.);
         });
 
         // Transfer focus from center to panel
