@@ -1742,7 +1742,8 @@
   // inside a root folder activate their git features immediately; deeper ones
   // activate on first use.
   // `0` means no limit and activates all git repositories immediately.
-  "file_scan_depth": 5,
+  // Android package directories commonly exceed five levels before a new project has Git.
+  "file_scan_depth": 0,
   // When to scan content of linked directories.
   // May take 2 values:
   //  1. Only scan symlinked directories when they've been expanded in the workspace:
