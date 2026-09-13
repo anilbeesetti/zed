@@ -22,6 +22,30 @@ installer; this is an independent fork, not an official Android Studio build.
 
 ## Findings and architectural decisions
 
+### Implementation checkpoint after the first working prototype
+
+The initial edit/build/run slice is implemented on ten local stack branches.
+See [validation evidence](ANDROID_IDE_VALIDATION.md) and the
+[per-layer review guide](ANDROID_IDE_REVIEW.md) for the actual branch names and
+checks. The numbered roadmap below remains the product plan; later language,
+project-model, debugging, preview, and release gates are not complete.
+
+The running prototype now includes Studio themes and tool rails, Android target
+and device selection, build/run/test/lint/Logcat, emulator start/stop, an isolated
+macOS launcher, and a two-module/two-flavor Compose smoke project. Kotlin setup
+resolves Android/Compose, generated Java symbols, and an Android library API.
+
+Language-server testing changed the risk assessment: the tested official server
+build had expired, while the community compatibility server works for basic
+editing but is deprecated and failed a real cross-module rename. The next
+language milestone must resolve this dependency choice and the failing fixture
+before treating refactoring as supported. Keep the compatibility implementation
+replaceable; do not expand it into a homegrown Kotlin compiler or indexer.
+
+Initial optimized-editor memory and warm first-workspace-render measurements
+are recorded with their limits in the validation report. They are encouraging
+prototype evidence, not a feature-equivalent Android Studio benchmark.
+
 ### What the fork already provides
 
 The starting revision is `7960b2a7c9`. It includes a Rust/GPUI desktop editor,
@@ -125,6 +149,22 @@ Kotlin/Java navigation, Android resources, and generated `R`/`BuildConfig` symbo
 must be checked together. Plain Kotlin syntax highlighting is not proof that
 Android project intelligence works. The current Zed Kotlin guide describes the
 extension installation path.[^8]
+
+Two candidates deserve explicit follow-up testing:
+
+* Zed's Java extension uses Eclipse JDT LS. Its current upstream documentation
+  describes Android Gradle import as experimental and requires at least Java
+  21. Test Android classpaths, generated symbols, and navigation rather than
+  assuming ordinary Java-project support covers AGP.
+  [Zed Java guide](https://zed.dev/docs/languages/java),
+  [Eclipse JDT LS](https://github.com/eclipse-jdtls/eclipse.jdt.ls).
+* `ktlsp` is a newer MIT-licensed Rust alternative for Kotlin and Java. Its
+  authors explicitly say type inference, overload resolution, and Gradle
+  modeling are not compiler-complete. Its own benchmark also shows that an
+  eager native index can use more memory than a JVM server. Treat it as a
+  compatibility spike candidate, not an automatic replacement because it uses
+  Rust. It was researched but not installed or validated in this session.
+  [ktlsp scope and limitations](https://github.com/pepegar/ktlsp).
 
 ### Devices, run, and logs
 
