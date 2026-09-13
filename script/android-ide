@@ -90,6 +90,9 @@ studio_java="/Applications/Android Studio.app/Contents/jbr/Contents/Home"
 if [[ -z ${JAVA_HOME:-} && -x "$studio_java/bin/java" ]]; then
     export JAVA_HOME="$studio_java"
 fi
+if [[ -z ${ANDROID_HOME:-} && -z ${ANDROID_SDK_ROOT:-} && -d "$HOME/Library/Android/sdk" ]]; then
+    export ANDROID_HOME="$HOME/Library/Android/sdk"
+fi
 
 echo "App: $bundle"
 echo "Profile: $profile"
