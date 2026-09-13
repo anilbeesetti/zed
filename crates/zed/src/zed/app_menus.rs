@@ -277,8 +277,12 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
                 MenuItem::separator(),
                 MenuItem::action("Sync Android Project", android_ui::SyncProject),
                 MenuItem::action("Android Tools", android_ui::ToggleFocus),
-                MenuItem::action("Configure Kotlin for Selected Variant", android_ui::ConfigureKotlin),
+                MenuItem::action(
+                    "Configure Kotlin for Selected Variant",
+                    android_ui::ConfigureKotlin,
+                ),
                 MenuItem::action("Refresh Android Devices", android_ui::RefreshDevices),
+                MenuItem::action("Stop Selected Emulator", android_ui::StopEmulator),
                 MenuItem::action("Logcat", android_ui::Logcat),
                 MenuItem::separator(),
                 MenuItem::action(

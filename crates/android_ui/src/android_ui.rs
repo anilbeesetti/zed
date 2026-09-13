@@ -34,6 +34,8 @@ actions!(
         SyncProject,
         /// Refreshes connected Android devices.
         RefreshDevices,
+        /// Stops the selected Android emulator and refreshes connected devices.
+        StopEmulator,
         /// Builds the selected Android variant.
         Build,
         /// Builds and launches the selected Android variant on the selected device.
@@ -65,6 +67,9 @@ pub fn init(cx: &mut App) {
                 with_panel(workspace, window, cx, |panel, _, cx| {
                     panel.refresh_devices(cx)
                 })
+            })
+            .register_action(|workspace, _: &StopEmulator, window, cx| {
+                with_panel(workspace, window, cx, AndroidPanel::stop_emulator)
             })
             .register_action(|workspace, _: &Build, window, cx| {
                 with_panel(workspace, window, cx, |panel, window, cx| {
@@ -911,6 +916,37 @@ impl AndroidPanel {
         }
     }
 
+    fn selected_emulator(&self) -> Result<&Device> {
+        let device = self.selected_device()?;
+        ensure!(
+            device.serial.starts_with("emulator-"),
+            "Select an Android emulator to stop; physical devices are not supported by this action."
+        );
+        Ok(device)
+    }
+
+    fn stop_emulator(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.running || self.syncing {
+            return;
+        }
+        let result = (|| {
+            let root = self.trusted_root(cx)?;
+            let serial = self.selected_emulator()?.serial.clone();
+            self.schedule(
+                format!("Stop Android Emulator · {serial}"),
+                android_cli_path()?,
+                vec!["emulator".into(), "stop".into(), serial],
+                root,
+                Some(AfterTask::RefreshDevices),
+                window,
+                cx,
+            )
+        })();
+        if let Err(error) = result {
+            self.fail(error, window, cx);
+        }
+    }
+
     fn emulator_picker(&self, cx: &Context<Self>) -> impl IntoElement {
         let emulators = self.emulators.clone();
         let panel = cx.weak_entity();
@@ -1087,7 +1123,13 @@ impl Render for AndroidPanel {
                 this.child(div().text_sm().text_color(cx.theme().colors().text_muted)
                     .child("Start an Android emulator or connect a device with USB debugging, then refresh."))
             })
-            .child(self.emulator_picker(cx))
+            .child(h_flex().flex_wrap().gap_1()
+                .child(self.emulator_picker(cx))
+                .child(Button::new("stop-emulator", "Stop emulator")
+                    .disabled(self.running || self.syncing || self.selected_emulator().is_err())
+                    .tab_index(0isize)
+                    .tooltip(Tooltip::text("Stop the selected emulator to release its memory. The virtual device is preserved."))
+                    .on_click(cx.listener(|panel, _, window, cx| panel.stop_emulator(window, cx)))))
             .when_some(self.emulator_error.clone(), |this, error| {
                 this.child(div().text_sm().text_color(cx.theme().status().error).child(error))
             })
@@ -1396,6 +1438,21 @@ mod tests {
             assert_eq!(panel.selected_device().map(|device| device.serial.as_str()).ok(), Some("emulator-2"));
         });
         panel.update_in(cx, |panel, window, cx| {
+            assert!(panel.selected_emulator().is_ok());
+            panel.devices.push(Device {
+                serial: "usb-phone".into(),
+                state: "device".into(),
+                model: "Phone".into(),
+            });
+            panel.selected_serial = Some("usb-phone".into());
+            panel.stop_emulator(window, cx);
+            assert!(!panel.running);
+            assert!(
+                panel
+                    .error
+                    .as_ref()
+                    .is_some_and(|error| error.contains("physical devices"))
+            );
             panel.start_emulator("--help".into(), window, cx);
             assert!(!panel.running);
             assert!(
