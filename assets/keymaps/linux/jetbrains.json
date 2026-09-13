@@ -233,4 +233,13 @@
       "ctrl-k": null,
     },
   },
+  {
+    "context": "Workspace",
+    "bindings": {
+      "ctrl-f9": "android::Build",
+      "shift-f10": "android::Run",
+      "alt-6": "android::Logcat",
+      "ctrl-alt-y": "android::SyncProject",
+    },
+  },
 ]

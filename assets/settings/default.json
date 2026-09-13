@@ -1049,6 +1049,11 @@
     // Does not affect single-file views.
     "multi_buffer_hide_symbols": false,
   },
+  "android_panel": {
+    "button": true,
+    "dock": "right",
+    "default_width": 320,
+  },
   "collaboration_panel": {
     // Whether to show the collaboration panel button in the status bar.
     "button": true,

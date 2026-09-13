@@ -270,6 +270,16 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
             name: "Run".into(),
             disabled: false,
             items: vec![
+                MenuItem::action("Run App", android_ui::Run),
+                MenuItem::action("Build Selected Variant", android_ui::Build),
+                MenuItem::action("Run Unit Tests", android_ui::Test),
+                MenuItem::action("Run Android Lint", android_ui::Lint),
+                MenuItem::separator(),
+                MenuItem::action("Sync Android Project", android_ui::SyncProject),
+                MenuItem::action("Android Tools", android_ui::ToggleFocus),
+                MenuItem::action("Refresh Android Devices", android_ui::RefreshDevices),
+                MenuItem::action("Logcat", android_ui::Logcat),
+                MenuItem::separator(),
                 MenuItem::action(
                     "Spawn Task",
                     zed_actions::Spawn::ViaModal {

@@ -238,4 +238,13 @@
       "cmd-k": null,
     },
   },
+  {
+    "context": "Workspace",
+    "bindings": {
+      "cmd-f9": "android::Build",
+      "ctrl-r": "android::Run",
+      "cmd-6": "android::Logcat",
+      "cmd-alt-y": "android::SyncProject",
+    },
+  },
 ]

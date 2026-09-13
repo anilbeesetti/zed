@@ -1,0 +1,31 @@
+[package]
+name = "android_ui"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/android_ui.rs"
+doctest = false
+
+[dependencies]
+android_tools.workspace = true
+anyhow.workspace = true
+futures.workspace = true
+gpui.workspace = true
+project.workspace = true
+settings.workspace = true
+task.workspace = true
+ui.workspace = true
+util.workspace = true
+workspace.workspace = true
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+project = { workspace = true, features = ["test-support"] }
+serde_json.workspace = true
+workspace = { workspace = true, features = ["test-support"] }

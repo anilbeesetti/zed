@@ -719,6 +719,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "android_ui"
+version = "0.1.0"
+dependencies = [
+ "android_tools",
+ "anyhow",
+ "futures 0.3.34",
+ "gpui",
+ "project",
+ "serde_json",
+ "settings",
+ "task",
+ "ui",
+ "util",
+ "workspace",
+]
+
+[[package]]
 name = "anes"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -18639,6 +18656,7 @@ name = "title_bar"
 version = "0.1.0"
 dependencies = [
  "agent_settings",
+ "android_ui",
  "anyhow",
  "arrayvec",
  "auto_update",
@@ -22811,6 +22829,7 @@ dependencies = [
  "agent_settings",
  "agent_skills",
  "agent_ui",
+ "android_ui",
  "anyhow",
  "ashpd",
  "askpass",
