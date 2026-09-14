@@ -187,6 +187,13 @@ Keep standalone start/stop actions, preserve the AVD when stopping, and disable 
 
 Validation: Android panel state/trust tests and native selected-emulator workflows in the combined report. Debug reuses this startup path in its later dependent layer. Changed-crate Clippy passes.
 
+Both device selectors refresh on opening and update the deployed menu when
+bounded discovery completes. Mark the current selection, disable stale rows
+while refreshing and reset keyboard selection after a reorder. Five combined
+Android-UI tests, changed-crate Clippy and the optimized native build pass.
+Native external-emulator start/stop and both picker surfaces pass without a
+manual refresh. Continuous ADB tracking remains a separate parity item.
+
 Release Notes:
 
 - Added stopped-emulator selection and automatic startup before Run

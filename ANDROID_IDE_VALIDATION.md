@@ -1,6 +1,6 @@
 # Android IDE prototype: validation and handoff
 
-Session: 13–14 September 2026. Platform: Apple Silicon macOS. Changes are published
+Session: 13–15 September 2026. Platform: Apple Silicon macOS. Changes are published
 as draft stacked PRs following the author’s later authorization. Historical
 checkpoints below retain their original measurements and limitations.
 
@@ -11,6 +11,58 @@ refactoring, advanced Kotlin debugging, broad project-model compatibility and
 release packaging are not complete. The
 [research and implementation plan](ANDROID_IDE_PLAN.md) covers the longer-term
 work; [the review guide](ANDROID_IDE_REVIEW.md) describes the review stack.
+
+## Device picker refresh — 15 September 2026
+
+Both Android device selectors previously captured the device and AVD lists when
+the toolbar rendered. Reopening the menu did not query ADB, so externally started
+or stopped devices could keep their old state until an explicit refresh.
+
+Opening either picker now starts the existing bounded discovery operation and
+updates the open menu when the panel changes. The menu shows refresh progress,
+disables stale device rows during discovery and marks the current selection.
+Selection remains attached to the device/AVD rather than a stale keyboard row
+number after a reorder. Successful selection still closes the menu. Errors direct
+the user to the existing Android tool-window details and preserve Refresh devices.
+
+This reuses Zed's persistent ContextMenu and entity observation. No background
+polling loop or new dependency was added. Android Studio's
+[DeviceProvisioner](https://android.googlesource.com/platform/tools/base/+/refs/heads/mirror-goog-studio-main/device-provisioner/src/main/com/android/sdklib/deviceprovisioner/DeviceProvisioner.kt)
+combines device-provider state with ADB's live tracker. This pass covers refresh
+on picker opening and discovery completion; continuous background changes while
+a menu remains open, and stable physical identity across changed wireless
+transport identifiers, remain future work.
+
+Validation: the new GPUI regression replaces the device list while a menu is
+open, reorders it and confirms through the same menu entity. It checks both
+selection preservation and selecting a newly discovered device. All five
+Android-UI tests and changed-crate Clippy pass. The optimized build passes in 14m 02s with debug information and incremental
+artifacts disabled. Its embedded source revision is
+`d3826af32454fe9e4516ef0cc3cd405f950ac00f`; later changes in this pass are documentation.
+
+Native checks on the existing Pixel_6a test AVD:
+
+1. Open the picker while the AVD is stopped and confirm the current physical
+   device remains checked.
+2. Close the menu and start the AVD externally. Reopen the picker: it discovers
+   the AVD as running without selecting Refresh devices. Select it successfully.
+3. Stop that exact test emulator externally and reopen the menu: it changes to
+   stopped while keeping the AVD selected.
+4. Open the Android tool-window picker: it shows the same selection and state.
+   Restore the original physical device at the end.
+
+No APK was deployed in this pass. The owned test emulator was stopped and its
+AVD preserved. The source/preview workspace remains open in the new binary.
+The initial rebuildable-cache measurement was 11.10 GiB, below the 30 GiB cleanup
+threshold, so no caches were removed.
+
+Local evidence is under `target/android-ide/validation/`: the
+`device-menu-refresh-*` build/test/Clippy logs and `device-picker-*-20260915.png`
+screenshots. Open-menu screenshots include local device identifiers and are kept
+local; the closed-picker progress image excludes them.
+
+The running-emulator toolbar currently displays the SDK model name, whereas the
+picker displays its AVD name. Consistent naming remains a follow-up UI gap.
 
 ## Device and Compose navigation follow-up — 14 September 2026
 
@@ -115,7 +167,7 @@ it is not a proven drop-in replacement, and no expiration check was bypassed.
 
 | Comparison area | Current coverage | Next concrete acceptance check |
 | --- | --- | --- |
-| Device picker | Running devices and stopped AVDs; explicit serial and state | Connect/disconnect and wireless reconnect while the menu is open; retain a valid selection |
+| Device picker | Running devices and stopped AVDs; fresh discovery on opening; selected-device checkmarks | Continuous changes while the menu stays open, stable identity across wireless reconnects and consistent AVD toolbar names |
 | Source navigation | Ten Compose/Android symbols and compiled overload fixtures | Nested library-to-library navigation, persistent library tabs across server restarts, larger Kotlin 2 projects, per-source-set classpaths and readiness feedback |
 | Preview controls | Toolbar visibility toggle, annotation picker, reusable render split | Limit button to source files in Compose modules; per-file selection, dirty-source refresh, Code/Split/Design behavior |
 | Project and variants | Trusted automatic sync, selected variant restoration, flavor builds | Edit Gradle dependencies and switch source sets without manual language setup; actionable sync errors |
