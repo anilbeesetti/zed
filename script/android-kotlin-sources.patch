@@ -113,3 +113,12 @@
 +        }
 +    }
 +}
+--- a/server/src/main/kotlin/org/javacs/kt/externalsources/FernFlowerDecompiler.kt
++++ b/server/src/main/kotlin/org/javacs/kt/externalsources/FernFlowerDecompiler.kt
+@@ -17,6 +17,7 @@
+     private val decompilerOptions =
+         arrayOf(
++            "-log=WARN", // Per-class INFO messages can block the LSP output pipe.
+             "-iec=1", // Include entire classpath for better context
+             "-jpr=1", // Include parameter names in method signatures
+         )
