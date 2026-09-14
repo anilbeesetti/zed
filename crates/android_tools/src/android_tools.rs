@@ -26,10 +26,43 @@ pub fn parse_devices(output: &str) -> Result<Vec<Device>> {
     lines
         .filter(|line| !line.trim().is_empty())
         .map(|line| {
-            let mut fields = line.split_whitespace();
-            let serial = fields.next().context("Device serial is missing")?;
-            let state = fields.next().context("Device state is missing")?;
-            let model = fields
+            // Wireless mDNS serials can contain spaces. ADB places the state after
+            // the complete serial, so find the last state token before metadata.
+            let (serial, state, details) = line
+                .match_indices(char::is_whitespace)
+                .rev()
+                .find_map(|(offset, _)| {
+                    let remainder = line.get(offset..)?.trim_start();
+                    let state = if remainder.starts_with("no permissions") {
+                        "no permissions"
+                    } else {
+                        remainder.split_whitespace().next()?
+                    };
+                    matches!(
+                        state,
+                        "device"
+                            | "offline"
+                            | "unauthorized"
+                            | "authorizing"
+                            | "connecting"
+                            | "bootloader"
+                            | "recovery"
+                            | "rescue"
+                            | "sideload"
+                            | "host"
+                            | "unknown"
+                            | "no permissions"
+                    )
+                    .then_some((
+                        line.get(..offset)?.trim_end(),
+                        state,
+                        remainder,
+                    ))
+                })
+                .context("ADB device state is missing or unsupported")?;
+            ensure!(!serial.is_empty(), "Device serial is missing");
+            let model = details
+                .split_whitespace()
                 .find_map(|field| field.strip_prefix("model:"))
                 .unwrap_or(serial)
                 .replace('_', " ");
@@ -303,6 +336,26 @@ mod tests {
         assert!(parse_devices("List of devices attached\n")?.is_empty());
         assert!(parse_devices("adb: cannot connect").is_err());
         assert!(parse_devices("List of devices attached\ninvalid").is_err());
+        let serial = "adb-test-device (2)._adb-tls-connect._tcp";
+        let wireless = parse_devices(&format!(
+            "List of devices attached\n{serial} device product:phone model:CPH2689 device:phone transport_id:11\n"
+        ))?;
+        assert_eq!(
+            wireless,
+            vec![Device {
+                serial: serial.into(),
+                state: "device".into(),
+                model: "CPH2689".into(),
+            }]
+        );
+        assert!(wireless.first().is_some_and(Device::is_available));
+        let unavailable = parse_devices(
+            "List of devices attached\nusb-123 no permissions (user is not in the plugdev group)\n",
+        )?;
+        assert_eq!(
+            unavailable.first().map(|device| device.state.as_str()),
+            Some("no permissions")
+        );
 
         let directory = tempfile::tempdir()?;
         let root = directory.path().join("project with spaces $literal");
