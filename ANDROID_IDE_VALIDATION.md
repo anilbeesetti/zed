@@ -3,15 +3,31 @@
 Session: 13–14 September 2026. Platform: Apple Silicon macOS. All changes and stack
 branches remain local; no branches were pushed and no GitHub PRs were created.
 
-This is a working edit/build/run prototype with an Android Studio-inspired
-shell. It is not ready to replace Android Studio for projects that require
-reliable Kotlin refactoring, Android debugging, or Compose previews. The
+This is a working Android edit/build/run/debug/Compose-preview prototype with an
+Android Studio-inspired shell. Android-aware Java editing and Kotlin object
+rename also work on the fixture. It remains a development build: mixed-language
+refactoring, advanced Kotlin debugging, broad project-model compatibility and
+release packaging are not complete. The
 [research and implementation plan](ANDROID_IDE_PLAN.md) covers the longer-term
 work; [the review guide](ANDROID_IDE_REVIEW.md) describes the local stack.
 
 ## Run it
 
-From this checkout, launch the already-built optimized app:
+The optional language/debug/preview tools are installed in this checkout. To
+reproduce their installation on Apple Silicon with JDK 21, run:
+
+```sh
+script/install-android-kotlin
+script/install-android-debugger
+script/install-android-preview
+```
+
+Each script verifies pinned source/artifact checksums, preserves an unmanaged
+installation, and is repeatable. Kotlin and the debugger build with a task-local
+JDK 11; execution uses JDK 21. Preview uses a separate short-lived JVM, without
+starting Android Studio or an emulator.
+
+From this checkout, launch the optimized app:
 
 ```sh
 script/android-ide --release --skip-build examples/android-ide
@@ -20,7 +36,7 @@ script/android-ide --release --skip-build examples/android-ide
 The launcher creates a macOS development bundle under `target/android-ide` and
 uses `target/android-ide/profile` for configuration and extensions. It preserves
 existing settings. New profiles disable auto-update and telemetry, enable the
-Kotlin extension, and select the community Kotlin server. This is a development
+Kotlin and Java extensions, and select the community Kotlin server. This is a development
 launcher, not a signed installer or an independently branded release.
 
 1. Open the Android tool window using the hammer on the right tool rail.
@@ -38,7 +54,16 @@ launcher, not a signed installer or an independently branded release.
    and `Android library connected`.
 7. Use **Test**, **Lint**, or **Open Logcat** as needed. Build output remains in
    ordinary task terminals. Ctrl+C interrupts the focused command or Logcat.
-8. Use **Stop emulator** when finished. This preserves the AVD and releases its
+8. Choose **Configure Java** for Android-aware Java editing; repeat Java and
+   Kotlin setup after a variant/dependency change. Open a Java file to start its
+   import, then allow JDT LS to finish before testing navigation.
+9. Set Java/Kotlin breakpoints and choose **Debug**. Use the native debugger's
+   variables, frames, step/continue and disconnect controls. The adapter supports
+   local/field evaluation; arbitrary expression evaluation is not implemented.
+10. Choose **Compose preview**, then **Select preview…** for Default or Large text.
+    Refresh after editing. Preview works without a selected device and preserves
+    the previous image on failure. Its editor split is reused across refreshes.
+11. Use **Stop emulator** when finished. This preserves the AVD and releases its
    VM memory. It is disabled for a physical device.
 
 The project is a real Gradle build and participates in Zed's existing workspace
@@ -65,8 +90,10 @@ SDK packages.
 | Kotlin Android APIs | Android/Compose resolution, useful hover/completion, and deliberate type-error diagnostics exercised on the reference project. |
 | Generated symbols | Smoke `R`, `BuildConfig`, and a Kotlin call to the app's Java helper resolve after setup. Variant changes regenerate the selected `R.jar` and Java output classpath. |
 | Library navigation | Native hover and Cmd+B navigate from `MainActivity.kt` to `LibraryGreeting.kt` in `:greeting`. The library's compiled classes JAR appears in the exported classpath. |
-| Kotlin rename | **Failed.** Shift+F6 on the library object returned a server internal error with `KotlinFrontEndException`. No source files changed. Do not advertise reliable rename/refactoring. |
-| Java editing | **Android import failed.** Java extension 6.8.26 / JDT LS 1.61.0 reported the probe outside the app classpath with defaults and with Android support enabled. Building Java and resolving its symbols from Kotlin work; Android-aware Java editing and mixed-language rename are not supported. |
+| Kotlin rename | The original 1.3.13 object-rename failure is fixed by the pinned upstream build. Native Shift+F6 changed the object, imports and usages across three Kotlin files; all temporary edits were restored. Java callers are not included, so mixed-language rename is not supported. |
+| Java editing | Configure Java imports the evaluated AGP compile graph into JDT LS. Native SDK/resource/library hover, type errors and fullDebug-to-demoDebug BuildConfig navigation passed without clearing JDT caches. Existing preferences/comments and unrelated Gradle arguments are preserved. |
+| Android Debug | Native build/deploy/debug-wait/attach passed. Java and Kotlin breakpoints, variables, Shift+F8 into the Compose caller and Ctrl+F2 detach were exercised. A portable DAP smoke test checks local evaluation, configuration completion, retained app process and removed owned forward. |
+| Compose preview | Downloaded Google renderer/layoutlib produce real images in the native editor split. demoDebug/fullDebug use the correct resources, Java/Kotlin libraries and application IDs. Default/Large text selection works with no emulator and Android Studio closed. An intentional preview exception preserved the last image byte-for-byte and showed an error. |
 | Cancellation | A temporary 60-second Gradle task was interrupted using Ctrl+C in the native terminal. Controls recovered, and the restored build passed in 2 seconds. Current task API displays interruption as command failure. |
 | Configuration safety | Existing user hooks are preserved with an actionable error. Generated files use atomic replacement. Settings updates preserve unrelated settings/comments and reject stale concurrent settings edits. |
 | Isolation | Development launcher profile, bundle identifiers, generated caches, telemetry/update defaults, existing-profile preservation, relative path handling, and running-app guard were checked. |
@@ -79,6 +106,8 @@ SDK packages.
 | Find Action | Cmd+Shift+A | Ctrl+Shift+A |
 | Build selected Android variant | Cmd+F9 | Ctrl+F9 |
 | Run selected Android variant | Ctrl+R | Shift+F10 |
+| Debug selected Android variant | Ctrl+D | Shift+F9 |
+| Continue / step out / disconnect | F9 / Shift+F8 / Ctrl+F2 | Existing JetBrains debugger mappings |
 | Sync Android project | Cmd+Option+Y | Ctrl+Alt+Y |
 | Open selected-device Logcat | Cmd+6 | Alt+6 |
 
@@ -102,7 +131,7 @@ Ultimate subscription requirement after preview; do not assume this is a free,
 unrestricted redistribution path for this fork.
 [JetBrains installation and preview terms](https://www.jetbrains.com/help/intellij-vscode/get_started_vs_code.html).
 
-The working compatibility path uses `fwcd/kotlin-language-server` 1.3.13 with
+The initial compatibility path used `fwcd/kotlin-language-server` 1.3.13 with
 JDK 21 and its documented project classpath hook. JBR 25 produced a Java-version
 parsing error, so Gradle and language-server Java runtimes are selected
 separately. The community repository now describes itself as deprecated in
@@ -119,31 +148,73 @@ change the user's Gradle build files.
 Known ceiling: one selected variant supplies a workspace-wide classpath. This
 does not model different variants in different modules, test-specific
 classpaths, KMP, included builds, or source-set visibility with Android Studio's
-precision. The next language milestone should evaluate a legally distributable,
-maintained server against the same failing rename and project-model fixtures.
+precision. The pinned upstream build below resolves the reproduced rename crash;
+a maintained production engine and broader project-model fixtures remain required.
 
-### Java import spike
+### Fixes verified during the continuation
 
-Installed the official Zed Java extension **6.8.26**, which downloaded Eclipse
-JDT LS **1.61.0**. A disposable Java file in the reference app accessed
-`android.os.Build.VERSION.SDK_INT` and generated `R.string.app_name`. The server
-imported the Gradle project, but reported that the file was not on the app
-classpath and restricted diagnostics to syntax. Its log contains Java Model
-error 969 for the existing source directory.
+`script/install-android-kotlin` builds MIT-licensed upstream commit
+`6d9e61b79d4631e75516def7ab7ff0d8b9310467`. Its existing front-end exception
+fallback fixes the object-rename crash. The bootstrap runs upstream rename tests;
+an additional disposable regression covered object rename with a shadowed
+parameter. The native IDE then renamed the library object across Kotlin files.
+This does not fix Java caller renaming or the workspace-wide classpath ceiling.
+[Source revision](https://github.com/fwcd/kotlin-language-server/tree/6d9e61b79d4631e75516def7ab7ff0d8b9310467).
 
-The second attempt explicitly enabled
-`lsp.jdtls.initialization_options.settings.java.jdt.ls.androidSupport.enabled`
-and automatic build-configuration updates. The test-owned import cache was
-moved aside, then the server restarted and reproduced the same failure. The
-temporary probe and settings were restored afterward. This is a concrete
-compatibility failure on AGP 9.4.0 / Gradle 9.6.1, not a claim that JDT LS fails
-for every Android project. The extension remains installed in the isolated
-development profile, but is not enabled automatically in new launcher profiles.
+The default and experimental JDT LS Android imports initially failed on AGP 9.4.0.
+Configure Java now exports each actual compile task in the selected Gradle task
+graph, applies the standard Eclipse model, and updates the root project through
+JDT LS. Updating only a module left stale Gradle arguments; refreshing the root
+fixed full-to-demo navigation without deleting caches. The JRE container must be
+preserved, and task dependencies cannot be read during `projectsEvaluated` under
+Gradle 9. Those findings are covered by integration evidence and the review guide.
+Java extension 6.8.26 / JDT LS 1.61.0 resolved SDK APIs, R, BuildConfig, compiled
+Kotlin libraries and deliberate type errors in the native IDE.
+[Java extension](https://github.com/zed-extensions/java),
+[JDT LS](https://github.com/eclipse-jdtls/eclipse.jdt.ls).
 
-Sources for the tested configuration:
-[Zed Java extension configuration](https://github.com/zed-extensions/java),
-[JDT LS experimental Android support](https://github.com/eclipse-jdtls/eclipse.jdt.ls).
-The logs and exact probe are retained under `target/android-ide/validation`.
+Android debugging uses MIT-licensed `fwcd/kotlin-debug-adapter` revision
+`7f05669b642d21afa46ac7b75307fa5d523a7263`, built with the pinned Kotlin server's
+shared module and Kotlin 2.1.0. The checked-in patch completes configurationDone,
+registers the intended class-prepare filters, removes obsolete breakpoint
+requests, tolerates optional source names, and disposes attached VMs on detach.
+The installed adapter passed upstream tests and a real emulator protocol test;
+the native UI passed Java/Kotlin breakpoints and stepping. The ordinary Java DAP
+adapter was separately proven, but its JDT source lookup did not resolve Kotlin
+frames correctly, so it is not the default Android attach path.
+[Adapter source](https://github.com/fwcd/kotlin-debug-adapter/tree/7f05669b642d21afa46ac7b75307fa5d523a7263).
+
+A final native test replaced the adapter executable with `/usr/bin/false` for one
+isolated process. That exposed a shared Zed DAP disconnect race. Closing request
+registration on EOF/write failure, and isolating request maps across TCP
+connections, fixes it. The deterministic regression failed before the change;
+all four DAP tests pass afterward, including reconnect. The same native failure
+now prints “debugger shutdown unexpectedly,” ends its session and removes the
+forward automatically. Quitting the earlier failed instance also removed its
+owned forward. The real adapter is restored simply by launching without that
+process-local test override. Control-D was exercised with editor focus. The real
+adapter was then rechecked: Java and Kotlin breakpoints, step-out and detach
+passed; application PID 5187 remained alive with an empty forward list.
+
+The cold-launch check also reproduced Android CLI returning before the new app
+process exists. Process discovery now retries up to 20 times with a 250 ms gap
+and a one-second timeout per ADB command, then surfaces the final failure. A
+GPUI regression checks delayed success, bounded failure and invalid PID output.
+Successful PID output is still validated before creating the forward. The final
+debug build then reached both Java and Kotlin breakpoints on its first cold
+launch after force-stopping the disposable full-flavor app.
+
+Compose preview pins Google renderer `0.0.1-alpha15` and all layoutlib components
+to `16.2.4`. The newer renderer alpha16 and published layoutlib 17.0.1 had an API
+mismatch; mixing native layoutlib versions also failed. The tested matching set
+renders independently of Android Studio. Google's compiled preview detector
+supplies method names and parameters. A small bridge exits after the alpha15
+renderer disposes its framework, because that version otherwise leaves worker
+threads alive. Render failures are checked in the result JSON, not inferred from
+an exit code. Runtime R classes come from the evaluated resource-processing task;
+compile-only R classes omit dependency resource IDs required by Compose.
+[Google screenshot tooling](https://developer.android.com/studio/preview/compose-screenshot-testing),
+[release notes](https://developer.android.com/studio/preview/compose-screenshot-testing-release-notes).
 
 ## Reproducible build environment
 
@@ -158,7 +229,7 @@ The logs and exact probe are retained under `target/android-ide/validation`.
 | Android CLI | 1.0.16261425, `/opt/homebrew/bin/android` |
 | SDK | `/Users/anil/Library/Android/sdk`; platform 37 used for fixture |
 | Smoke build | AGP 9.4.0, Gradle 9.6.1, Kotlin Compose plugin 2.2.10, Compose BOM 2026.02.01 |
-| Tools installed for this session | Pinned Rust components and the official `github/gh-stack` extension |
+| Tools installed for this session | Rust components, official gh-stack extension, task-local JDK 11, pinned Kotlin server/debugger builds, Google Compose renderer/layoutlib |
 | Tools reused | Xcode/Metal, CMake, Ninja, Homebrew, Android Studio/SDK/CLI, JDK 21, ADB/emulator, telegram-send |
 
 The upstream LiveKit build helper could not retrieve its WebRTC archive through
@@ -210,7 +281,8 @@ git -c core.whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol \
 
 The complete-stack whitespace check accepts the generated Windows wrapper's
 CRLF endings and excludes the unmodified vendored font license, which has one
-upstream trailing space. An unconfigured `git diff --check main..HEAD` reports
+upstream trailing space. The pinned debugger patch preserves upstream context
+whitespace through a scoped Git attribute. An unconfigured `git diff --check main..HEAD` reports
 those vendor-file differences; the source/doc check above passes.
 
 Set `LK_CUSTOM_WEBRTC` as above for commands that build the relevant native
@@ -244,28 +316,19 @@ versions exist; the smoke manifest has a backup-policy warning and no launcher
 icon. No lint errors. Versions were kept consistent with the verified fixture
 rather than expanding this test into dependency upgrades.
 
-## Optimized build and initial performance measurements
+## Historical optimized builds and initial performance measurements
 
-The final native source, including variant restoration, compiled successfully
-in **18 minutes 26 seconds** with four jobs. Its optimized executable reports
-`1651d598ccc367f3b1a6dbbc46ef5612a9c59103`. Combined tests and Clippy also passed
-after the local stack rebase. The report commit changes documentation only.
-The final executable passed native restart/Sync variant restoration, emulator
-startup, and Ctrl+R build/deploy of `:mobile · fullDebug` on `medium_phone`.
-ADB confirmed `dev.zed.androidsample.full` as the resumed activity. The IDE's
-Stop emulator action then completed and ADB listed no connected devices.
+The initial ten-layer prototype compiled in **18 minutes 26 seconds** with four
+jobs. That executable reported `1651d598ccc367f3b1a6dbbc46ef5612a9c59103` and
+passed native restart/Sync variant restoration, emulator startup, and Ctrl+R
+build/deploy of `:mobile · fullDebug` on `medium_phone`. Stop emulator completed
+and ADB listed no devices. These results precede the Java/debugger/preview work.
 
-The optimized IDE is left open on the smoke project with `fullDebug` selected.
-Android Studio and the test emulators are closed; the AVDs remain available for
-the next run. Gradle and ADB may retain their normal shared daemon processes.
-
-The optimized build before the variant-restoration fix passed in 18 minutes
-53 seconds using four Cargo jobs. Its executable reports
-`93d7661d5f36e208286d10dfd4be459332441142`.
-The later smoke-fixture update added an Android library without changing the
-native source. Both flavors deployed successfully on `Pixel_6a` from this build.
-The original optimized baseline build also passed,
-and repeated debug builds were used for the shorter test/fix cycles.
+An earlier optimized build passed in 18 minutes 53 seconds using four jobs and
+reported `93d7661d5f36e208286d10dfd4be459332441142`. Both flavors deployed on
+`Pixel_6a` after the library fixture was added. Repeated debug builds were used
+for shorter test/fix cycles. Neither historical revision should be described as
+the final continuation binary; the final build is recorded below.
 
 ### Warm startup observation
 
@@ -318,17 +381,121 @@ Raw JSON and all three per-process `vmmap` reports are retained in
 `target/android-ide/validation/baseline-*.txt`. This ignored directory is local
 evidence, not a committed binary payload.
 
+## Continuation checks and evidence
+
+The continuation adds four independent implementation layers after the initial
+validation commit. Focused tests now cover four Android tool tests and three native
+panel/debugger tests. Four DAP tests cover transport recovery, and five image-viewer
+tests cover reload and asset lifetime behavior. The original
+dock/panel tests remain relevant because the
+new features reuse the existing workspace and debugger views.
+
+```sh
+cargo test -p dap -p android_tools -p android_ui -p image_viewer -j 6
+./script/clippy -p dap -p android_tools -p android_ui -p project -p image_viewer \
+  --features gpui/inspector -j 6
+script/test-android-debugger --device emulator-5554
+```
+
+The optimized verification before the image-metadata correction used source
+`a602e3b17768f5eebc8978373116493c5d47bb30`. That build passed in 7 minutes 47
+seconds, restored fullDebug, rebuilt the app, configured both language servers,
+and rendered Compose with Android Studio and the emulator closed. Preview-size
+switching then exposed stale image metadata in the existing shared loader.
+
+Final source `371380b5a7420ba8d937c9b642e8feaec3c1078e` refreshes metadata with the
+new image bytes before notifying the existing viewer. Its real-file regression
+failed with stale 1×1 dimensions before the change and passed with 2×1 afterward.
+All five image-viewer tests passed, including asset-cache and split-pane checks.
+The native rebuilt app then updated the existing pane from 681×399 to 845×480
+and back, with the correct file size and working Fit to View.
+The combined 16 tests and strict Clippy pass on that complete source. Its debug
+build completed in 1 minute 10 seconds with the warm local cache. The final
+documentation commit does not alter the native source. The optimized build of
+this exact source completed successfully in **17 minutes 10 seconds** with six
+jobs; only the documented upstream linker/future-compatibility warnings remain.
+
+The debugger smoke requires the installed adapter, a running explicitly selected
+emulator, and an assembled demoDebug fixture. It affects only the sample app and
+its own port forward. Both demo/full local unit-test and lint tasks passed after
+the named Compose previews were added. The intentional rendering exception was
+removed and the original successful image remained unchanged throughout failure.
+
+| Evidence under `target/android-ide/validation` | What it establishes |
+| --- | --- |
+| `java-summary.txt`, `java-native-sdk-hover.png`, `java-native-type-diagnostic.png` | Native Android Java resolution, diagnostics and variant import findings. |
+| `kotlin-pinned-summary.txt`, `kotlin-upstream-native-rename.diff`, `kotlin-upstream-object-rename.png` | The actual Kotlin-only object rename and its scope. |
+| `kotlin-pinned-install.log`, `kotlin-head-rename-tests.log` | Reproducible source install and upstream regression evidence. |
+| `debugger-summary.txt`, `debugger-installed-smoke.log` | Java/Kotlin stops, local evaluation, handshake, retained app process and forward removal. |
+| `dap-disconnect-before.log`, `dap-disconnect-after.log`, `debugger-startup-recovery.png` | Reproduced transport failure, fixed regression and native failure recovery. |
+| `debug-native-kotlin-step.png` | Native stepping from the Kotlin library into its Compose caller. |
+| `preview-summary.txt`, `compose-native-workspace.png` | Native standalone Compose rendering and side-by-side source/image layout. |
+| `compose-native-full-default.png`, `compose-native-full-large.png` | Distinct default and large-text renders from fullDebug. |
+| `preview-native-tests.log`, `preview-native-clippy.log` | Preview model, safe output handling and native panel checks. |
+| `debug-process-wait-tests.log`, `debugger-cold-start-fixed.png` | Readiness regression and first-attempt native Java/Kotlin cold-start attachment. |
+| `debugger-real-adapter-recovery.png` | Real-adapter stepping after the shared transport fix. |
+| `final-sample-tests.log` | Both variants' unit tests and Android lint. |
+| `final-combined-tests.log`, `final-combined-clippy.log` | All 16 focused tests and strict Clippy on the complete continuation source. |
+| `final-debug-build.log`, `final-release-build.log`, `final-build.json` | Final-source debug and optimized compilation, with binary hash. |
+| `final-optimized-workspace.png`, `final-memory.json`, `final-memory-summary.log` | Final running workspace and editor/language-server memory costs. |
+| `preview-metadata-before.log`, `preview-metadata-after.log`, `preview-metadata-clippy.log` | Reproduced stale metadata and verified shared image reload fix. |
+| `preview-metadata-native-large.png`, `preview-metadata-native-default.png` | Correct dimensions and file size after native preview-size switches. |
+
+These artifacts are local and ignored. Telegram updates were sent to the
+explicitly approved configured destination, including native debugger and Compose
+images. They contain only this test IDE/project evidence.
+
+## Final running build and process snapshot
+
+The optimized `371380b5a7420ba8d937c9b642e8feaec3c1078e` executable is left open
+on the smoke project. Sync restored `:mobile · fullDebug`, and the existing source
+and real Compose preview are visible. Both language servers are running. Android
+Studio and the test emulator are closed, and `adb forward --list` is empty.
+The final workspace screenshot is `final-optimized-workspace.png`.
+
+Binary SHA-256:
+`05c66620bdb7b122d6318f3ea00f97b86f09756efd50e3f6efd8d83a5902b632`.
+`final-build.json` records the source revision, size and completed checks.
+
+Three physical-footprint samples were taken from 09:29:19 through 09:29:44 IST on
+14 September with no Rust compiler running. These are post-startup observations
+on the two-module fixture, not a controlled large-project benchmark. The first
+sample still had editor/Kotlin activity; the latter two showed about 0.4% editor
+CPU and 0% for the language servers.
+
+| Process group | Median physical footprint | Range |
+| --- | ---: | ---: |
+| Optimized editor | 334.3 MiB | 322.3–386.8 MiB |
+| Pinned Kotlin server | approximately 1.40 GiB | rounded by vmmap |
+| Java language server | 695.6 MiB | 695.6–699.5 MiB |
+| Java proxy | 1.48 MiB | 1.48 MiB |
+| Editor plus Java/Kotlin support | approximately 2.41 GiB | approximately 2.40–2.46 GiB |
+
+The owned terminal shell adds about 5.31 MiB. macOS denied `vmmap` access to its
+protected `/usr/bin/login` parent; that footprint is recorded as unavailable,
+not zero. Shared Gradle/ADB services are outside this process group. The earlier
+Android Studio measurement used a different state and fixture, so no percentage
+improvement over Studio is inferred from these final samples. Language-server
+cost remains the main memory target for future work.
+
+`final-memory.json`, `final-memory-summary.log`, and `final-memory-*.txt` retain
+all measurements, CPU/RSS observations and the unavailable-helper result.
+`measure-final-memory.py <editor-pid>` reproduces the scoped sample and verifies
+that the PID belongs to the isolated optimized app.
+
 ## Remaining acceptance gates
 
-1. **Language engine and project model:** resolve the observed rename failure;
-   choose a maintained server with suitable terms; verify Java editing,
-   per-module source sets, tests, KMP, included builds, and stale-model recovery.
-2. **Android debugger:** prove deploy/attach, Kotlin breakpoints, stepping,
-   evaluation, detach, and process death through a compatible adapter before
-   exposing a working Android Debug button.
-3. **Compose/XML preview:** demonstrate standalone rendering and resource/variant
-   correctness with a bounded worker process. This prototype does not render
-   previews; `@Preview` remains useful when opened in Android Studio.
+1. **Language engine and project model:** a maintained production Kotlin engine,
+   mixed Java/Kotlin refactoring, test/source-set visibility, KMP and included
+   builds. The observed object rename and basic Android Java import failures are
+   fixed; they are no longer pending implementation tasks.
+2. **Advanced debugging:** coroutine/inline/SMAP mappings, complex expressions,
+   deep multi-module source roots, process-death/reconnect stress and NDK/LLDB.
+   Basic Java/Kotlin deploy/attach, variables, stepping and detach are implemented.
+3. **Preview breadth:** XML design tools, interactive Compose/live edit,
+   multi-value PreviewParameter galleries, larger dependency graphs and broader
+   device/theme/locale matrices. Static Compose rendering, variant correctness,
+   annotation selection and failure preservation are implemented.
 4. **Project view and device tools:** logical Android grouping, native Logcat
    filters, AVD/SDK creation and management, split APK support, and an embedded
    emulator need their own tested increments.
@@ -352,7 +519,7 @@ screenshots and logs without adding build artifacts to the review stack:
 | --- | --- |
 | `zed-android-studio-reference.png` | Installed Android Studio layout. This early capture predates recovery of the reference project's initial sync failure. |
 | `zed-android-studio-shell.png` | Running native fork with Studio-style tool rails and build/run output. |
-| `zed-final-native-run.png` | Final optimized executable after successful full-flavor deployment on `medium_phone`. |
+| `zed-final-native-run.png` | Initial ten-layer optimized executable after full-flavor deployment on `medium_phone`. |
 | `saved-variant-restored.png` | `fullDebug` restored by Sync after a real app quit and relaunch. |
 | `zed-android-studio-light.png` | Real light-theme editor, project tree, Android controls, and successful build. |
 | `zed-android-narrow.png` | Smaller window with Android controls still reachable by scrolling. |
@@ -361,7 +528,7 @@ screenshots and logs without adding build artifacts to the review stack:
 | `zed-android-rename-error.png`, `zed-kotlin-rename-server-error.png` | Reproduced community Kotlin rename failure. |
 | `zed-java-android-import-error.png`, `jdtls-android-import.log`, `AndroidIdeJavaProbe.java` | Failed Android Java import after enabling JDT LS Android support. |
 | `zed-final-combined-tests.log`, `zed-final-combined-clippy.log` | Combined stack checks after the variant-restoration change. |
-| `zed-selection-release-build.log`, `zed-final-system-specs.txt` | Successful final optimized build and its source revision. |
+| `zed-selection-release-build.log`, `zed-final-system-specs.txt` | Initial ten-layer optimized build and its source revision. |
 | `memory-baseline.json`, `baseline-*.txt` | Three raw per-process memory samples. |
 | `helper-cleanup.json` | Scoped process check after closing the development app and Java probe. |
 | `startup-*.json`, `startup-*.log`, `zed-startup-measure.py` | Monotonic warm first-workspace-render measurements and harness. |

@@ -11,8 +11,9 @@ developer assemble a collection of terminal commands.
 Android Studio's current dark UI is the reference. Familiarity includes the
 position of controls, keyboard actions, selection behavior, and useful error
 messages, as well as colors. It does not imply that all Android Studio features
-already exist in this fork. Compose previews, Kotlin refactorings, debugger
-support, and profilers need separate implementations and acceptance tests.
+already exist in this fork. Compose rendering and JVM debugging now have tested
+implementations; advanced refactorings, Kotlin coroutine debugging, interactive
+previews, XML design tools, and profilers still need separate acceptance tests.
 
 The initial target is local development on Apple Silicon macOS, the environment
 available for development and testing. Keep subprocess construction and settings
@@ -22,29 +23,39 @@ installer; this is an independent fork, not an official Android Studio build.
 
 ## Findings and architectural decisions
 
-### Implementation checkpoint after the first working prototype
+### Implementation checkpoint after the language, debugger, and preview work
 
-The initial edit/build/run slice is implemented on ten local stack branches.
+The local stack now contains the original ten layers plus Java support, the
+pinned Kotlin runtime, Android debugging, Compose preview, and final validation.
 See [validation evidence](ANDROID_IDE_VALIDATION.md) and the
-[per-layer review guide](ANDROID_IDE_REVIEW.md) for the actual branch names and
-checks. The numbered roadmap below remains the product plan; later language,
-project-model, debugging, preview, and release gates are not complete.
+[per-layer review guide](ANDROID_IDE_REVIEW.md) for exact branches and checks.
+Nothing has been pushed or submitted to GitHub.
 
-The running prototype now includes Studio themes and tool rails, Android target
-and device selection, build/run/test/lint/Logcat, emulator start/stop, an isolated
-macOS launcher, and a two-module/two-flavor Compose smoke project. Kotlin setup
-resolves Android/Compose, generated Java symbols, and an Android library API.
+The native app includes Studio themes/tool rails/keybindings, evaluated Android
+targets, variant persistence, build/run/test/lint/Logcat, emulator start/stop,
+and an isolated macOS launcher. The two-module/two-flavor fixture exercises
+Android resources, generated symbols, Java/Kotlin calls and Compose previews.
 
-Language-server testing changed the risk assessment: the tested official server
-build had expired, while the community compatibility server works for basic
-editing but is deprecated and failed a real cross-module rename. The next
-language milestone must resolve this dependency choice and the failing fixture
-before treating refactoring as supported. Keep the compatibility implementation
-replaceable; do not expand it into a homegrown Kotlin compiler or indexer.
+Java setup exports the actual selected AGP compile graph into JDT LS's normal
+Eclipse/Buildship import. Android SDK, generated resources and BuildConfig,
+library symbols, type diagnostics, and full-to-demo navigation were verified.
+The pinned community Kotlin build fixes the reproduced object-rename crash;
+Java callers are still outside that Kotlin rename transaction. The deprecated
+server remains a compatibility choice, so a maintained production language
+engine and broader source-set/KMP coverage remain product gates.
 
-Initial optimized-editor memory and warm first-workspace-render measurements
-are recorded with their limits in the validation report. They are encouraging
-prototype evidence, not a feature-equivalent Android Studio benchmark.
+Android Debug uses the existing native debugger with a pinned, minimally patched
+community JVM adapter. Native Java/Kotlin breakpoints, local variables, stepping
+and detach work on the emulator. Compose preview uses downloaded Google tooling,
+compiled annotation discovery, the selected variant's runtime classes/resources,
+and the existing image viewer. Both variants and multiple preview configurations
+render with Android Studio closed and no device connected.
+
+The final optimized editor measured about 334 MiB, and about 2.41 GiB including
+its Java and Kotlin language support, on the small fixture. Exact samples and
+the earlier warm first-workspace-render measurements are in the validation
+report. Language-server cost remains the main memory target; these observations
+do not establish a feature-equivalent Android Studio performance advantage.
 
 ### What the fork already provides
 
@@ -303,7 +314,9 @@ and inspect output from inside the fork. Test empty and invalid states too.
 
 ### 5. Kotlin/Java Android intelligence
 
-Branch: `codex/android-ide/language-support`.
+Implemented layers: `codex/android-ide/java-support` and
+`codex/android-ide/kotlin-runtime`. The basic Android editing gate is met on the
+fixture; mixed-language rename, test/source-set visibility and KMP remain open.
 
 1. Install and pin a candidate Kotlin server through the existing extension path.
 2. Verify completion for Android and Compose APIs, imports, diagnostics, and
@@ -341,7 +354,9 @@ replacing the terminal fallback. Keep device-side changes explicit.
 
 ### 8. Android debugging
 
-Branch: `codex/android-ide/debugger`.
+Branch: `codex/android-ide/debugger`. Basic deploy/attach, Java/Kotlin line
+breakpoints, local evaluation, stepping and detach are implemented and tested.
+Coroutine/inline mappings, advanced expressions and native debugging remain open.
 
 Prove a DAP/JDWP adapter path with a debuggable fixture. Add deploy-and-attach,
 breakpoint mapping, step/continue, variables, evaluation, and detach. Test Kotlin
@@ -350,7 +365,10 @@ advertise native C++ debugging until LLDB/NDK support has its own test.
 
 ### 9. UI preview spike
 
-Branch: `codex/android-ide/preview-spike`.
+Implemented branch: `codex/android-ide/compose-preview`. Standalone static
+Compose rendering, variant resources, annotation selection and failure handling
+are verified. Interactive previews, multi-value parameter galleries and XML
+design tooling remain open.
 
 Produce an evidence-backed prototype for standalone Compose rendering. Establish
 variant/resource classpaths, classloader isolation, rendering process lifetime,
@@ -403,9 +421,11 @@ does not prove a runtime or binary-size benefit. Profile startup and helper
 lifetimes first. Keep Android integration concentrated in a small number of
 modules, with upstream APIs reused and changes documented per stack layer.
 
-The current implementation session prioritizes the first end-to-end edit,
-build, device, and run slice. Remaining milestones are a development roadmap,
-not an assertion that full Android Studio parity can be delivered in one sitting.
+The implemented workflow now covers editing, build/run, Java/Kotlin debugging
+and standalone Compose rendering. The remaining milestones prioritize broader
+project compatibility, robust language semantics, representative performance
+measurements and a distributable product. They are not claims of completed
+Android Studio parity.
 
 ## Sources
 
