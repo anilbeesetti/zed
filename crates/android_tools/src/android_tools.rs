@@ -165,6 +165,32 @@ pub struct AndroidTarget {
     pub output_listing: PathBuf,
 }
 
+pub struct AndroidApk {
+    pub paths: Vec<PathBuf>,
+    pub application_id: Option<String>,
+}
+
+impl AndroidApk {
+    pub fn debug_application_id(&self) -> Result<&str> {
+        let application_id = self
+            .application_id
+            .as_deref()
+            .context("The APK metadata has no application ID")?;
+        ensure!(
+            application_id.contains('.')
+                && application_id.split('.').all(|part| {
+                    !part.is_empty()
+                        && part.starts_with(|character: char| character.is_ascii_alphabetic())
+                        && part
+                            .chars()
+                            .all(|character| character.is_ascii_alphanumeric() || character == '_')
+                }),
+            "The APK metadata has an invalid application ID"
+        );
+        Ok(application_id)
+    }
+}
+
 impl AndroidTarget {
     pub fn label(&self) -> String {
         format!("{} · {}", self.module, self.variant)
@@ -183,6 +209,10 @@ impl AndroidTarget {
     }
 
     pub fn apk_paths(&self) -> Result<Vec<PathBuf>> {
+        Ok(self.apk()?.paths)
+    }
+
+    pub fn apk(&self) -> Result<AndroidApk> {
         let listing = fs::read_to_string(&self.output_listing).with_context(|| {
             format!(
                 "Build {} before running it: the APK listing is missing",
@@ -230,7 +260,7 @@ impl AndroidTarget {
             .parent()
             .context("APK metadata has no parent directory")?
             .canonicalize()?;
-        metadata
+        let paths = metadata
             .elements
             .into_iter()
             .map(|element| {
@@ -258,7 +288,11 @@ impl AndroidTarget {
                 );
                 Ok(path)
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        Ok(AndroidApk {
+            paths,
+            application_id: metadata.application_id,
+        })
     }
 }
 
@@ -331,6 +365,7 @@ struct ApkMetadata {
     version: u32,
     artifact_type: ArtifactType,
     variant_name: String,
+    application_id: Option<String>,
     elements: Vec<ApkElement>,
 }
 
@@ -437,12 +472,20 @@ mod tests {
         )?;
         fs::write(root.join("app.apk"), b"test fixture")?;
         let metadata_path = root.join("output-metadata.json");
-        let metadata = serde_json::json!({"version": 3, "artifactType": {"type": "APK"}, "variantName": "freeDebug", "elements": [{"filters": [], "outputFile": "app.apk"}]});
+        let metadata = serde_json::json!({"version": 3, "artifactType": {"type": "APK"}, "variantName": "freeDebug", "applicationId": "dev.zed.sample", "elements": [{"filters": [], "outputFile": "app.apk"}]});
         fs::write(&metadata_path, serde_json::to_vec(&metadata)?)?;
         assert_eq!(
             target.apk_paths()?,
             vec![root.join("app.apk").canonicalize()?]
         );
+        assert_eq!(target.apk()?.debug_application_id()?, "dev.zed.sample");
+        for invalid_id in ["", "one", "dev..app", "dev.app;id", "dev.1app", "dev.app\n"] {
+            let apk = AndroidApk {
+                paths: Vec::new(),
+                application_id: Some(invalid_id.into()),
+            };
+            assert!(apk.debug_application_id().is_err());
+        }
         for field in ["../app.apk", "/tmp/app.apk", "missing.apk"] {
             let mut invalid = metadata.clone();
             invalid["elements"][0]["outputFile"] = field.into();

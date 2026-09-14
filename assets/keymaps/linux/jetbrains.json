@@ -239,6 +239,7 @@
     "bindings": {
       "ctrl-f9": "android::Build",
       "shift-f10": "android::Run",
+      "shift-f9": "android::Debug",
       "alt-6": "android::Logcat",
       "ctrl-alt-y": "android::SyncProject",
     },

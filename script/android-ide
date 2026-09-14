@@ -26,7 +26,8 @@ unless --profile is supplied. Existing profile settings are preserved.
 Prerequisites: the repository's Rust toolchain, Xcode with Metal tools, Android
 CLI, Android SDK, and a Gradle-compatible JDK. Kotlin setup additionally needs
 JDK 21. Run script/install-android-kotlin for the pinned Kotlin server and rename
-fixes. The Android Studio runtime is used for Gradle when JAVA_HOME is unset.
+fixes, and script/install-android-debugger for Java/Kotlin breakpoints and stepping.
+The Android Studio runtime is used for Gradle when JAVA_HOME is unset.
 
 The launcher honors CARGO_TARGET_DIR and LK_CUSTOM_WEBRTC. Set CARGO_BUILD_JOBS
 to limit build concurrency. Quit this development app before rebuilding it.
@@ -98,6 +99,11 @@ fi
 kotlin_server="$repository/target/android-ide/dependencies/kotlin-language-server/bin/kotlin-language-server"
 if [[ -z ${ANDROID_IDE_KOTLIN_SERVER:-} && -x "$kotlin_server" ]]; then
     export ANDROID_IDE_KOTLIN_SERVER="$kotlin_server"
+fi
+
+kotlin_debugger="$repository/target/android-ide/dependencies/kotlin-debug-adapter/bin/kotlin-debug-adapter"
+if [[ -z ${ANDROID_IDE_KOTLIN_DEBUGGER:-} && -x "$kotlin_debugger" ]]; then
+    export ANDROID_IDE_KOTLIN_DEBUGGER="$kotlin_debugger"
 fi
 
 echo "App: $bundle"

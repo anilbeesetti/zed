@@ -1,3 +1,5 @@
+mod android_debugger;
+
 use android_tools::{
     AndroidTarget, Device, adb_path, android_cli_path, emulator_path, is_gradle_project,
     parse_devices, parse_emulators, parse_targets,
@@ -42,6 +44,8 @@ actions!(
         Build,
         /// Builds and launches the selected Android variant on the selected device.
         Run,
+        /// Builds and debugs the selected Android variant on the selected device.
+        Debug,
         /// Runs local unit tests for the selected Android variant.
         Test,
         /// Runs Android lint for the selected variant.
@@ -54,6 +58,7 @@ actions!(
 );
 
 pub fn init(cx: &mut App) {
+    dap::DapRegistry::global(cx).add_adapter(Arc::new(android_debugger::AndroidKotlinAdapter));
     cx.observe_new(|workspace: &mut Workspace, window, cx| {
         let Some(window) = window else { return };
         let panel = cx
@@ -83,6 +88,11 @@ pub fn init(cx: &mut App) {
             .register_action(|workspace, _: &Run, window, cx| {
                 with_panel(workspace, window, cx, |panel, window, cx| {
                     panel.gradle(GradleOperation::Run, window, cx)
+                })
+            })
+            .register_action(|workspace, _: &Debug, window, cx| {
+                with_panel(workspace, window, cx, |panel, window, cx| {
+                    panel.gradle(GradleOperation::Debug, window, cx)
                 })
             })
             .register_action(|workspace, _: &Test, window, cx| {
@@ -137,6 +147,7 @@ pub fn toolbar(workspace: &WeakEntity<Workspace>, cx: &App) -> Option<Entity<And
 enum GradleOperation {
     Build,
     Run,
+    Debug,
     Test,
     Lint,
     Kotlin,
@@ -144,7 +155,8 @@ enum GradleOperation {
 }
 
 enum AfterTask {
-    Deploy(AndroidTarget, String),
+    Deploy(AndroidTarget, String, bool),
+    AttachDebugger(PathBuf, String, String),
     Kotlin(AndroidTarget),
     Java(AndroidTarget),
     RefreshDevices,
@@ -200,6 +212,9 @@ pub struct AndroidPanel {
     _startup_subscriptions: Vec<Subscription>,
     kotlin_task: Option<Task<()>>,
     java_task: Option<Task<()>>,
+    debug_task: Option<Task<()>>,
+    debug_forward: Option<android_debugger::Forward>,
+    _debug_subscriptions: Vec<Subscription>,
     java_refresh: Option<(PathBuf, serde_json::Value)>,
     java_status_subscription: Option<lsp::Subscription>,
     _project_subscription: Subscription,
@@ -223,7 +238,7 @@ impl AndroidPanel {
             panel: panel.downgrade(),
             _subscription: cx.observe(&panel, |_, _, cx| cx.notify()),
         });
-        Self {
+        let mut panel = Self {
             workspace,
             project,
             toolbar,
@@ -251,10 +266,15 @@ impl AndroidPanel {
             _startup_subscriptions: Vec::new(),
             kotlin_task: None,
             java_task: None,
+            debug_task: None,
+            debug_forward: None,
+            _debug_subscriptions: Vec::new(),
             java_refresh: None,
             java_status_subscription: None,
             _project_subscription: project_subscription,
-        }
+        };
+        panel._debug_subscriptions = panel.observe_debugger(cx);
+        panel
     }
 
     fn observe_project_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -550,10 +570,19 @@ impl AndroidPanel {
                 .selected_target
                 .clone()
                 .context("Sync the Android project and select a build variant first.")?;
+            if matches!(operation, GradleOperation::Debug) {
+                android_debugger::binary()?;
+                android_tools::kotlin::java_home()?;
+                ensure!(
+                    self.debug_forward.is_none(),
+                    "Disconnect the current Android debug session before starting another."
+                );
+            }
             let after_task = match operation {
-                GradleOperation::Run => Some(AfterTask::Deploy(
+                GradleOperation::Run | GradleOperation::Debug => Some(AfterTask::Deploy(
                     target.clone(),
                     self.selected_device()?.serial.clone(),
+                    matches!(operation, GradleOperation::Debug),
                 )),
                 GradleOperation::Kotlin => Some(AfterTask::Kotlin(target.clone())),
                 GradleOperation::Java => Some(AfterTask::Java(target.clone())),
@@ -562,6 +591,7 @@ impl AndroidPanel {
             let (name, gradle_task) = match operation {
                 GradleOperation::Build
                 | GradleOperation::Run
+                | GradleOperation::Debug
                 | GradleOperation::Kotlin
                 | GradleOperation::Java => ("Build", target.gradle_task("assemble", "")),
                 GradleOperation::Test => ("Test", target.gradle_task("test", "UnitTest")),
@@ -624,7 +654,8 @@ impl AndroidPanel {
                         ScheduledTaskResult::Success => {
                             panel.status = "Task completed successfully".into();
                             match after_task {
-                                Some(AfterTask::Deploy(target, serial)) => panel.deploy(target, serial, window, cx),
+                                Some(AfterTask::Deploy(target, serial, debug)) => panel.deploy(target, serial, debug, window, cx),
+                                Some(AfterTask::AttachDebugger(root, serial, application_id)) => panel.attach_debugger(root, serial, application_id, window, cx),
                                 Some(AfterTask::Kotlin(target)) => panel.configure_kotlin(target, window, cx),
                                 Some(AfterTask::Java(target)) => panel.configure_java(target, window, cx),
                                 Some(AfterTask::RefreshDevices) => panel.refresh_devices(cx),
@@ -652,6 +683,7 @@ impl AndroidPanel {
         &mut self,
         target: AndroidTarget,
         serial: String,
+        debug: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -661,36 +693,54 @@ impl AndroidPanel {
         self.deploy_task = Some(cx.spawn_in(window, async move |panel, cx| {
             let result = cx
                 .background_spawn(async move {
-                    let paths = target.apk_paths()?;
+                    let apk = target.apk()?;
+                    let application_id = if debug {
+                        Some(apk.debug_application_id()?.to_owned())
+                    } else {
+                        None
+                    };
                     Ok::<_, anyhow::Error>((
                         android_cli_path()?,
-                        paths
+                        apk.paths
                             .into_iter()
                             .map(|path| path.to_string_lossy().into_owned())
                             .collect::<Vec<_>>()
                             .join(","),
+                        application_id,
                     ))
                 })
                 .await;
             panel
                 .update_in(cx, |panel, window, cx| {
                     panel.running = false;
-                    let result = result.and_then(|(program, apks)| {
+                    let result = result.and_then(|(program, apks, application_id)| {
                         let root = root.context("The Android project was closed.")?;
                         ensure!(
                             panel.trusted_root(cx)? == root,
                             "The selected Android project changed during the build."
                         );
+                        let mut args = vec![
+                            "run".into(),
+                            format!("--device={serial}"),
+                            format!("--apks={apks}"),
+                        ];
+                        if debug {
+                            args.push("--debug".into());
+                        }
+                        let after = application_id.map(|application_id| {
+                            AfterTask::AttachDebugger(root.clone(), serial, application_id)
+                        });
                         panel.schedule(
-                            "Android Run".into(),
+                            if debug {
+                                "Android Debug"
+                            } else {
+                                "Android Run"
+                            }
+                            .into(),
                             program,
-                            vec![
-                                "run".into(),
-                                format!("--device={serial}"),
-                                format!("--apks={apks}"),
-                            ],
+                            args,
                             root,
-                            None,
+                            after,
                             window,
                             cx,
                         )
@@ -1294,6 +1344,22 @@ impl AndroidPanel {
                     })),
             )
             .child(
+                IconButton::new("android-debug", IconName::Debug)
+                    .tab_index(0isize)
+                    .aria_label("Debug app")
+                    .disabled(
+                        self.running
+                            || self.syncing
+                            || self.debug_forward.is_some()
+                            || self.selected_target.is_none()
+                            || self.selected_device().is_err(),
+                    )
+                    .tooltip(|_, cx| Tooltip::for_action("Debug app", &Debug, cx))
+                    .on_click(cx.listener(|panel, _, window, cx| {
+                        panel.gradle(GradleOperation::Debug, window, cx)
+                    })),
+            )
+            .child(
                 IconButton::new("android-build", IconName::ToolHammer)
                     .tab_index(0isize)
                     .aria_label("Build selected variant")
@@ -1364,12 +1430,13 @@ impl Render for AndroidPanel {
         let commands = [
             (GradleOperation::Build, "Build"),
             (GradleOperation::Run, "Run"),
+            (GradleOperation::Debug, "Debug"),
             (GradleOperation::Test, "Test"),
             (GradleOperation::Lint, "Lint"),
         ]
         .into_iter()
         .map(|(operation, label)| {
-            let is_run = matches!(operation, GradleOperation::Run);
+            let is_run = matches!(operation, GradleOperation::Run | GradleOperation::Debug);
             Button::new(label, label)
                 .when(is_run, |button| button.style(ButtonStyle::Filled))
                 .disabled(

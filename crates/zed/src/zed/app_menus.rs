@@ -271,6 +271,7 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
             disabled: false,
             items: vec![
                 MenuItem::action("Run App", android_ui::Run),
+                MenuItem::action("Debug App", android_ui::Debug),
                 MenuItem::action("Build Selected Variant", android_ui::Build),
                 MenuItem::action("Run Unit Tests", android_ui::Test),
                 MenuItem::action("Run Android Lint", android_ui::Lint),

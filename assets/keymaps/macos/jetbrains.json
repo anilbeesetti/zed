@@ -244,6 +244,7 @@
     "bindings": {
       "cmd-f9": "android::Build",
       "ctrl-r": "android::Run",
+      "ctrl-d": "android::Debug",
       "cmd-6": "android::Logcat",
       "cmd-alt-y": "android::SyncProject",
     },

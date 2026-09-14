@@ -724,6 +724,9 @@ version = "0.1.0"
 dependencies = [
  "android_tools",
  "anyhow",
+ "async-trait",
+ "collections",
+ "dap",
  "db",
  "futures 0.3.34",
  "gpui",
