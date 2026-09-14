@@ -871,9 +871,6 @@ impl AndroidPanel {
     }
 
     fn device_picker(&self, id: &'static str, cx: &Context<Self>) -> impl IntoElement {
-        let devices = self.devices.clone();
-        let emulators = self.emulators.clone();
-        let emulator_serials = self.emulator_serials.clone();
         let panel = cx.weak_entity();
         let label = self
             .selected_device()
@@ -891,20 +888,39 @@ impl AndroidPanel {
                     .disabled(self.running)
                     .tab_index(0isize),
             )
-            .menu(move |window, cx| {
-                Some(ContextMenu::build(window, cx, |mut menu, _, _| {
-                    for device in &devices {
-                        if emulator_serials
-                            .values()
-                            .any(|serial| serial == &device.serial)
-                        {
-                            continue;
-                        }
-                        let panel = panel.clone();
-                        let device = device.clone();
-                        let label =
-                            format!("{} · {} · {}", device.model, device.serial, device.state);
-                        menu = menu.entry(label, None, move |_, cx| {
+            .menu(move |window, cx| Some(Self::device_menu(panel.upgrade()?, window, cx)))
+    }
+
+    fn device_menu(panel: Entity<Self>, window: &mut Window, cx: &mut App) -> Entity<ContextMenu> {
+        panel.update(cx, |panel, cx| panel.refresh_devices(cx));
+        let menu = ContextMenu::build_persistent(window, cx, {
+            let panel = panel.clone();
+            move |mut menu, _, cx| {
+                let state = panel.read(cx);
+                if state.refreshing_devices {
+                    menu = menu.label("Refreshing devices…");
+                } else if state.device_error.is_some() || state.emulator_error.is_some() {
+                    menu = menu.label("Device refresh failed. See Android tools for details.");
+                }
+                for device in &state.devices {
+                    if state
+                        .emulator_serials
+                        .values()
+                        .any(|serial| serial == &device.serial)
+                    {
+                        continue;
+                    }
+                    let panel = panel.downgrade();
+                    let device = device.clone();
+                    let label = format!("{} · {} · {}", device.model, device.serial, device.state);
+                    menu = menu.toggleable_entry_disabled_when(
+                        label,
+                        state.selected_avd.is_none()
+                            && state.selected_serial.as_ref() == Some(&device.serial),
+                        state.refreshing_devices,
+                        IconPosition::Start,
+                        None,
+                        move |_, cx| {
                             panel
                                 .update(cx, |panel, cx| {
                                     panel.selected_serial = Some(device.serial.clone());
@@ -912,25 +928,32 @@ impl AndroidPanel {
                                     cx.notify();
                                 })
                                 .log_err();
-                        });
-                    }
-                    if !emulators.is_empty() {
-                        menu = menu.header("Virtual devices");
-                    }
-                    for name in &emulators {
-                        let panel = panel.clone();
-                        let serial = emulator_serials.get(name).cloned();
-                        let label = format!(
-                            "{} · {}",
-                            name,
-                            if serial.is_some() {
-                                "running"
-                            } else {
-                                "stopped"
-                            }
-                        );
-                        let name = name.clone();
-                        menu = menu.entry(label, None, move |_, cx| {
+                        },
+                    );
+                }
+                if !state.emulators.is_empty() {
+                    menu = menu.header("Virtual devices");
+                }
+                for name in &state.emulators {
+                    let panel = panel.downgrade();
+                    let serial = state.emulator_serials.get(name).cloned();
+                    let label = format!(
+                        "{} · {}",
+                        name,
+                        if serial.is_some() {
+                            "running"
+                        } else {
+                            "stopped"
+                        }
+                    );
+                    let name = name.clone();
+                    menu = menu.toggleable_entry_disabled_when(
+                        label,
+                        state.selected_avd.as_ref() == Some(&name),
+                        state.refreshing_devices,
+                        IconPosition::Start,
+                        None,
+                        move |_, cx| {
                             panel
                                 .update(cx, |panel, cx| {
                                     panel.selected_avd = Some(name.clone());
@@ -938,17 +961,30 @@ impl AndroidPanel {
                                     cx.notify();
                                 })
                                 .log_err();
-                        });
-                    }
-                    let panel = panel.clone();
-                    menu.separator()
-                        .entry("Refresh devices", None, move |_, cx| {
-                            panel
-                                .update(cx, |panel, cx| panel.refresh_devices(cx))
-                                .log_err();
-                        })
-                }))
+                        },
+                    );
+                }
+                let panel = panel.downgrade();
+                menu.separator()
+                    .entry("Refresh devices", None, move |_, cx| {
+                        panel
+                            .update(cx, |panel, cx| panel.refresh_devices(cx))
+                            .log_err();
+                    })
+                    .keep_open_on_confirm(false)
+            }
+        });
+        menu.update(cx, |_, cx| {
+            cx.observe_in(&panel, window, |menu, _, window, cx| {
+                menu.rebuild(window, cx);
+                // The refresh can reorder rows; never confirm a different device
+                // using the keyboard index from the previous list.
+                menu.clear_selected();
+                menu.select_toggled_or_first(window, cx);
             })
+            .detach();
+        });
+        menu
     }
 
     fn start_emulator(
@@ -1464,6 +1500,51 @@ mod tests {
     };
     use serde_json::json;
     use workspace::AppState;
+
+    #[gpui::test]
+    async fn device_menu_uses_refreshed_devices_and_preserves_selection(cx: &mut TestAppContext) {
+        let _app_state = cx.update(AppState::test);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let panel = cx.new(|cx| AndroidPanel::new(workspace.downgrade(), project, cx));
+        panel.update(cx, |panel, _| {
+            // Supply completion below instead of running host SDK processes.
+            panel.refreshing_devices = true;
+            panel.devices = parse_devices(
+                "List of devices attached\nold device model:Old\nselected device model:Selected\n",
+            )
+            .expect("Valid devices");
+            panel.selected_serial = Some("selected".into());
+        });
+        let menu = cx.update(|window, cx| AndroidPanel::device_menu(panel.clone(), window, cx));
+        panel.update(cx, |panel, cx| {
+            panel.devices.reverse();
+            panel.refreshing_devices = false;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        menu.update_in(cx, |menu, window, cx| {
+            menu.confirm(&Default::default(), window, cx);
+        });
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.selected_serial.as_deref(), Some("selected"));
+        });
+        panel.update(cx, |panel, cx| {
+            panel.devices =
+                parse_devices("List of devices attached\nreplacement device model:Replacement\n")
+                    .expect("Valid replacement device");
+            cx.notify();
+        });
+        cx.run_until_parked();
+        menu.update_in(cx, |menu, window, cx| {
+            menu.confirm(&Default::default(), window, cx);
+        });
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.selected_serial.as_deref(), Some("replacement"));
+            assert!(panel.selected_device().is_ok());
+        });
+    }
 
     #[gpui::test]
     async fn android_panel_respects_trust_roots_and_device_state(cx: &mut TestAppContext) {
