@@ -8,7 +8,7 @@
 +    var autoConvertToKotlin: Boolean = false,
 +    var sourceArchives: List<String> = emptyList()
  )
- 
+
  data class InlayHintsConfiguration(
 --- a/server/src/main/kotlin/org/javacs/kt/KotlinWorkspaceService.kt
 +++ b/server/src/main/kotlin/org/javacs/kt/KotlinWorkspaceService.kt
@@ -19,7 +19,7 @@
 +                get("sourceArchives")?.asJsonArray?.let { externalSources.sourceArchives = it.map { path -> path.asString } }
              }
          }
- 
+
 --- a/server/src/main/kotlin/org/javacs/kt/definition/GoToDefinition.kt
 +++ b/server/src/main/kotlin/org/javacs/kt/definition/GoToDefinition.kt
 @@ -21,6 +21,18 @@
@@ -38,7 +38,7 @@
 +import org.jetbrains.org.objectweb.asm.ClassReader
 +import org.jetbrains.org.objectweb.asm.ClassVisitor
 +import org.jetbrains.org.objectweb.asm.Opcodes
- 
+
  private val cachedTempFiles = mutableMapOf<KlsURI, Path>()
  private val definitionPattern = Regex("(?:class|interface|object|fun)\\s+(\\w+)")
 @@ -33,10 +45,19 @@
@@ -54,17 +54,17 @@
 +        ((it as? DeclarationDescriptorWithSource)?.source as? KotlinJvmBinarySourceElement)?.binaryClass
 +            ?: ((it as? DeserializedMemberDescriptor)?.containerSource as? JvmPackagePartSource)?.knownJvmBinaryClass
 +    }.firstOrNull()
- 
+
      LOG.info("Found declaration descriptor {}", target)
 -    var destination = location(target)
 +    var destination = location(target) ?: binary?.location?.takeIf { "!/" in it }?.let {
 +        Location(Paths.get(it).toUri().toString(), Range(Position(0, 0), Position(0, 0)))
 +    }
      val psi = target.findPsi()
- 
+
      if (psi is KtNamedDeclaration) {
 @@ -48,7 +69,13 @@
- 
+
          if (isInsideArchive(rawClassURI, cp)) {
              parseURI(rawClassURI).toKlsURI()?.let { klsURI ->
 -                val (klsSourceURI, content) = classContentProvider.contentOf(klsURI)
@@ -75,13 +75,13 @@
 +                    }, ClassReader.SKIP_CODE or ClassReader.SKIP_FRAMES)
 +                    sourceFile
 +                })
- 
+
                  if (config.useKlsScheme) {
                      // Defer decompilation until a jarClassContents request is sent
 @@ -71,17 +98,20 @@
                      destination.uri = tmpFile.toUri().toString()
                  }
- 
+
 -                if (destination.range.isZero) {
 +                if (klsSourceURI.source || destination.range.isZero) {
                      // Try to find the definition inside the source directly
@@ -146,7 +146,7 @@
 +import java.net.URI
 +import java.nio.file.Paths
 +import java.util.zip.ZipFile
- 
+
  /**
   * Provides the source code for classes located inside
 @@ -34,9 +37,9 @@
@@ -191,7 +191,7 @@
 --- a/server/src/main/kotlin/org/javacs/kt/externalsources/FernFlowerDecompiler.kt
 +++ b/server/src/main/kotlin/org/javacs/kt/externalsources/FernFlowerDecompiler.kt
 @@ -17,6 +17,7 @@
- 
+
      private val decompilerOptions =
          arrayOf(
 +            "-log=WARN", // Per-class INFO messages can block the LSP output pipe.
@@ -201,14 +201,14 @@
 --- a/server/src/main/kotlin/org/javacs/kt/externalsources/KlsURI.kt
 +++ b/server/src/main/kotlin/org/javacs/kt/externalsources/KlsURI.kt
 @@ -86,7 +86,7 @@
- 
+
      fun withFileExtension(newExtension: String): KlsURI {
          val (parentUri, fileName) = fileUri.toString().partitionAroundLast("/")
 -        val newUri = URI("$parentUri${fileName.split(".").first()}.$newExtension")
 +        val newUri = URI("$parentUri${fileName.substringBeforeLast(".")}.$newExtension")
          return KlsURI(newUri, query)
      }
- 
+
 --- a/server/src/main/kotlin/org/javacs/kt/symbols/Symbols.kt
 +++ b/server/src/main/kotlin/org/javacs/kt/symbols/Symbols.kt
 @@ -7,7 +7,7 @@
@@ -223,26 +223,52 @@
 @@ -59,7 +59,7 @@
  private fun workspaceSymbol(d: KtNamedDeclaration): WorkspaceSymbol? {
      val name = d.name ?: return null
- 
+
 -    return WorkspaceSymbol(name, symbolKind(d), Either.forRight(workspaceLocation(d)), symbolContainer(d))
 +    return WorkspaceSymbol(name, symbolKind(d), Either.forLeft(workspaceLocation(d)), symbolContainer(d))
  }
- 
+
  private fun symbolKind(d: KtNamedDeclaration): SymbolKind =
 @@ -73,11 +73,11 @@
              else -> throw IllegalArgumentException("Unexpected symbol $d")
          }
- 
+
 -private fun workspaceLocation(d: KtNamedDeclaration): WorkspaceSymbolLocation {
 +private fun workspaceLocation(d: KtNamedDeclaration): Location {
      val file = d.containingFile
      val uri = file.toPath().toUri().toString()
- 
+
 -    return WorkspaceSymbolLocation(uri)
 +    return Location(uri, range(file.text, d.nameIdentifier?.textRange ?: d.textRange))
  }
- 
+
  private fun symbolContainer(d: KtNamedDeclaration): String? =
+--- a/server/src/test/kotlin/org/javacs/kt/ClassPathTest.kt
++++ b/server/src/test/kotlin/org/javacs/kt/ClassPathTest.kt
+@@ -45,3 +45,23 @@
+         assertThat(findKotlinStdlib(), notNullValue())
+     }
+ }
++
++class ExplicitClassPathTest {
++    @Test fun `root hook avoids rediscovering Gradle modules`() {
++        org.junit.Assume.assumeFalse(System.getProperty("os.name").startsWith("Windows"))
++        val root = Files.createTempDirectory("explicit-classpath")
++        try {
++            val jar = Files.createFile(root.resolve("dependency.jar"))
++            val script = root.resolve("kls-classpath.sh")
++            Files.writeString(script, "#!/bin/sh\nprintf '%s' '${jar}'\n")
++            assertTrue(script.toFile().setExecutable(true))
++            Files.writeString(root.resolve("build.gradle"), "throw new Exception('must not discover Gradle')")
++            val resolver = defaultClassPathResolver(listOf(root))
++            assertTrue(resolver.classpath.any { it.compiledJar == jar })
++            assertTrue(resolver.buildScriptClasspath.all { it.fileName.toString().startsWith("kotlin-stdlib") })
++            assertTrue(!resolver.resolverType.contains("Gradle"))
++        } finally {
++            assertTrue(root.toFile().deleteRecursively())
++        }
++    }
++}
 --- a/server/src/test/kotlin/org/javacs/kt/DefinitionTest.kt
 +++ b/server/src/test/kotlin/org/javacs/kt/DefinitionTest.kt
 @@ -75,3 +75,87 @@
@@ -344,8 +370,8 @@
 +        org.junit.Assert.assertTrue(found.all { it.location.left.range.end.line > it.location.left.range.start.line || it.location.left.range.end.character > it.location.left.range.start.character })
          val byKind = found.groupBy({ it.kind }, { it.name })
          val all = found.map { it.name }.toList()
- 
---- /dev/null
+
+--- a/server/src/test/kotlin/org/javacs/kt/externalsources/AttachedSourcesTest.kt
 +++ b/server/src/test/kotlin/org/javacs/kt/externalsources/AttachedSourcesTest.kt
 @@ -0,0 +1,40 @@
 +package org.javacs.kt.externalsources
@@ -388,3 +414,18 @@
 +        }
 +    }
 +}
+--- a/shared/src/main/kotlin/org/javacs/kt/classpath/DefaultClassPathResolver.kt
++++ b/shared/src/main/kotlin/org/javacs/kt/classpath/DefaultClassPathResolver.kt
+@@ -17,6 +17,12 @@
+
+ /** Searches the workspace for all files that could provide classpath info. */
+ private fun workspaceResolvers(workspaceRoot: Path): Sequence<ClassPathResolver> {
++    // An explicit root hook already supplies the project model; rediscovering each
++    // Gradle module delays initialization and can replace the synced variant.
++    val explicit = workspaceRoot.toFile().listFiles()?.firstNotNullOfOrNull {
++        ShellClassPathResolver.maybeCreate(it.toPath())
++    }
++    if (explicit != null) return sequenceOf(explicit)
+     val ignored: List<PathMatcher> = ignoredPathPatterns(workspaceRoot, workspaceRoot.resolve(".gitignore"))
+     return folderResolvers(workspaceRoot, ignored).asSequence()
+ }
