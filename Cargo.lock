@@ -735,6 +735,7 @@ dependencies = [
  "serde_json",
  "settings",
  "task",
+ "tempfile",
  "ui",
  "util",
  "workspace",

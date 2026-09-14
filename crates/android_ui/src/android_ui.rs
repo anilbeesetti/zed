@@ -1,4 +1,5 @@
 mod android_debugger;
+mod android_preview;
 
 use android_tools::{
     AndroidTarget, Device, adb_path, android_cli_path, emulator_path, is_gradle_project,
@@ -54,6 +55,8 @@ actions!(
         ConfigureKotlin,
         /// Builds the selected variant and configures Android-aware Java language support.
         ConfigureJava,
+        /// Builds the selected variant and renders its Compose previews beside the code.
+        ComposePreview,
     ]
 );
 
@@ -108,6 +111,11 @@ pub fn init(cx: &mut App) {
             .register_action(|workspace, _: &Logcat, window, cx| {
                 with_panel(workspace, window, cx, AndroidPanel::logcat)
             })
+            .register_action(|workspace, _: &ComposePreview, window, cx| {
+                with_panel(workspace, window, cx, |panel, window, cx| {
+                    panel.gradle(GradleOperation::Preview, window, cx)
+                })
+            })
             .register_action(|workspace, _: &ConfigureJava, window, cx| {
                 with_panel(workspace, window, cx, |panel, window, cx| {
                     panel.gradle(GradleOperation::Java, window, cx)
@@ -152,6 +160,7 @@ enum GradleOperation {
     Lint,
     Kotlin,
     Java,
+    Preview,
 }
 
 enum AfterTask {
@@ -159,6 +168,7 @@ enum AfterTask {
     AttachDebugger(PathBuf, String, String),
     Kotlin(AndroidTarget),
     Java(AndroidTarget),
+    Preview(AndroidTarget),
     RefreshDevices,
     EmulatorReady(String, GradleOperation, PathBuf),
 }
@@ -213,6 +223,9 @@ pub struct AndroidPanel {
     kotlin_task: Option<Task<()>>,
     java_task: Option<Task<()>>,
     debug_task: Option<Task<()>>,
+    preview_task: Option<Task<()>>,
+    previews: Vec<android_tools::preview::Preview>,
+    selected_preview: Option<String>,
     debug_forward: Option<android_debugger::Forward>,
     _debug_subscriptions: Vec<Subscription>,
     java_refresh: Option<(PathBuf, serde_json::Value)>,
@@ -267,6 +280,9 @@ impl AndroidPanel {
             kotlin_task: None,
             java_task: None,
             debug_task: None,
+            preview_task: None,
+            previews: Vec::new(),
+            selected_preview: None,
             debug_forward: None,
             _debug_subscriptions: Vec::new(),
             java_refresh: None,
@@ -578,6 +594,10 @@ impl AndroidPanel {
                     "Disconnect the current Android debug session before starting another."
                 );
             }
+            if matches!(operation, GradleOperation::Preview) {
+                android_tools::preview::installation()?;
+                android_tools::kotlin::java_home()?;
+            }
             let after_task = match operation {
                 GradleOperation::Run | GradleOperation::Debug => Some(AfterTask::Deploy(
                     target.clone(),
@@ -586,6 +606,7 @@ impl AndroidPanel {
                 )),
                 GradleOperation::Kotlin => Some(AfterTask::Kotlin(target.clone())),
                 GradleOperation::Java => Some(AfterTask::Java(target.clone())),
+                GradleOperation::Preview => Some(AfterTask::Preview(target.clone())),
                 _ => None,
             };
             let (name, gradle_task) = match operation {
@@ -593,7 +614,8 @@ impl AndroidPanel {
                 | GradleOperation::Run
                 | GradleOperation::Debug
                 | GradleOperation::Kotlin
-                | GradleOperation::Java => ("Build", target.gradle_task("assemble", "")),
+                | GradleOperation::Java
+                | GradleOperation::Preview => ("Build", target.gradle_task("assemble", "")),
                 GradleOperation::Test => ("Test", target.gradle_task("test", "UnitTest")),
                 GradleOperation::Lint => ("Lint", target.gradle_task("lint", "")),
             };
@@ -658,6 +680,7 @@ impl AndroidPanel {
                                 Some(AfterTask::AttachDebugger(root, serial, application_id)) => panel.attach_debugger(root, serial, application_id, window, cx),
                                 Some(AfterTask::Kotlin(target)) => panel.configure_kotlin(target, window, cx),
                                 Some(AfterTask::Java(target)) => panel.configure_java(target, window, cx),
+                                Some(AfterTask::Preview(target)) => panel.generate_preview(target, window, cx),
                                 Some(AfterTask::RefreshDevices) => panel.refresh_devices(cx),
                                 Some(AfterTask::EmulatorReady(name, operation, root)) => panel.run_on_emulator(name, operation, root, window, cx),
                                 None => {}
@@ -1504,6 +1527,11 @@ impl Render for AndroidPanel {
                 .tab_index(0isize)
                 .tooltip(Tooltip::text("Build the selected variant and configure the Java extension with Android sources, generated symbols, and dependencies."))
                 .on_click(cx.listener(|panel, _, window, cx| panel.gradle(GradleOperation::Java, window, cx))))
+            .child(Button::new("android-compose-preview", "Compose preview")
+                .disabled(self.running || self.syncing || self.selected_target.is_none()).tab_index(0isize)
+                .tooltip(Tooltip::text("Build the selected variant and render a Compose @Preview beside the code."))
+                .on_click(cx.listener(|panel, _, window, cx| panel.gradle(GradleOperation::Preview, window, cx))))
+            .child(self.preview_picker(cx))
             .child(Button::new("logcat", "Open Logcat")
                 .disabled(self.selected_device().is_err()).tab_index(0isize)
                 .on_click(cx.listener(|panel, _, window, cx| panel.logcat(window, cx))))

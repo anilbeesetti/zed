@@ -24,7 +24,8 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-@Preview
+@Preview(name = "Default")
+@Preview(name = "Large text", fontScale = 1.4f)
 @Composable
 fun SampleScreen() {
     MaterialTheme {

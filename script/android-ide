@@ -27,6 +27,7 @@ Prerequisites: the repository's Rust toolchain, Xcode with Metal tools, Android
 CLI, Android SDK, and a Gradle-compatible JDK. Kotlin setup additionally needs
 JDK 21. Run script/install-android-kotlin for the pinned Kotlin server and rename
 fixes, and script/install-android-debugger for Java/Kotlin breakpoints and stepping.
+Run script/install-android-preview for standalone Compose previews.
 The Android Studio runtime is used for Gradle when JAVA_HOME is unset.
 
 The launcher honors CARGO_TARGET_DIR and LK_CUSTOM_WEBRTC. Set CARGO_BUILD_JOBS
@@ -104,6 +105,11 @@ fi
 kotlin_debugger="$repository/target/android-ide/dependencies/kotlin-debug-adapter/bin/kotlin-debug-adapter"
 if [[ -z ${ANDROID_IDE_KOTLIN_DEBUGGER:-} && -x "$kotlin_debugger" ]]; then
     export ANDROID_IDE_KOTLIN_DEBUGGER="$kotlin_debugger"
+fi
+
+compose_preview="$repository/target/android-ide/dependencies/compose-preview"
+if [[ -z ${ANDROID_IDE_COMPOSE_PREVIEW:-} && -f "$compose_preview/PreviewBridge.class" ]]; then
+    export ANDROID_IDE_COMPOSE_PREVIEW="$compose_preview"
 fi
 
 echo "App: $bundle"

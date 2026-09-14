@@ -32,5 +32,21 @@ macOS launcher discovers the standard SDK and Android Studio runtime; command
 line builds need `ANDROID_HOME` and `JAVA_HOME` set. Kotlin setup uses JDK 21
 separately. Generated caches and machine-specific settings are ignored.
 
-The `@Preview` annotation is included for Android Studio reference testing.
-This fork does not yet render Compose previews.
+Run `script/install-android-kotlin`, `script/install-android-debugger`, and
+`script/install-android-preview` once before launching the IDE. **Configure Java**
+imports the selected variant into JDT LS; repeat Java and Kotlin setup after
+changing variants or dependencies.
+
+**Debug** builds and launches the selected app, then attaches the native debugger.
+Set breakpoints on the return in `Greeting.java` and `LibraryGreeting.kt`; inspect
+variables, step, and disconnect using the debugger controls. On macOS, Control-D
+starts Android debugging, F9 continues, Shift-F8 steps out, and Control-F2
+disconnects. `script/test-android-debugger --device emulator-5554` provides an
+explicit emulator-only smoke test after building `demoDebug`.
+
+**Compose preview** builds the selected variant and opens a rendered image beside
+the code. **Select preview…** switches between the default and large-text
+annotations. Rendering uses downloaded Google tooling, JDK 21, and the selected
+variant's resources; Android Studio and a running device are unnecessary. Refresh
+after code changes. Interactive previews and multi-value preview parameter
+galleries are not implemented.
