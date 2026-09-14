@@ -138,6 +138,26 @@ fn positive_number<T: std::str::FromStr + PartialEq + Default>(
     Ok(value)
 }
 
+async fn wait_for_application_process<ReadProcess: Future<Output = Result<String>>>(
+    mut read_process: impl FnMut() -> ReadProcess,
+    executor: &BackgroundExecutor,
+) -> Result<u32> {
+    let mut attempts = 0;
+    loop {
+        match read_process().await {
+            Ok(output) => return positive_number(&output, "application process ID"),
+            Err(error) => {
+                attempts += 1;
+                if attempts == 20 {
+                    return Err(error.context("The Android app did not start a debuggable process"));
+                }
+                // Android CLI can return before ActivityManager has created the process.
+                executor.timer(Duration::from_millis(250)).await;
+            }
+        }
+    }
+}
+
 impl AndroidPanel {
     pub(super) fn observe_debugger(&self, cx: &mut Context<Self>) -> Vec<Subscription> {
         let store = self.project.read(cx).dap_store();
@@ -195,8 +215,10 @@ impl AndroidPanel {
                 let root = root.clone();
                 async move {
                     let adb = adb_path()?;
-                    let output = tool_output(adb.clone(), vec!["-s".into(), serial.clone(), "shell".into(), "pidof".into(), "-s".into(), application_id.clone()], &root, &executor, Duration::from_secs(10)).await?;
-                    let process: u32 = positive_number(&output, "application process ID")?;
+                    let process = wait_for_application_process(
+                        || tool_output(adb.clone(), vec!["-s".into(), serial.clone(), "shell".into(), "pidof".into(), "-s".into(), application_id.clone()], &root, &executor, Duration::from_secs(1)),
+                        &executor,
+                    ).await?;
                     let output = tool_output(adb.clone(), vec!["-s".into(), serial.clone(), "forward".into(), "tcp:0".into(), format!("jdwp:{process}")], &root, &executor, Duration::from_secs(10)).await?;
                     let port: u16 = positive_number(&output, "debugger port")?;
                     Ok::<_, anyhow::Error>(Forward { executor, adb, serial, port,
@@ -230,6 +252,44 @@ impl AndroidPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    async fn waits_for_application_process(executor: BackgroundExecutor) {
+        let mut attempts = 0;
+        let process = wait_for_application_process(
+            || {
+                attempts += 1;
+                std::future::ready(if attempts < 3 {
+                    Err(anyhow::anyhow!("process not created"))
+                } else {
+                    Ok("1234\n".into())
+                })
+            },
+            &executor,
+        )
+        .await
+        .expect("The app process should appear after two retries");
+        assert_eq!(process, 1234);
+        assert_eq!(attempts, 3);
+
+        let mut attempts = 0;
+        let error = wait_for_application_process(
+            || {
+                attempts += 1;
+                std::future::ready(Err(anyhow::anyhow!("device offline")))
+            },
+            &executor,
+        )
+        .await
+        .expect_err("An unavailable device must stop retrying");
+        assert_eq!(attempts, 20);
+        assert!(format!("{error:#}").contains("device offline"));
+        assert!(
+            wait_for_application_process(|| std::future::ready(Ok("1234 5678".into())), &executor,)
+                .await
+                .is_err()
+        );
+    }
 
     #[test]
     fn validates_adb_process_and_port() -> Result<()> {
