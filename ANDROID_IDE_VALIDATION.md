@@ -50,7 +50,8 @@ launcher, not a signed installer or an independently branded release.
 4. Choose **Configure Kotlin**. It builds that variant, exports the evaluated
    compile classpath, and configures the project with a JDK 21 language server.
    The Kotlin extension must be installed; new launcher profiles request it
-   automatically. Repeat setup after changing variants or dependencies.
+   automatically. Repeat setup after upgrading this prototype or changing variants
+   or dependencies, so existing projects receive the corrected source settings.
 5. Select a connected device or a stopped AVD in the top device picker.
    **Run** and **Debug** start a stopped selection and wait for it before deploying.
 6. Choose **Run**. The app displays the selected flavor, its application ID,
@@ -644,9 +645,9 @@ Screenshots: `review-resource-native.png`, `review-component-source-native.png`,
 `review-usages-native.png`, `review-stopped-emulator-run.png`,
 `review-class-search-native.png`, `review-gradle-native.png`, and
 `review-find-final-native.png` in the local
-validation directory. The macOS screen-sharing badge obscures the window buttons
-in captures; their native vertical position uses the titlebar height and actual
-button height rather than a fixed inset.
+validation directory. The screen-sharing badge obscures the window buttons in
+earlier captures; the final optimized captures show the settled, centered native
+controls. Their position uses the titlebar and actual button heights.
 
 Latest focused logs: `review-go-to-class-before.log` / `review-go-to-class-after.log`,
 `review-find-shortcuts-before.log` / `review-find-shortcuts-after.log`,
@@ -697,6 +698,32 @@ flavor, dependency and framework resource parity.
 
 ### Optimized review build
 
-The corrected optimized build is compiling. Native checks above used the normal
-debug executable with the shipped keymaps and isolated profile. The final release
-result and source/binary identity will be recorded here after startup validation.
+The optimized build passed in **27 minutes 9 seconds**. The running executable
+reports `1.21.0+dev.45baad4154940b206f5c2f8662ca68868d992209`; later commits change
+only the review/validation documents. Binary SHA-256:
+`52b6f8030dc8b84fafe78d4126e28e7b253ee45041ab3cc7bc15a14b726371e8`.
+
+It is left open on the bundled `examples/android-ide` project. Automatic sync
+restored `:mobile · fullDebug`. Configure Kotlin completed and refreshed the
+sample’s settings with 76 source archives. Native Gradle Kotlin highlighting,
+Cmd+O class search, Cmd+Shift+F floating Find and Escape dismissal passed on this
+optimized executable. The native traffic lights are centered in the settled
+window. No test emulator is running.
+
+`review-release-build.json`, `review-release-final-build.log`,
+`review-release-system-specs.log`, `review-release-final-launch.log`,
+`review-optimized-find.png`, `review-optimized-titlebar.png`, and
+`review-optimized-workspace.png` retain the final evidence. The last focused
+Clippy run also passed (`review-keymap-clippy-final.log`); its reported elapsed
+time includes waiting for the release build’s Cargo lock.
+
+The existing test-source limitation remains: the exported language-server
+classpath is the selected production variant’s classpath. Opening unit-test
+results can therefore show missing JUnit symbols even though Gradle tests build
+and pass. Test-only classpaths and a complete source-set model remain in the
+language-engine acceptance gate above.
+
+All **19 draft PRs** in GitHub stack **#16** were verified against the local branch
+heads, ordered parent branches, draft status, navigation links and release notes.
+The [review guide](ANDROID_IDE_REVIEW.md) links every layer. GitHub reported no CI
+checks on the fork; the checks documented here ran locally. Nothing was merged.

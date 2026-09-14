@@ -20,27 +20,27 @@ review focused without losing the runnable combined application at the top.
 The actual Git branch tips are authoritative if a cached `gh-stack` head field
 has not refreshed after a commit.
 
-| Layer | Branch suffix under `codex/android-ide/` | Parent | Original checkpoint (before review fixes) |
+| Layer | Branch suffix under `codex/android-ide/` | Parent | Draft PR |
 | --- | --- | --- | --- |
-| 1 | `research` | `main` | `bbcbb5f406` |
-| 2 | `studio-defaults` | `research` | `600b860c56` |
-| 3 | `android-tools` | `studio-defaults` | `d0ff09aa75` |
-| 4 | `android-workflow` | `android-tools` | `d79381e9f1` |
-| 5 | `studio-shell` | `android-workflow` | `f46e27fbf1` |
-| 6 | `kotlin-setup` | `studio-shell` | `a188c158ff` |
-| 7 | `dev-launcher` | `kotlin-setup` | `972ba9dc74` |
-| 8 | `emulator-start` | `dev-launcher` | `a9d4067e86` |
-| 9 | `smoke-project` | `emulator-start` | `1651d598cc` |
-| 10 | `validation` | `smoke-project` | `e9ccaabbea` |
-| 11 | `java-support` | `validation` | `2faff91476` |
-| 12 | `kotlin-runtime` | `java-support` | `66dc0548c9` |
-| 13 | `debugger` | `kotlin-runtime` | `136b384657` |
-| 14 | `compose-preview` | `debugger` | `371380b5a7` |
-| 15 | `final-validation` | `compose-preview` | Original report |
-| 16 | `navigation` | `final-validation` | See current branch tip |
-| 17 | `search-everywhere` | `navigation` | See current branch tip |
-| 18 | `find-replace-popup` | `search-everywhere` | See current branch tip |
-| 19 | `review-validation` | `find-replace-popup` | This report |
+| 1 | `research` | `main` | [#1](https://github.com/anilbeesetti/zed/pull/1) |
+| 2 | `studio-defaults` | `research` | [#2](https://github.com/anilbeesetti/zed/pull/2) |
+| 3 | `android-tools` | `studio-defaults` | [#3](https://github.com/anilbeesetti/zed/pull/3) |
+| 4 | `android-workflow` | `android-tools` | [#4](https://github.com/anilbeesetti/zed/pull/4) |
+| 5 | `studio-shell` | `android-workflow` | [#5](https://github.com/anilbeesetti/zed/pull/5) |
+| 6 | `kotlin-setup` | `studio-shell` | [#6](https://github.com/anilbeesetti/zed/pull/6) |
+| 7 | `dev-launcher` | `kotlin-setup` | [#7](https://github.com/anilbeesetti/zed/pull/7) |
+| 8 | `emulator-start` | `dev-launcher` | [#8](https://github.com/anilbeesetti/zed/pull/8) |
+| 9 | `smoke-project` | `emulator-start` | [#9](https://github.com/anilbeesetti/zed/pull/9) |
+| 10 | `validation` | `smoke-project` | [#10](https://github.com/anilbeesetti/zed/pull/10) |
+| 11 | `java-support` | `validation` | [#11](https://github.com/anilbeesetti/zed/pull/11) |
+| 12 | `kotlin-runtime` | `java-support` | [#12](https://github.com/anilbeesetti/zed/pull/12) |
+| 13 | `debugger` | `kotlin-runtime` | [#13](https://github.com/anilbeesetti/zed/pull/13) |
+| 14 | `compose-preview` | `debugger` | [#14](https://github.com/anilbeesetti/zed/pull/14) |
+| 15 | `final-validation` | `compose-preview` | [#15](https://github.com/anilbeesetti/zed/pull/15) |
+| 16 | `navigation` | `final-validation` | [#17](https://github.com/anilbeesetti/zed/pull/17) |
+| 17 | `search-everywhere` | `navigation` | [#18](https://github.com/anilbeesetti/zed/pull/18) |
+| 18 | `find-replace-popup` | `search-everywhere` | [#19](https://github.com/anilbeesetti/zed/pull/19) |
+| 19 | `review-validation` | `find-replace-popup` | [#20](https://github.com/anilbeesetti/zed/pull/20) |
 
 For example:
 
@@ -85,9 +85,11 @@ Align common editing/debugging shortcuts with the Android Studio reference, incl
 
 Validation: native theme/layout checks from the original checkpoint, shortcut precedence regression for both platform maps, combined 128-test run, formatting, and changed-crate Clippy. Strict app-level keymap loading and action-namespace tests pass, including the debugger action names that previously caused native startup failure. Full IntelliJ refactoring/action parity is not claimed.
 
-Suggested .rules additions
+### Suggested .rules additions
 
 “When adding built-in keybindings, validate the platform assets with `KeymapFile::load_asset` in the app-level regression. Partial keymap loading can silently drop unknown action names that make native startup fail.”
+
+“When changing base keymaps, test the combined default and base maps with an editor focused. Inherited global and Pane bindings can outrank Workspace overrides.”
 
 Release Notes:
 
