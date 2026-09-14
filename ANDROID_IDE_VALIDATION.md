@@ -555,7 +555,9 @@ for the human author to remove only after reviewing the stack.
   boundaries, framework/foreign namespaces, ignored comments, and malformed XML.
   This works without waiting for a generated `R` class or an initialized server.
 - Language installation: default automatic extensions now include Kotlin, Java
-  and XML. The Java extension supplies Gradle Kotlin DSL highlighting; XML handles
+  and XML. The Java extension supplies Gradle Kotlin DSL highlighting. Its Kotlin grammar
+  is registered under its extension owner so another Kotlin grammar version
+  cannot replace it. XML handles
   both the manifest and values files. User extension overrides remain respected.
 - Repeated command-clicks: cached definition links move the caret to the actual
   clicked symbol before falling back to references. The existing picker now
@@ -586,6 +588,53 @@ cargo test --locked -p project --features test-support test_android_resource_def
 cargo test --locked -p editor test_cached_declaration_click_moves_caret_before_usages
 ./script/clippy -p android_ui -p android_tools -p platform_title_bar -p project -p editor -p lsp_locations -p command_palette -p search -p project_panel --features gpui/inspector
 ```
+
+### Native verification and integration corrections
+
+The native test project was a disposable copy under `/private/tmp`, trusted as
+one project. It populated all four variants without a manual Sync. After a quit
+and relaunch, it automatically restored `:mobile · demoDebug`.
+
+- Navigating `R.string.app_name` opened the declaration in `strings.xml` before
+  Kotlin setup. Both values XML and `AndroidManifest.xml` were highlighted.
+- Configure Kotlin initially exposed a settings-contract error: the Kotlin
+  extension wraps its settings in `kotlin`, so our generated configuration must
+  contain `externalSources` directly. The corrected configuration opened
+  `ComponentActivity.java` at its declaration, with bytes identical to the
+  AndroidX activity source archive. Runtime `+android-sources-2` also limits
+  fallback decompiler logging to warnings/errors so per-class logs cannot block
+  the LSP connection. Its attached-source, definition and rename tests passed.
+- Go to Definition on a `LibraryGreeting` use opened its Kotlin declaration;
+  invoking it on the declaration opened a four-entry usages popup.
+- The top device picker included stopped AVDs. Selecting `medium_phone` and
+  pressing Run booted it, deployed `demoDebug` to `emulator-5554`, and displayed
+  the expected flavor, package ID and library text. `adb emu avd name` verified
+  the selected AVD. The bottom-left Logcat icon opened that emulator’s stream.
+  The stream and this test emulator were stopped afterward.
+- Find in Files opened a floating window with results instead of adding a tab.
+  Full shipped-keymap regressions caught category Tab and result-editor Escape
+  conflicts. Scoped bindings now pass the existing category and dirty-close
+  Save/Cancel tests.
+
+The app-level strict loader test resolves every binding in both shipped JetBrains
+maps, and the action-namespace registration test passes. These checks caught
+misnamed debugger actions that had compiled but prevented the earlier optimized
+binary from opening a window. The final Android UI suite also passes (3 tests),
+including source configuration and trust/variant/device behavior.
+
+The extension grammar regression passes. A wider extension-host run passed 44
+of 45 tests; the unrelated development-extension build test failed when its
+WASI SDK download was denied by the sandbox’s network restriction. The grammar
+registration and extension removal/restoration tests passed in that run.
+
+Screenshots: `review-resource-native.png`, `review-component-source-native.png`,
+`review-usages-native.png`, and `review-stopped-emulator-run.png` in the local
+validation directory. The macOS screen-sharing badge obscures the window buttons
+in captures; their native vertical position uses the titlebar height and actual
+button height rather than a fixed inset.
+
+The Kotlin configuration contract was checked against the
+[installed extension’s implementation](https://github.com/zed-extensions/kotlin/blob/main/src/kotlin.rs).
 
 ### Shortcut audit
 

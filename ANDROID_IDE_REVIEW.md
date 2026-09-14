@@ -367,7 +367,8 @@ Release Notes:
 
 The owning layers contain the defaults/shortcut corrections (2), trusted-project
 auto-sync (4), traffic-light alignment and Logcat rail control (5), dependency
-source archive export (6), stopped-AVD selection and Run startup (8), patched
+source archive export (6), stopped-AVD selection and Run startup (8), isolated
+Java/Kotlin extension grammar versions (11), patched
 source navigation runtime (12), and Debug startup for a stopped AVD (13).
 Their descendants were rebased with `gh stack rebase --upstack --remote origin`.
 
