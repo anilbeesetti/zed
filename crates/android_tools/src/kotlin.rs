@@ -78,7 +78,7 @@ pub fn prepare(root: &Path) -> Result<PathBuf> {
     Ok(init)
 }
 
-fn ensure_directory(path: &Path) -> Result<()> {
+pub(crate) fn ensure_directory(path: &Path) -> Result<()> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => ensure!(
             metadata.is_dir() && !metadata.file_type().is_symlink(),
@@ -220,7 +220,7 @@ pub fn finish(
     atomic_write(&root.join(".zed/settings.json"), updated_settings, false)
 }
 
-fn atomic_write(path: &Path, text: &str, executable: bool) -> Result<()> {
+pub(crate) fn atomic_write(path: &Path, text: &str, executable: bool) -> Result<()> {
     let parent = path
         .parent()
         .context("Generated file has no parent directory")?;

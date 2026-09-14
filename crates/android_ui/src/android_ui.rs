@@ -14,6 +14,7 @@ use settings::{IntoGpui, RegisterSetting, Settings};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 use task::{RevealStrategy, SaveStrategy, TaskContext, TaskTemplate};
@@ -47,6 +48,8 @@ actions!(
         Lint,
         /// Builds the selected variant and configures the community Kotlin server with JDK 21.
         ConfigureKotlin,
+        /// Builds the selected variant and configures Android-aware Java language support.
+        ConfigureJava,
     ]
 );
 
@@ -95,6 +98,11 @@ pub fn init(cx: &mut App) {
             .register_action(|workspace, _: &Logcat, window, cx| {
                 with_panel(workspace, window, cx, AndroidPanel::logcat)
             })
+            .register_action(|workspace, _: &ConfigureJava, window, cx| {
+                with_panel(workspace, window, cx, |panel, window, cx| {
+                    panel.gradle(GradleOperation::Java, window, cx)
+                })
+            })
             .register_action(|workspace, _: &ConfigureKotlin, window, cx| {
                 with_panel(workspace, window, cx, |panel, window, cx| {
                     panel.gradle(GradleOperation::Kotlin, window, cx)
@@ -132,11 +140,13 @@ enum GradleOperation {
     Test,
     Lint,
     Kotlin,
+    Java,
 }
 
 enum AfterTask {
     Deploy(AndroidTarget, String),
     Kotlin(AndroidTarget),
+    Java(AndroidTarget),
     RefreshDevices,
     EmulatorReady(String, GradleOperation, PathBuf),
 }
@@ -189,6 +199,10 @@ pub struct AndroidPanel {
     auto_sync_root: Option<PathBuf>,
     _startup_subscriptions: Vec<Subscription>,
     kotlin_task: Option<Task<()>>,
+    java_task: Option<Task<()>>,
+    java_refresh: Option<(PathBuf, serde_json::Value)>,
+    java_status_subscription: Option<lsp::Subscription>,
+    _project_subscription: Subscription,
 }
 
 impl AndroidPanel {
@@ -197,6 +211,13 @@ impl AndroidPanel {
         project: Entity<Project>,
         cx: &mut Context<Self>,
     ) -> Self {
+        let project_subscription = cx.subscribe(&project, |panel, _, event, cx| {
+            if let project::Event::LanguageServerAdded(id, name, worktree) = event
+                && name.0.as_ref() == "jdtls"
+            {
+                panel.observe_java_import(*id, *worktree, cx);
+            }
+        });
         let panel = cx.entity();
         let toolbar = cx.new(|cx| AndroidToolbar {
             panel: panel.downgrade(),
@@ -229,6 +250,10 @@ impl AndroidPanel {
             auto_sync_root: None,
             _startup_subscriptions: Vec::new(),
             kotlin_task: None,
+            java_task: None,
+            java_refresh: None,
+            java_status_subscription: None,
+            _project_subscription: project_subscription,
         }
     }
 
@@ -531,12 +556,14 @@ impl AndroidPanel {
                     self.selected_device()?.serial.clone(),
                 )),
                 GradleOperation::Kotlin => Some(AfterTask::Kotlin(target.clone())),
+                GradleOperation::Java => Some(AfterTask::Java(target.clone())),
                 _ => None,
             };
             let (name, gradle_task) = match operation {
-                GradleOperation::Build | GradleOperation::Run | GradleOperation::Kotlin => {
-                    ("Build", target.gradle_task("assemble", ""))
-                }
+                GradleOperation::Build
+                | GradleOperation::Run
+                | GradleOperation::Kotlin
+                | GradleOperation::Java => ("Build", target.gradle_task("assemble", "")),
                 GradleOperation::Test => ("Test", target.gradle_task("test", "UnitTest")),
                 GradleOperation::Lint => ("Lint", target.gradle_task("lint", "")),
             };
@@ -599,6 +626,7 @@ impl AndroidPanel {
                             match after_task {
                                 Some(AfterTask::Deploy(target, serial)) => panel.deploy(target, serial, window, cx),
                                 Some(AfterTask::Kotlin(target)) => panel.configure_kotlin(target, window, cx),
+                                Some(AfterTask::Java(target)) => panel.configure_java(target, window, cx),
                                 Some(AfterTask::RefreshDevices) => panel.refresh_devices(cx),
                                 Some(AfterTask::EmulatorReady(name, operation, root)) => panel.run_on_emulator(name, operation, root, window, cx),
                                 None => {}
@@ -729,6 +757,127 @@ impl AndroidPanel {
             }).log_err();
         }));
         cx.notify();
+    }
+
+    fn configure_java(
+        &mut self,
+        target: AndroidTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use android_tools::{java, kotlin};
+        let root = match self.trusted_root(cx) {
+            Ok(root) => root,
+            Err(error) => {
+                self.fail(error, window, cx);
+                return;
+            }
+        };
+        self.running = true;
+        self.status = "Preparing the selected Android Java model…".into();
+        let executor = cx.background_executor().clone();
+        self.java_task = Some(cx.spawn_in(window, async move |panel, cx| {
+            let result = async {
+                let (models, previous) = cx.background_spawn({
+                    let root = root.clone();
+                    async move {
+                        let init = java::prepare(&root)?;
+                        let program = if cfg!(windows) { root.join("gradlew.bat") } else { PathBuf::from("/bin/sh") };
+                        let mut args = if cfg!(windows) { Vec::new() } else { vec!["./gradlew".into()] };
+                        args.extend(["--init-script".into(), init.to_string_lossy().into_owned(),
+                            format!("-Dzed.android.compileTask={}", target.gradle_task("compile", "JavaWithJavac")),
+                            java::MODEL_TASK.into(), "--no-configuration-cache".into(), "--console=plain".into()]);
+                        let output = tool_output(program, args, &root, &executor, Duration::from_secs(300)).await?;
+                        Ok::<_, anyhow::Error>((java::parse_model(&output, &root, &target)?, kotlin::read_settings(&root)?))
+                    }
+                }).await?;
+                let updated = panel.update_in(cx, |panel, _, cx| {
+                    ensure!(panel.trusted_root(cx)? == root, "The Android project changed during Java setup");
+                    java_settings(previous.clone(), &root, cx)
+                })??;
+                // JDT LS refreshes persisted Gradle arguments only when the root project is updated.
+                let uri = lsp::Uri::from_file_path(&root)
+                    .map_err(|_| anyhow::anyhow!("Could not create the Java project URI"))?;
+                cx.background_spawn({
+                    let root = root.clone();
+                    async move {
+                        java::finish(&root, &models, &previous, &updated)
+                    }
+                }).await?;
+                Ok::<_, anyhow::Error>((root, serde_json::json!({"identifiers": [{"uri": uri}]})))
+            }.await;
+            panel.update_in(cx, |panel, window, cx| {
+                panel.running = false;
+                match result {
+                    Ok(refresh) => {
+                        panel.java_refresh = Some(refresh);
+                        panel.status = "Java configured. Open a Java file to import the selected variant; run setup again after variant or dependency changes.".into();
+                        panel.project.read(cx).lsp_store().update(cx, |store, cx| store.restart_all_language_servers(cx));
+                    }
+                    Err(error) => panel.fail(error, window, cx),
+                }
+                cx.notify();
+            }).log_err();
+        }));
+        cx.notify();
+    }
+
+    fn observe_java_import(
+        &mut self,
+        id: lsp::LanguageServerId,
+        worktree_id: Option<project::WorktreeId>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((root, parameters)) = &self.java_refresh else {
+            return;
+        };
+        let project = self.project.read(cx);
+        let Some(worktree) = worktree_id.and_then(|id| project.worktree_for_id(id, cx)) else {
+            return;
+        };
+        if worktree.read(cx).abs_path().as_ref() != root {
+            return;
+        }
+        let Some(server) = project.lsp_store().read(cx).language_server_for_id(id) else {
+            return;
+        };
+        let server = Arc::downgrade(&server);
+        let root = root.clone();
+        let parameters = parameters.clone();
+        let panel = cx.weak_entity();
+        self.java_status_subscription = project
+            .lsp_store()
+            .read(cx)
+            .language_server_for_id(id)
+            .map(|language_server| {
+                language_server.on_notification::<JavaStatus, _>(move |status, cx| {
+                    if status.get("type").and_then(|value| value.as_str()) != Some("ServiceReady") {
+                        return;
+                    }
+                    panel
+                        .update(cx, |panel, cx| {
+                            if panel.java_refresh.is_none() {
+                                return;
+                            }
+                            let result = (|| {
+                                ensure!(
+                                    panel.trusted_root(cx)? == root,
+                                    "The Android project changed before Java import"
+                                );
+                                server
+                                    .upgrade()
+                                    .context("The Java language server stopped before import")?
+                                    .notify::<RefreshJavaProjects>(parameters.clone())
+                            })();
+                            panel.java_refresh = None;
+                            if let Err(error) = result {
+                                panel.error = Some(format!("{error:#}"));
+                            }
+                            cx.notify();
+                        })
+                        .log_err();
+                })
+            });
     }
 
     fn logcat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1283,6 +1432,11 @@ impl Render for AndroidPanel {
                 .tab_index(0isize)
                 .tooltip(Tooltip::text("Build the selected variant, create a project classpath hook, and configure the community Kotlin server with JDK 21 in .zed/settings.json."))
                 .on_click(cx.listener(|panel, _, window, cx| panel.gradle(GradleOperation::Kotlin, window, cx))))
+            .child(Button::new("configure-java", "Configure Java")
+                .disabled(self.syncing || self.running || self.selected_target.is_none())
+                .tab_index(0isize)
+                .tooltip(Tooltip::text("Build the selected variant and configure the Java extension with Android sources, generated symbols, and dependencies."))
+                .on_click(cx.listener(|panel, _, window, cx| panel.gradle(GradleOperation::Java, window, cx))))
             .child(Button::new("logcat", "Open Logcat")
                 .disabled(self.selected_device().is_err()).tab_index(0isize)
                 .on_click(cx.listener(|panel, _, window, cx| panel.logcat(window, cx))))
@@ -1359,6 +1513,74 @@ impl Render for AndroidToolbar {
                 .log_err(),
         )
     }
+}
+
+enum JavaStatus {}
+impl lsp::notification::Notification for JavaStatus {
+    type Params = serde_json::Value;
+    const METHOD: &'static str = "language/status";
+}
+enum RefreshJavaProjects {}
+impl lsp::notification::Notification for RefreshJavaProjects {
+    type Params = serde_json::Value;
+    const METHOD: &'static str = "java/projectConfigurationsUpdate";
+}
+
+fn java_settings(previous: String, root: &Path, cx: &App) -> Result<String> {
+    let parsed: serde_json::Value = settings::parse_json_with_comments(&previous)?;
+    let mut options = parsed
+        .pointer("/lsp/jdtls/initialization_options")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    ensure!(
+        options.is_object(),
+        "Java initialization options must be an object"
+    );
+    let mut java_settings = parsed
+        .pointer("/lsp/jdtls/settings")
+        .or_else(|| parsed.pointer("/lsp/jdtls/initialization_options/settings"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let import = root
+        .join(".zed/android-java/import.gradle")
+        .to_string_lossy()
+        .into_owned();
+    let model = format!(
+        "-Dzed.android.javaModel={}",
+        root.join(".zed/android-java/model.json").display()
+    );
+    let arguments = java_settings
+        .pointer("/java/import/gradle/arguments")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
+    let mut arguments: Vec<String> = serde_json::from_value(arguments)
+        .context("Java Gradle arguments must be an array of strings")?;
+    arguments.retain(|argument| !argument.starts_with("-Dzed.android.javaModel="));
+    if !arguments
+        .windows(2)
+        .any(|pair| pair == ["--init-script", &import])
+    {
+        arguments.extend(["--init-script".into(), import]);
+    }
+    arguments.push(model);
+    util::merge_json_value_into(
+        serde_json::json!({"java": {
+            "import": {"gradle": {"arguments": arguments}},
+            "configuration": {"updateBuildConfiguration": "automatic"},
+            "jdt": {"ls": {"androidSupport": {"enabled": false}}}
+        }}),
+        &mut java_settings,
+    );
+    options
+        .as_object_mut()
+        .context("Java initialization options must be an object")?
+        .insert("settings".into(), java_settings.clone());
+    cx.global::<settings::SettingsStore>()
+        .new_text_for_update(previous, |content| {
+            let settings = content.project.lsp.0.entry("jdtls".into()).or_default();
+            settings.settings = Some(java_settings);
+            settings.initialization_options = Some(options);
+        })
 }
 
 fn kotlin_settings(
@@ -1614,6 +1836,29 @@ mod tests {
             assert_eq!(parsed["languages"]["Kotlin"]["language_servers"], json!(["kotlin-language-server"]));
             assert_eq!(parsed["lsp"]["kotlin-language-server"]["binary"]["env"]["JAVA_HOME"], "/jdk 21");
             assert_eq!(parsed["lsp"]["kotlin-language-server"]["settings"]["externalSources"]["sourceArchives"], json!(["/sources/activity.jar"]));
+            let previous = r#"{// keep Java preferences
+                "tab_size": 2,
+                "lsp": {"jdtls": {
+                    "initialization_options": {"bundles": ["debug.jar"]},
+                    "settings": {"java": {"format": {"enabled": false}, "import": {"gradle": {"arguments": ["--offline"]}}}}
+                }}
+            }"#;
+            let updated = java_settings(previous.into(), Path::new("/android project"), cx).expect("Java settings should update");
+            assert!(updated.contains("// keep Java preferences"));
+            let parsed: serde_json::Value = settings::parse_json_with_comments(&updated).expect("Java settings should parse");
+            assert_eq!(parsed["tab_size"], 2);
+            let server = &parsed["lsp"]["jdtls"];
+            assert_eq!(server["initialization_options"]["bundles"], json!(["debug.jar"]));
+            assert_eq!(server["settings"]["java"]["format"]["enabled"], false);
+            assert_eq!(server["settings"], server["initialization_options"]["settings"]);
+            assert_eq!(server["settings"]["java"]["import"]["gradle"]["arguments"], json!([
+                "--offline", "--init-script", "/android project/.zed/android-java/import.gradle",
+                "-Dzed.android.javaModel=/android project/.zed/android-java/model.json"
+            ]));
+            assert_eq!(java_settings(updated.clone(), Path::new("/android project"), cx).expect("Setup should be repeatable"), updated);
+            assert!(java_settings(r#"{"lsp":{"jdtls":{"initialization_options":[]}}}"#.into(), Path::new("/android"), cx).is_err());
+            assert!(java_settings(r#"{"lsp":{"jdtls":{"settings":{"java":{"import":{"gradle":{"arguments":"invalid"}}}}}}}"#.into(), Path::new("/android"), cx).is_err());
+
         });
         let filesystem = FakeFs::new(cx.executor());
         filesystem

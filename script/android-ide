@@ -80,7 +80,7 @@ if [[ ! -e "$profile/config/settings.json" ]]; then
 {
   "auto_update": false,
   "telemetry": { "diagnostics": false, "metrics": false },
-  "auto_install_extensions": { "kotlin": true },
+  "auto_install_extensions": { "kotlin": true, "java": true },
   "languages": { "Kotlin": { "language_servers": ["kotlin-language-server"] } }
 }
 SETTINGS
