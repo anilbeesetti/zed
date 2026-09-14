@@ -1,4 +1,5 @@
 mod persistence;
+mod search_everywhere;
 
 use std::{
     cmp::{self, Reverse},
@@ -30,6 +31,7 @@ use zed_actions::{OpenZedUrl, command_palette::Toggle};
 
 pub fn init(cx: &mut App) {
     command_palette_hooks::init(cx);
+    search_everywhere::init(cx);
     cx.observe_new(CommandPalette::register).detach();
 }
 

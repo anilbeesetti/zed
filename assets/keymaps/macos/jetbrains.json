@@ -138,9 +138,9 @@
       "cmd-shift-n": "workspace::NewFile",
       "cmd-n": "workspace::NewFile",
       "cmd-shift-a": "command_palette::Toggle",
-      "shift shift": "command_palette::Toggle",
+      "shift shift": "search_everywhere::Toggle",
       "cmd-alt-o": "project_symbols::Toggle", // JetBrains: Go to Symbol
-      "cmd-o": "project_symbols::Toggle", // JetBrains: Go to Class
+      "cmd-o": ["search_everywhere::Toggle", {"category": "classes"}], // JetBrains: Go to Class
       "cmd-1": "project_panel::ToggleFocus",
       "cmd-9": "git_panel::ToggleFocus",
       "cmd-5": "debug_panel::ToggleFocus",
@@ -247,6 +247,13 @@
       "ctrl-d": "android::Debug",
       "cmd-6": "android::Logcat",
       "cmd-alt-y": "android::SyncProject",
+    },
+  },
+  {
+    "context": "SearchEverywhere",
+    "bindings": {
+      "tab": "search_everywhere::NextCategory",
+      "shift-tab": "search_everywhere::PreviousCategory",
     },
   },
 ]
