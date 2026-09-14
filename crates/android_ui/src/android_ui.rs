@@ -57,6 +57,8 @@ actions!(
         ConfigureJava,
         /// Builds the selected variant and renders its Compose previews beside the code.
         ComposePreview,
+        /// Shows or hides the most recently rendered Compose preview.
+        ToggleComposePreview,
     ]
 );
 
@@ -116,6 +118,9 @@ pub fn init(cx: &mut App) {
                     panel.gradle(GradleOperation::Preview, window, cx)
                 })
             })
+            .register_action(|workspace, _: &ToggleComposePreview, window, cx| {
+                android_preview::toggle_preview(workspace, window, cx);
+            })
             .register_action(|workspace, _: &ConfigureJava, window, cx| {
                 with_panel(workspace, window, cx, |panel, window, cx| {
                     panel.gradle(GradleOperation::Java, window, cx)
@@ -149,6 +154,12 @@ pub fn toolbar(workspace: &WeakEntity<Workspace>, cx: &App) -> Option<Entity<And
     let workspace = workspace.upgrade()?;
     let panel = workspace.read(cx).panel::<AndroidPanel>(cx)?;
     Some(panel.read(cx).toolbar.clone())
+}
+
+pub fn can_preview_compose(workspace: &Workspace, cx: &App) -> bool {
+    workspace
+        .panel::<AndroidPanel>(cx)
+        .is_some_and(|panel| panel.read(cx).auto_sync_candidate(cx).is_some())
 }
 
 #[derive(Clone, Copy)]
@@ -226,6 +237,7 @@ pub struct AndroidPanel {
     preview_task: Option<Task<()>>,
     previews: Vec<android_tools::preview::Preview>,
     selected_preview: Option<String>,
+    rendered_preview: Option<(PathBuf, AndroidTarget)>,
     debug_forward: Option<android_debugger::Forward>,
     _debug_subscriptions: Vec<Subscription>,
     java_refresh: Option<(PathBuf, serde_json::Value)>,
@@ -283,6 +295,7 @@ impl AndroidPanel {
             preview_task: None,
             previews: Vec::new(),
             selected_preview: None,
+            rendered_preview: None,
             debug_forward: None,
             _debug_subscriptions: Vec::new(),
             java_refresh: None,
