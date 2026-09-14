@@ -54,6 +54,19 @@ const GRADLE_INIT: &str = r#"gradle.projectsEvaluated {
 }
 "#;
 
+pub fn server_binary() -> Result<Option<PathBuf>> {
+    env::var_os("ANDROID_IDE_KOTLIN_SERVER")
+        .map(|path| {
+            let path = PathBuf::from(path);
+            ensure!(
+                path.is_absolute() && path.is_file(),
+                "ANDROID_IDE_KOTLIN_SERVER must name an existing absolute server executable"
+            );
+            Ok(path)
+        })
+        .transpose()
+}
+
 pub fn prepare(root: &Path) -> Result<PathBuf> {
     validate_hooks(root)?;
     let root = root.canonicalize()?;

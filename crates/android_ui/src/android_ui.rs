@@ -722,7 +722,7 @@ impl AndroidPanel {
         let executor = cx.background_executor().clone();
         self.kotlin_task = Some(cx.spawn_in(window, async move |panel, cx| {
             let result = async {
-                let (paths, sources, java_home, previous_settings) = cx.background_spawn({
+                let (paths, sources, java_home, previous_settings, server_binary) = cx.background_spawn({
                     let root = root.clone();
                     async move {
                         let java_home = kotlin::java_home()?;
@@ -735,12 +735,12 @@ impl AndroidPanel {
                         args.extend(["--init-script".into(), init.to_string_lossy().into_owned(),
                             format!("-Dzed.android.compileTask={compile}"), task, "--console=plain".into()]);
                         let output = tool_output(program, args, &root, &executor, Duration::from_secs(300)).await?;
-                        Ok::<_, anyhow::Error>((kotlin::parse_classpath(&output)?, kotlin::parse_sources(&output)?, java_home, kotlin::read_settings(&root)?))
+                        Ok::<_, anyhow::Error>((kotlin::parse_classpath(&output)?, kotlin::parse_sources(&output)?, java_home, kotlin::read_settings(&root)?, kotlin::server_binary()?))
                     }
                 }).await?;
                 let updated_settings = panel.update_in(cx, |panel, _, cx| {
                     ensure!(panel.trusted_root(cx)? == root, "The Android project changed during Kotlin setup");
-                    kotlin_settings(previous_settings.clone(), &java_home, &sources, cx)
+                    kotlin_settings(previous_settings.clone(), &java_home, &sources, server_binary.as_deref(), cx)
                 })??;
                 cx.background_spawn(async move { kotlin::finish(&root, &paths, &previous_settings, &updated_settings) }).await
             }.await;
@@ -1587,6 +1587,7 @@ fn kotlin_settings(
     previous: String,
     java_home: &Path,
     source_archives: &[PathBuf],
+    server_binary: Option<&Path>,
     cx: &App,
 ) -> Result<String> {
     cx.global::<settings::SettingsStore>()
@@ -1611,10 +1612,14 @@ fn kotlin_settings(
             );
             server
                 .binary
-                .get_or_insert_default()
+                .get_or_insert_default();
+            binary
                 .env
                 .get_or_insert_default()
                 .insert("JAVA_HOME".into(), java_home.to_string_lossy().into_owned());
+            if let Some(server) = server_binary {
+                binary.path = Some(server.to_string_lossy().into_owned());
+            }
         })
 }
 
@@ -1828,7 +1833,7 @@ mod tests {
                 }
             }
             let previous = "{\n// keep this comment\n\"tab_size\": 2, \"languages\": {\"Rust\": {\"format_on_save\": \"off\"}}\n}";
-            let updated = kotlin_settings(previous.into(), Path::new("/jdk 21"), &[PathBuf::from("/sources/activity.jar")], cx).expect("Kotlin settings update should succeed");
+            let updated = kotlin_settings(previous.into(), Path::new("/jdk 21"), &[PathBuf::from("/sources/activity.jar")], Some(Path::new("/pinned kotlin/bin/server")), cx).expect("Kotlin settings update should succeed");
             assert!(updated.contains("// keep this comment"));
             let parsed: serde_json::Value = settings::parse_json_with_comments(&updated).expect("Generated settings should parse");
             assert_eq!(parsed["tab_size"], 2);
@@ -1836,6 +1841,7 @@ mod tests {
             assert_eq!(parsed["languages"]["Kotlin"]["language_servers"], json!(["kotlin-language-server"]));
             assert_eq!(parsed["lsp"]["kotlin-language-server"]["binary"]["env"]["JAVA_HOME"], "/jdk 21");
             assert_eq!(parsed["lsp"]["kotlin-language-server"]["settings"]["externalSources"]["sourceArchives"], json!(["/sources/activity.jar"]));
+            assert_eq!(parsed["lsp"]["kotlin-language-server"]["binary"]["path"], "/pinned kotlin/bin/server");
             let previous = r#"{// keep Java preferences
                 "tab_size": 2,
                 "lsp": {"jdtls": {
