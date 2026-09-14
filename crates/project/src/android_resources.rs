@@ -111,7 +111,9 @@ impl Project {
                 }
                 let folder_kind = directory.split('-').next()?;
                 ((folder_kind == "values" && filename.ends_with(".xml"))
-                    || (folder_kind == kind && filename.split('.').next() == Some(name.as_str())))
+                    || (folder_kind == kind
+                        && filename.ends_with(".xml")
+                        && filename.split('.').next() == Some(name.as_str())))
                 .then_some((entry.path.clone(), folder_kind == "values"))
             })
             .collect::<Vec<_>>();
@@ -224,6 +226,7 @@ fn value_ranges(text: &str, kind: &str, name: &str) -> Result<Vec<Range<usize>>>
                 }
             }
             Event::End(_) => {
+                anyhow::ensure!(depth > 0, "Unexpected Android resource closing tag");
                 depth -= 1;
             }
             Event::Eof => {
