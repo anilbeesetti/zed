@@ -12,6 +12,7 @@ use gpui::{
 use project::{Project, TaskSourceKind, trusted_worktrees::TrustedWorktrees};
 use settings::{IntoGpui, RegisterSetting, Settings};
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -137,6 +138,7 @@ enum AfterTask {
     Deploy(AndroidTarget, String),
     Kotlin(AndroidTarget),
     RefreshDevices,
+    EmulatorReady(String, GradleOperation, PathBuf),
 }
 
 #[derive(RegisterSetting)]
@@ -172,6 +174,9 @@ pub struct AndroidPanel {
     emulators: Vec<String>,
     emulator_error: Option<String>,
     selected_serial: Option<String>,
+    selected_avd: Option<String>,
+    emulator_serials: HashMap<String, String>,
+    emulator_task: Option<Task<()>>,
     status: SharedString,
     error: Option<String>,
     device_error: Option<String>,
@@ -209,6 +214,9 @@ impl AndroidPanel {
             emulators: Vec::new(),
             emulator_error: None,
             selected_serial: None,
+            selected_avd: None,
+            emulator_serials: HashMap::new(),
+            emulator_task: None,
             status: "Sync an Android project to discover its build variants.".into(),
             error: None,
             device_error: None,
@@ -430,39 +438,28 @@ impl AndroidPanel {
         self.device_task = Some(cx.spawn(async move |panel, cx| {
             let (devices, emulators) = cx
                 .background_spawn(async move {
-                    futures::join!(
-                        async {
-                            let output = tool_output(
-                                adb_path()?,
-                                vec!["devices".into(), "-l".into()],
-                                Path::new("."),
-                                &executor,
-                                Duration::from_secs(15),
-                            )
-                            .await?;
-                            parse_devices(&output)
-                        },
-                        async {
-                            let output = tool_output(
-                                emulator_path()?,
-                                vec!["-list-avds".into()],
-                                Path::new("."),
-                                &executor,
-                                Duration::from_secs(15),
-                            )
-                            .await?;
-                            parse_emulators(&output)
-                        }
-                    )
+                    futures::join!(connected_devices(&executor), async {
+                        let output = tool_output(
+                            emulator_path()?,
+                            vec!["-list-avds".into()],
+                            Path::new("."),
+                            &executor,
+                            Duration::from_secs(15),
+                        )
+                        .await?;
+                        parse_emulators(&output)
+                    })
                 })
                 .await;
             panel
                 .update(cx, |panel, cx| {
                     panel.refreshing_devices = false;
                     match devices {
-                        Ok(devices) => {
+                        Ok((devices, emulator_serials)) => {
                             panel.device_error = None;
-                            if panel.selected_serial.is_none() {
+                            if let Some(name) = &panel.selected_avd {
+                                panel.selected_serial = emulator_serials.get(name).cloned();
+                            } else if panel.selected_serial.is_none() {
                                 let available = devices
                                     .iter()
                                     .filter(|device| device.is_available())
@@ -473,9 +470,11 @@ impl AndroidPanel {
                                 }
                             }
                             panel.devices = devices;
+                            panel.emulator_serials = emulator_serials;
                         }
                         Err(error) => {
                             panel.devices.clear();
+                            panel.emulator_serials.clear();
                             panel.device_error = Some(format!("{error:#}"));
                         }
                     }
@@ -501,8 +500,23 @@ impl AndroidPanel {
             .context("Select an available Android device. Start an emulator or connect a device, then refresh the device list.")
     }
 
+    fn can_run_on_selected_device(&self) -> bool {
+        self.selected_device().is_ok()
+            || self
+                .selected_avd
+                .as_ref()
+                .is_some_and(|name| self.emulators.contains(name))
+    }
+
     fn gradle(&mut self, operation: GradleOperation, window: &mut Window, cx: &mut Context<Self>) {
         if self.running || self.syncing {
+            return;
+        }
+        if matches!(operation, GradleOperation::Run)
+            && self.selected_device().is_err()
+            && let Some(name) = self.selected_avd.clone()
+        {
+            self.start_emulator(name, Some(operation), window, cx);
             return;
         }
         let result = (|| {
@@ -586,6 +600,7 @@ impl AndroidPanel {
                                 Some(AfterTask::Deploy(target, serial)) => panel.deploy(target, serial, window, cx),
                                 Some(AfterTask::Kotlin(target)) => panel.configure_kotlin(target, window, cx),
                                 Some(AfterTask::RefreshDevices) => panel.refresh_devices(cx),
+                                Some(AfterTask::EmulatorReady(name, operation, root)) => panel.run_on_emulator(name, operation, root, window, cx),
                                 None => {}
                             }
                         }
@@ -857,22 +872,34 @@ impl AndroidPanel {
 
     fn device_picker(&self, id: &'static str, cx: &Context<Self>) -> impl IntoElement {
         let devices = self.devices.clone();
+        let emulators = self.emulators.clone();
+        let emulator_serials = self.emulator_serials.clone();
         let panel = cx.weak_entity();
         let label = self
             .selected_device()
             .map(|device| device.model.clone())
-            .unwrap_or_else(|_| "Select device".into());
+            .unwrap_or_else(|_| {
+                self.selected_avd
+                    .clone()
+                    .unwrap_or_else(|| "Select device".into())
+            });
         PopoverMenu::new(id)
             .trigger(
                 Button::new("device", label)
                     .label_size(LabelSize::Small)
                     .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall))
-                    .disabled(self.running || devices.is_empty())
+                    .disabled(self.running)
                     .tab_index(0isize),
             )
             .menu(move |window, cx| {
                 Some(ContextMenu::build(window, cx, |mut menu, _, _| {
                     for device in &devices {
+                        if emulator_serials
+                            .values()
+                            .any(|serial| serial == &device.serial)
+                        {
+                            continue;
+                        }
                         let panel = panel.clone();
                         let device = device.clone();
                         let label =
@@ -881,17 +908,56 @@ impl AndroidPanel {
                             panel
                                 .update(cx, |panel, cx| {
                                     panel.selected_serial = Some(device.serial.clone());
+                                    panel.selected_avd = None;
                                     cx.notify();
                                 })
                                 .log_err();
                         });
                     }
-                    menu
+                    if !emulators.is_empty() {
+                        menu = menu.header("Virtual devices");
+                    }
+                    for name in &emulators {
+                        let panel = panel.clone();
+                        let serial = emulator_serials.get(name).cloned();
+                        let label = format!(
+                            "{} · {}",
+                            name,
+                            if serial.is_some() {
+                                "running"
+                            } else {
+                                "stopped"
+                            }
+                        );
+                        let name = name.clone();
+                        menu = menu.entry(label, None, move |_, cx| {
+                            panel
+                                .update(cx, |panel, cx| {
+                                    panel.selected_avd = Some(name.clone());
+                                    panel.selected_serial = serial.clone();
+                                    cx.notify();
+                                })
+                                .log_err();
+                        });
+                    }
+                    let panel = panel.clone();
+                    menu.separator()
+                        .entry("Refresh devices", None, move |_, cx| {
+                            panel
+                                .update(cx, |panel, cx| panel.refresh_devices(cx))
+                                .log_err();
+                        })
                 }))
             })
     }
 
-    fn start_emulator(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
+    fn start_emulator(
+        &mut self,
+        name: String,
+        operation: Option<GradleOperation>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.running || self.syncing {
             return;
         }
@@ -901,12 +967,20 @@ impl AndroidPanel {
                 self.emulators.contains(&name),
                 "Refresh devices and select an available emulator first."
             );
+            let after_task = operation
+                .map(|operation| AfterTask::EmulatorReady(name.clone(), operation, root.clone()))
+                .unwrap_or(AfterTask::RefreshDevices);
+            ensure!(
+                operation.is_none() || self.selected_target.is_some(),
+                "Sync the Android project and select a build variant first."
+            );
+            self.selected_avd = Some(name.clone());
             self.schedule(
                 format!("Android Emulator · {name}"),
                 android_cli_path()?,
                 vec!["emulator".into(), "start".into(), name],
                 root,
-                Some(AfterTask::RefreshDevices),
+                Some(after_task),
                 window,
                 cx,
             )
@@ -914,6 +988,40 @@ impl AndroidPanel {
         if let Err(error) = result {
             self.fail(error, window, cx);
         }
+    }
+
+    fn run_on_emulator(
+        &mut self,
+        name: String,
+        operation: GradleOperation,
+        root: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.running = true;
+        self.status = format!("Connecting to {name}…").into();
+        let executor = cx.background_executor().clone();
+        self.emulator_task = Some(cx.spawn_in(window, async move |panel, cx| {
+            let result = cx.background_spawn(async move { connected_devices(&executor).await }).await;
+            panel.update_in(cx, |panel, window, cx| {
+                panel.running = false;
+                let result = result.and_then(|(devices, serials)| {
+                    ensure!(panel.trusted_root(cx)? == root, "The Android project changed while the emulator was starting.");
+                    let serial = serials.get(&name).cloned().context("The selected emulator started but is not available in ADB. Refresh devices and retry.")?;
+                    panel.selected_serial = Some(serial);
+                    panel.selected_avd = Some(name);
+                    panel.devices = devices;
+                    panel.emulator_serials = serials;
+                    Ok(())
+                });
+                match result {
+                    Ok(()) => panel.gradle(operation, window, cx),
+                    Err(error) => panel.fail(error, window, cx),
+                }
+                cx.notify();
+            }).log_err();
+        }));
+        cx.notify();
     }
 
     fn selected_emulator(&self) -> Result<&Device> {
@@ -962,7 +1070,7 @@ impl AndroidPanel {
                         let panel = panel.clone();
                         let name = name.clone();
                         menu = menu.entry(name.clone(), None, move |window, cx| {
-                            panel.update(cx, |panel, cx| panel.start_emulator(name.clone(), window, cx)).log_err();
+                            panel.update(cx, |panel, cx| panel.start_emulator(name.clone(), None, window, cx)).log_err();
                         });
                     }
                     menu
@@ -993,7 +1101,7 @@ impl AndroidPanel {
                         self.running
                             || self.syncing
                             || self.selected_target.is_none()
-                            || self.selected_device().is_err(),
+                            || !self.can_run_on_selected_device(),
                     )
                     .tooltip(|_, cx| Tooltip::for_action("Run app", &Run, cx))
                     .on_click(cx.listener(|panel, _, window, cx| {
@@ -1083,7 +1191,7 @@ impl Render for AndroidPanel {
                     self.syncing
                         || self.running
                         || self.selected_target.is_none()
-                        || (is_run && self.selected_device().is_err()),
+                        || (is_run && !self.can_run_on_selected_device()),
                 )
                 .tab_index(0isize)
                 .on_click(
@@ -1250,6 +1358,55 @@ fn kotlin_settings(
                 .get_or_insert_default()
                 .insert("JAVA_HOME".into(), java_home.to_string_lossy().into_owned());
         })
+}
+
+async fn connected_devices(
+    executor: &BackgroundExecutor,
+) -> Result<(Vec<Device>, HashMap<String, String>)> {
+    let adb = adb_path()?;
+    let output = tool_output(
+        adb.clone(),
+        vec!["devices".into(), "-l".into()],
+        Path::new("."),
+        executor,
+        Duration::from_secs(15),
+    )
+    .await?;
+    let devices = parse_devices(&output)?;
+    let mut emulator_serials = HashMap::new();
+    for device in &devices {
+        if !device.is_available() || !device.serial.starts_with("emulator-") {
+            continue;
+        }
+        let output = tool_output(
+            adb.clone(),
+            vec![
+                "-s".into(),
+                device.serial.clone(),
+                "emu".into(),
+                "avd".into(),
+                "name".into(),
+            ],
+            Path::new("."),
+            executor,
+            Duration::from_secs(5),
+        )
+        .await;
+        if let Some(output) = output.log_err()
+            && let Some(name) = output
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty() && *line != "OK")
+        {
+            ensure!(
+                emulator_serials
+                    .insert(name.to_owned(), device.serial.clone())
+                    .is_none(),
+                "More than one running device uses AVD {name}. Select its serial explicitly."
+            );
+        }
+    }
+    Ok((devices, emulator_serials))
 }
 
 async fn tool_output(
@@ -1434,6 +1591,13 @@ mod tests {
                 .expect("Valid device list");
             panel.selected_serial = Some("emulator-1".into());
             assert!(panel.selected_device().is_err());
+            assert!(!panel.can_run_on_selected_device());
+            panel.emulators = vec!["medium_phone".into()];
+            panel.selected_avd = Some("medium_phone".into());
+            assert!(panel.can_run_on_selected_device());
+            panel.selected_avd = Some("removed_avd".into());
+            assert!(!panel.can_run_on_selected_device());
+            panel.selected_avd = None;
             panel.selected_serial = Some("emulator-2".into());
             assert_eq!(panel.selected_device().map(|device| device.serial.as_str()).ok(), Some("emulator-2"));
         });
@@ -1453,7 +1617,7 @@ mod tests {
                     .as_ref()
                     .is_some_and(|error| error.contains("physical devices"))
             );
-            panel.start_emulator("--help".into(), window, cx);
+            panel.start_emulator("--help".into(), None, window, cx);
             assert!(!panel.running);
             assert!(
                 panel
