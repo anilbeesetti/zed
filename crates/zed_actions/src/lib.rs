@@ -503,6 +503,7 @@ pub mod search {
     #[action(namespace = search, no_json, no_register)]
     pub struct NewSearchInDirectory {
         pub directory: String,
+        pub modal: bool,
     }
 
     actions!(

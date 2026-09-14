@@ -134,6 +134,13 @@ impl State {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, JsonSchema, Action)]
+#[action(namespace = project_panel)]
+#[serde(default, deny_unknown_fields)]
+pub struct NewSearchInDirectory {
+    pub modal: bool,
+}
+
 pub struct ProjectPanel {
     project: Entity<Project>,
     fs: Arc<dyn Fs>,
@@ -392,8 +399,6 @@ actions!(
         ToggleHideGitIgnore,
         /// Toggles visibility of hidden files.
         ToggleHideHidden,
-        /// Starts a new search in the selected directory.
-        NewSearchInDirectory,
         /// Unfolds the selected directory.
         UnfoldDirectory,
         /// Folds the selected directory.
@@ -1144,7 +1149,7 @@ impl ProjectPanel {
                             menu.action("Open Markdown Preview", Box::new(OpenMarkdownPreview))
                         })
                         .when(is_dir, |menu| {
-                            menu.action("Search Inside", Box::new(NewSearchInDirectory))
+                            menu.action("Search Inside", Box::new(NewSearchInDirectory::default()))
                         })
                     } else {
                         menu.action("New File", Box::new(NewFile))
@@ -1164,8 +1169,10 @@ impl ProjectPanel {
                                 menu.action("Open Markdown Preview", Box::new(OpenMarkdownPreview))
                             })
                             .when(is_dir, |menu| {
-                                menu.separator()
-                                    .action("Find in Folder…", Box::new(NewSearchInDirectory))
+                                menu.separator().action(
+                                    "Find in Folder…",
+                                    Box::new(NewSearchInDirectory::default()),
+                                )
                             })
                             .when(is_unfoldable, |menu| {
                                 menu.action("Unfold Directory", Box::new(UnfoldDirectory))
@@ -3977,7 +3984,7 @@ impl ProjectPanel {
 
     pub fn new_search_in_directory(
         &mut self,
-        _: &NewSearchInDirectory,
+        action: &NewSearchInDirectory,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -3991,7 +3998,10 @@ impl ProjectPanel {
                     None => {
                         // File at root, open search with empty filter
                         window.dispatch_action(
-                            Box::new(zed_actions::search::NewSearchInDirectory::default()),
+                            Box::new(zed_actions::search::NewSearchInDirectory {
+                                modal: action.modal,
+                                ..Default::default()
+                            }),
                             cx,
                         );
                         return;
@@ -4010,7 +4020,10 @@ impl ProjectPanel {
                 .display(self.project.read(cx).path_style(cx))
                 .into_owned();
             window.dispatch_action(
-                Box::new(zed_actions::search::NewSearchInDirectory { directory }),
+                Box::new(zed_actions::search::NewSearchInDirectory {
+                    directory,
+                    modal: action.modal,
+                }),
                 cx,
             );
         }

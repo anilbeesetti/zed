@@ -124,7 +124,8 @@
     "context": "Workspace",
     "bindings": {
       "ctrl-shift-f12": "workspace::ToggleAllDocks",
-      "ctrl-shift-r": ["pane::DeploySearch", { "replace_enabled": true }],
+      "ctrl-shift-f": ["pane::DeploySearch", { "modal": true }],
+      "ctrl-shift-r": ["pane::DeploySearch", { "replace_enabled": true, "modal": true }],
       "alt-shift-f10": "task::Spawn",
       "shift-f10": "task::Spawn",
       "ctrl-f5": "task::Rerun",
@@ -179,7 +180,7 @@
     "context": "ProjectPanel",
     "bindings": {
       "enter": "project_panel::Open",
-      "ctrl-shift-f": "project_panel::NewSearchInDirectory",
+      "ctrl-shift-f": ["project_panel::NewSearchInDirectory", { "modal": true }],
       "backspace": ["project_panel::Trash", { "skip_prompt": false }],
       "delete": ["project_panel::Trash", { "skip_prompt": false }],
       "shift-delete": ["project_panel::Delete", { "skip_prompt": false }],
