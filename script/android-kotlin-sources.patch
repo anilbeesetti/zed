@@ -20,6 +20,123 @@
              }
          }
  
+--- a/server/src/main/kotlin/org/javacs/kt/definition/GoToDefinition.kt
++++ b/server/src/main/kotlin/org/javacs/kt/definition/GoToDefinition.kt
+@@ -21,6 +21,18 @@
+ import org.jetbrains.kotlin.descriptors.ConstructorDescriptor
+ import java.io.File
+ import java.nio.file.Paths
++import org.eclipse.lsp4j.Position
++import org.jetbrains.kotlin.descriptors.*
++import org.jetbrains.kotlin.load.kotlin.*
++import org.jetbrains.kotlin.serialization.deserialization.descriptors.DeserializedMemberDescriptor
++import org.jetbrains.kotlin.resolve.DescriptorUtils
++import org.jetbrains.kotlin.resolve.descriptorUtil.fqNameSafe
++import org.jetbrains.kotlin.psi.*
++import org.jetbrains.kotlin.psi.psiUtil.collectDescendantsOfType
++import org.jetbrains.kotlin.renderer.DescriptorRenderer
++import org.jetbrains.org.objectweb.asm.ClassReader
++import org.jetbrains.org.objectweb.asm.ClassVisitor
++import org.jetbrains.org.objectweb.asm.Opcodes
+ 
+ private val cachedTempFiles = mutableMapOf<KlsURI, Path>()
+ private val definitionPattern = Regex("(?:class|interface|object|fun)\\s+(\\w+)")
+@@ -33,10 +45,19 @@
+     config: ExternalSourcesConfiguration,
+     cp: CompilerClassPath
+ ): Location? {
+-    val (_, target) = file.referenceExpressionAtPoint(cursor) ?: return null
++    val (expression, descriptor) = file.referenceExpressionAtPoint(cursor) ?: return null
++    val original = if (descriptor is CallableMemberDescriptor) DescriptorUtils.unwrapFakeOverride(descriptor).original else descriptor
++    val target = if (original is ClassDescriptor && original.isCompanionObject && expression.text != original.name.asString())
++        original.containingDeclaration else original
++    val binary = generateSequence(target) { it.containingDeclaration }.mapNotNull {
++        ((it as? DeclarationDescriptorWithSource)?.source as? KotlinJvmBinarySourceElement)?.binaryClass
++            ?: ((it as? DeserializedMemberDescriptor)?.containerSource as? JvmPackagePartSource)?.knownJvmBinaryClass
++    }.firstOrNull()
+ 
+     LOG.info("Found declaration descriptor {}", target)
+-    var destination = location(target)
++    var destination = location(target) ?: binary?.location?.takeIf { "!/" in it }?.let {
++        Location(Paths.get(it).toUri().toString(), Range(Position(0, 0), Position(0, 0)))
++    }
+     val psi = target.findPsi()
+ 
+     if (psi is KtNamedDeclaration) {
+@@ -48,7 +69,13 @@
+ 
+         if (isInsideArchive(rawClassURI, cp)) {
+             parseURI(rawClassURI).toKlsURI()?.let { klsURI ->
+-                val (klsSourceURI, content) = classContentProvider.contentOf(klsURI)
++                val (klsSourceURI, content) = classContentProvider.contentOf(klsURI, (binary as? VirtualFileKotlinClass)?.let { binaryClass ->
++                    var sourceFile: String? = null
++                    ClassReader(binaryClass.file.contentsToByteArray()).accept(object : ClassVisitor(Opcodes.ASM9) {
++                        override fun visitSource(source: String?, debug: String?) { sourceFile = source }
++                    }, ClassReader.SKIP_CODE or ClassReader.SKIP_FRAMES)
++                    sourceFile
++                })
+ 
+                 if (config.useKlsScheme) {
+                     // Defer decompilation until a jarClassContents request is sent
+@@ -71,17 +98,20 @@
+                     destination.uri = tmpFile.toUri().toString()
+                 }
+ 
+-                if (destination.range.isZero) {
++                if (klsSourceURI.source || destination.range.isZero) {
+                     // Try to find the definition inside the source directly
+                     val name = when (target) {
+                         is ConstructorDescriptor -> target.constructedClass.name.toString()
+                         else -> target.name.toString()
+                     }
+-                    definitionPattern.findAll(content)
+-                        .map { it.groups[1]!! }
++                    val kotlinRange = if (klsSourceURI.fileExtension == "kt") {
++                        sourceDeclarationRange(cp.compiler.createKtFile(content), target)
++                    } else null
++                    destination.range = kotlinRange ?: definitionPattern.findAll(content)
++                        .mapNotNull { it.groups[1] }
+                         .find { it.value == name }
+-                        ?.let { it.range }
+-                        ?.let { destination.range = Range(position(content, it.first), position(content, it.last)) }
++                        ?.range?.let { Range(position(content, it.first), position(content, it.last + 1)) }
++                        ?: destination.range
+                 }
+             }
+         }
+@@ -94,3 +124,32 @@
+     uri.contains(".jar!") || uri.contains(".zip!") || cp.javaHome?.let {
+         Paths.get(parseURI(uri)).toString().startsWith(File(it).path)
+     } ?: false
++
++internal fun sourceDeclarationRange(source: KtFile, target: DeclarationDescriptor): Range? {
++    val declarationTarget = if (target is ConstructorDescriptor) target.constructedClass else target
++    val name = declarationTarget.name.asString()
++    val candidates = source.collectDescendantsOfType<KtNamedDeclaration> {
++        it.name == name && it.fqName == declarationTarget.fqNameSafe && when (declarationTarget) {
++            is ClassDescriptor -> it is KtClassOrObject
++            is PropertyDescriptor -> it is KtProperty || (it is KtParameter && it.hasValOrVar())
++            is FunctionDescriptor -> it is KtNamedFunction
++            is TypeAliasDescriptor -> it is KtTypeAlias
++            else -> true
++        }
++    }
++    val callable = target as? CallableDescriptor
++    val declaration = if (candidates.size == 1) candidates.single() else candidates.singleOrNull { candidate ->
++        if (candidate !is KtCallableDeclaration || callable == null) false else {
++            val parameters = candidate.valueParameters
++            parameters.size == callable.valueParameters.size && parameters.zip(callable.valueParameters).all { (parameter, descriptor) ->
++                parameter.name == descriptor.name.asString() &&
++                    parameter.typeReference?.text?.filterNot(Char::isWhitespace) ==
++                    DescriptorRenderer.SHORT_NAMES_IN_TYPES.renderType(descriptor.type).filterNot(Char::isWhitespace)
++            } && candidate.receiverTypeReference?.text?.filterNot(Char::isWhitespace) ==
++                callable.extensionReceiverParameter?.type?.let { DescriptorRenderer.SHORT_NAMES_IN_TYPES.renderType(it).filterNot(Char::isWhitespace) }
++        }
++    }
++    return declaration?.nameIdentifier?.textRange?.let {
++        Range(position(source.text, it.startOffset), position(source.text, it.endOffset))
++    }
++}
 --- a/server/src/main/kotlin/org/javacs/kt/externalsources/ClassContentProvider.kt
 +++ b/server/src/main/kotlin/org/javacs/kt/externalsources/ClassContentProvider.kt
 @@ -11,6 +11,9 @@
@@ -32,30 +149,35 @@
  
  /**
   * Provides the source code for classes located inside
-@@ -36,7 +39,7 @@
+@@ -34,9 +37,9 @@
+      * contents.
+      * If the file is inside a source archive, the source code is returned as is.
       */
-     fun contentOf(uri: KlsURI): Pair<KlsURI, String> {
+-    fun contentOf(uri: KlsURI): Pair<KlsURI, String> {
++    fun contentOf(uri: KlsURI, sourceFile: String? = null): Pair<KlsURI, String> {
          LOG.info("Resolving {} for contents", uri)
 -        val resolvedUri = sourceArchiveProvider.fetchSourceArchive(uri.archivePath)?.let(uri.withSource(true)::withArchivePath) ?: uri
-+        val resolvedUri = attachedSource(uri, config.sourceArchives) ?: sourceArchiveProvider.fetchSourceArchive(uri.archivePath)?.let(uri.withSource(true)::withArchivePath) ?: uri
++        val resolvedUri = attachedSource(uri, config.sourceArchives, sourceFile) ?: sourceArchiveProvider.fetchSourceArchive(uri.archivePath)?.let(uri.withSource(true)::withArchivePath) ?: uri
          val key = resolvedUri.toString()
          val (contents, extension) = cachedContents[key] ?: run {
                  LOG.info("Reading contents of {}", describeURI(resolvedUri.fileUri))
-@@ -69,3 +72,24 @@
+@@ -69,3 +72,26 @@
          }
      } catch (e: FileNotFoundException) { null }
  }
 +
-+internal fun attachedSource(uri: KlsURI, archives: List<String>): KlsURI? {
++internal fun attachedSource(uri: KlsURI, archives: List<String>, sourceFile: String? = null): KlsURI? {
 +    val classPath = uri.fileUri.schemeSpecificPart.substringAfter("!/", "")
 +        .substringBeforeLast('.').substringBefore('$')
 +    if (classPath.isEmpty()) return null
++    val sourcePath = sourceFile?.takeIf { '/' !in it && '\\' !in it }
++        ?.let { classPath.substringBeforeLast('/', "").let { directory -> if (directory.isEmpty()) it else "$directory/$it" } }
 +    for (archive in archives) {
 +        try {
 +            ZipFile(archive).use { zip ->
 +                // AndroidX multiplatform sources retain their source-set directory.
 +                val entry = listOf("", "androidMain/", "jvmMain/", "commonMain/")
-+                    .asSequence().flatMap { prefix -> sequenceOf("$prefix$classPath.kt", "$prefix$classPath.java") }
++                    .asSequence().flatMap { prefix -> sequenceOf(sourcePath?.let { "$prefix$it" }, "$prefix$classPath.kt", "$prefix$classPath.java").filterNotNull() }
 +                    .mapNotNull(zip::getEntry).firstOrNull() ?: return@use
 +                return URI(Paths.get(archive).toUri().toString() + "!" + URI(null, null, "/${entry.name}", null).rawPath)
 +                    .toKlsURI()?.withSource(true)
@@ -66,62 +188,27 @@
 +    }
 +    return null
 +}
---- a/server/src/main/kotlin/org/javacs/kt/definition/GoToDefinition.kt
-+++ b/server/src/main/kotlin/org/javacs/kt/definition/GoToDefinition.kt
-@@ -71,7 +71,7 @@
-                     destination.uri = tmpFile.toUri().toString()
-                 }
- 
--                if (destination.range.isZero) {
-+                if (klsSourceURI.source || destination.range.isZero) {
-                     // Try to find the definition inside the source directly
-                     val name = when (target) {
-                         is ConstructorDescriptor -> target.constructedClass.name.toString()
---- /dev/null
-+++ b/server/src/test/kotlin/org/javacs/kt/externalsources/AttachedSourcesTest.kt
-@@ -0,0 +1,33 @@
-+package org.javacs.kt.externalsources
-+
-+import java.net.URI
-+import java.nio.file.Files
-+import java.util.zip.ZipEntry
-+import java.util.zip.ZipOutputStream
-+import org.junit.Assert.*
-+import org.junit.Test
-+
-+class AttachedSourcesTest {
-+    @Test
-+    fun `resolve source sets inner classes and paths with spaces`() {
-+        val directory = Files.createTempDirectory("attached sources ")
-+        val archive = directory.resolve("library sources.jar")
-+        try {
-+            ZipOutputStream(Files.newOutputStream(archive)).use { zip ->
-+                zip.putNextEntry(ZipEntry("androidMain/androidx/activity/ComponentActivity.kt"))
-+                zip.write("package androidx.activity\nclass ComponentActivity".toByteArray())
-+                zip.closeEntry()
-+            }
-+            val uri = URI("file:///compiled.jar!/androidx/activity/ComponentActivity${'$'}Nested.class").toKlsURI()!!
-+            val source = attachedSource(uri, listOf(archive.toString()))!!
-+            assertTrue(source.source)
-+            assertEquals("kt", source.fileExtension)
-+            assertTrue(source.readContents().contains("class ComponentActivity"))
-+            assertNull(attachedSource(uri, emptyList()))
-+            assertNull(attachedSource(URI("file:///compiled.jar!/unknown/Class.class").toKlsURI()!!, listOf(archive.toString())))
-+        } finally {
-+            Files.deleteIfExists(archive)
-+            Files.deleteIfExists(directory)
-+        }
-+    }
-+}
 --- a/server/src/main/kotlin/org/javacs/kt/externalsources/FernFlowerDecompiler.kt
 +++ b/server/src/main/kotlin/org/javacs/kt/externalsources/FernFlowerDecompiler.kt
-@@ -17,5 +17,6 @@
+@@ -17,6 +17,7 @@
+ 
      private val decompilerOptions =
          arrayOf(
 +            "-log=WARN", // Per-class INFO messages can block the LSP output pipe.
              "-iec=1", // Include entire classpath for better context
              "-jpr=1", // Include parameter names in method signatures
          )
+--- a/server/src/main/kotlin/org/javacs/kt/externalsources/KlsURI.kt
++++ b/server/src/main/kotlin/org/javacs/kt/externalsources/KlsURI.kt
+@@ -86,7 +86,7 @@
+ 
+     fun withFileExtension(newExtension: String): KlsURI {
+         val (parentUri, fileName) = fileUri.toString().partitionAroundLast("/")
+-        val newUri = URI("$parentUri${fileName.split(".").first()}.$newExtension")
++        val newUri = URI("$parentUri${fileName.substringBeforeLast(".")}.$newExtension")
+         return KlsURI(newUri, query)
+     }
+ 
 --- a/server/src/main/kotlin/org/javacs/kt/symbols/Symbols.kt
 +++ b/server/src/main/kotlin/org/javacs/kt/symbols/Symbols.kt
 @@ -7,7 +7,7 @@
@@ -156,6 +243,96 @@
  }
  
  private fun symbolContainer(d: KtNamedDeclaration): String? =
+--- a/server/src/test/kotlin/org/javacs/kt/DefinitionTest.kt
++++ b/server/src/test/kotlin/org/javacs/kt/DefinitionTest.kt
+@@ -75,3 +75,87 @@
+         assertThat(ranges, hasItem(equalTo(expect)))
+     }
+ }
++
++class BinaryDefinitionTest {
++    @Test fun `navigate compiled Kotlin classes properties overloads and renamed facades`() {
++        val directory = java.nio.file.Files.createTempDirectory("binary navigation ")
++        val library = """
++            @file:JvmName("RenamedFacade")
++            package external
++            class Typography(val headlineSmall: String)
++            object MaterialTheme { val typography = Typography("Title") }
++            fun MaterialTheme(content: () -> Unit) = content()
++            fun Text(value: String) = value
++            fun Text(value: Int) = value
++            val Int.dp: Int get() = this
++        """.trimIndent()
++        val server = KotlinLanguageServer()
++        try {
++            val source = directory.resolve("Symbols.android.kt")
++            java.nio.file.Files.writeString(source, library)
++            val binary = directory.resolve("library.jar")
++            val standardLibrary = java.nio.file.Paths.get(kotlin.Unit::class.java.protectionDomain.codeSource.location.toURI())
++            org.junit.Assert.assertEquals(org.jetbrains.kotlin.cli.common.ExitCode.OK,
++                org.jetbrains.kotlin.cli.jvm.K2JVMCompiler().exec(System.err,
++                    "-no-stdlib", "-no-reflect", "-classpath", standardLibrary.toString(), "-d", binary.toString(), source.toString()))
++            val archive = directory.resolve("library-sources.jar")
++            java.util.zip.ZipOutputStream(java.nio.file.Files.newOutputStream(archive)).use {
++                it.putNextEntry(java.util.zip.ZipEntry("commonMain/external/Symbols.android.kt"))
++                it.write(library.toByteArray())
++                it.closeEntry()
++            }
++            val workspace = java.nio.file.Files.createDirectory(directory.resolve("workspace"))
++            val classpath = "$binary${java.io.File.pathSeparator}$standardLibrary"
++            val hook = workspace.resolve("kls-classpath")
++            java.nio.file.Files.writeString(hook, "#!/bin/sh\nprintf '%s\\n' '$classpath'\n")
++            org.junit.Assert.assertTrue(hook.toFile().setExecutable(true))
++            server.config.externalSources.sourceArchives = listOf(archive.toString())
++            server.sourcePath.indexEnabled = false
++            server.connect(object : org.eclipse.lsp4j.services.LanguageClient {
++                override fun telemetryEvent(value: Any?) {}
++                override fun publishDiagnostics(value: org.eclipse.lsp4j.PublishDiagnosticsParams?) {}
++                override fun showMessage(value: org.eclipse.lsp4j.MessageParams?) {}
++                override fun logMessage(value: org.eclipse.lsp4j.MessageParams?) {}
++                override fun showMessageRequest(value: org.eclipse.lsp4j.ShowMessageRequestParams?) =
++                    java.util.concurrent.CompletableFuture.completedFuture<org.eclipse.lsp4j.MessageActionItem>(null)
++            })
++            server.initialize(org.eclipse.lsp4j.InitializeParams().apply {
++                capabilities = org.eclipse.lsp4j.ClientCapabilities()
++                workspaceFolders = listOf(org.eclipse.lsp4j.WorkspaceFolder(workspace.toUri().toString(), "test"))
++            }).get()
++            val text = """
++                import external.*
++                val title = MaterialTheme.typography.headlineSmall
++                val number = Text(1)
++                val word = Text("hello")
++                val spacing = 24.dp
++            """.trimIndent()
++            val uri = workspace.resolve("Main.kt").toUri().toString()
++            server.textDocumentService.didOpen(org.eclipse.lsp4j.DidOpenTextDocumentParams(
++                org.eclipse.lsp4j.TextDocumentItem(uri, "kotlin", 1, text)))
++            val checks = listOf(
++                "MaterialTheme.typography" to "object MaterialTheme",
++                "typography.headlineSmall" to "val typography",
++                "headlineSmall" to "val headlineSmall",
++                "Text(1)" to "fun Text(value: Int)",
++                "Text(\"hello\")" to "fun Text(value: String)",
++                "dp" to "val Int.dp"
++            )
++            for ((reference, declaration) in checks + checks) {
++                val offset = text.indexOf(reference) + 1
++                val result = server.textDocumentService.definition(org.eclipse.lsp4j.DefinitionParams(
++                    org.eclipse.lsp4j.TextDocumentIdentifier(uri), org.javacs.kt.position.position(text, offset))).get().left
++                org.junit.Assert.assertEquals(reference, 1, result.size)
++                val destination = result.single()
++                val contents = java.nio.file.Files.readString(java.nio.file.Paths.get(java.net.URI(destination.uri)))
++                org.junit.Assert.assertEquals(library, contents)
++                val targetOffset = org.javacs.kt.position.offset(contents, destination.range.start)
++                org.junit.Assert.assertTrue("$reference should resolve to $declaration at $targetOffset", targetOffset in library.indexOf(declaration) until library.indexOf(declaration) + declaration.length)
++                org.junit.Assert.assertTrue(destination.range.end.character > destination.range.start.character)
++            }
++        } finally {
++            server.close()
++            directory.toFile().deleteRecursively()
++        }
++    }
++}
 --- a/server/src/test/kotlin/org/javacs/kt/WorkspaceSymbolsTest.kt
 +++ b/server/src/test/kotlin/org/javacs/kt/WorkspaceSymbolsTest.kt
 @@ -10,6 +10,9 @@
@@ -168,3 +345,46 @@
          val byKind = found.groupBy({ it.kind }, { it.name })
          val all = found.map { it.name }.toList()
  
+--- /dev/null
++++ b/server/src/test/kotlin/org/javacs/kt/externalsources/AttachedSourcesTest.kt
+@@ -0,0 +1,40 @@
++package org.javacs.kt.externalsources
++
++import java.net.URI
++import java.nio.file.Files
++import java.util.zip.ZipEntry
++import java.util.zip.ZipOutputStream
++import org.junit.Assert.*
++import org.junit.Test
++
++class AttachedSourcesTest {
++    @Test
++    fun `resolve source sets inner classes and paths with spaces`() {
++        val directory = Files.createTempDirectory("attached sources ")
++        val archive = directory.resolve("library sources.jar")
++        try {
++            ZipOutputStream(Files.newOutputStream(archive)).use { zip ->
++                zip.putNextEntry(ZipEntry("androidMain/androidx/activity/ComponentActivity.kt"))
++                zip.write("package androidx.activity\nclass ComponentActivity".toByteArray())
++                zip.closeEntry()
++                zip.putNextEntry(ZipEntry("androidMain/example/Resources.android.kt"))
++                zip.write("package example\nfun resourceName() = 1".toByteArray())
++                zip.closeEntry()
++            }
++            val uri = URI("file:///compiled.jar!/androidx/activity/ComponentActivity${'$'}Nested.class").toKlsURI()!!
++            val source = attachedSource(uri, listOf(archive.toString()))!!
++            assertTrue(source.source)
++            assertEquals("kt", source.fileExtension)
++            assertTrue(source.readContents().contains("class ComponentActivity"))
++            val facade = URI("file:///compiled.jar!/example/ResourcesKt.class").toKlsURI()!!
++            val topLevel = attachedSource(facade, listOf(archive.toString()), "Resources.android.kt")!!
++            assertTrue(topLevel.withFileExtension("kt").readContents().contains("fun resourceName"))
++            assertNull(attachedSource(facade, listOf(archive.toString()), "../Resources.android.kt"))
++            assertNull(attachedSource(uri, emptyList()))
++            assertNull(attachedSource(URI("file:///compiled.jar!/unknown/Class.class").toKlsURI()!!, listOf(archive.toString())))
++        } finally {
++            Files.deleteIfExists(archive)
++            Files.deleteIfExists(directory)
++        }
++    }
++}
