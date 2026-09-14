@@ -557,7 +557,7 @@ impl AndroidPanel {
         if self.running || self.syncing {
             return;
         }
-        if matches!(operation, GradleOperation::Run)
+        if matches!(operation, GradleOperation::Run | GradleOperation::Debug)
             && self.selected_device().is_err()
             && let Some(name) = self.selected_avd.clone()
         {
@@ -1352,7 +1352,7 @@ impl AndroidPanel {
                             || self.syncing
                             || self.debug_forward.is_some()
                             || self.selected_target.is_none()
-                            || self.selected_device().is_err(),
+                            || !self.can_run_on_selected_device(),
                     )
                     .tooltip(|_, cx| Tooltip::for_action("Debug app", &Debug, cx))
                     .on_click(cx.listener(|panel, _, window, cx| {
