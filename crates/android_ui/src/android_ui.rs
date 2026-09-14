@@ -23,6 +23,7 @@ use workspace::{
     dock::{DockPosition, Panel, PanelEvent},
     tasks::ScheduledTaskResult,
 };
+pub use zed_actions::android::Logcat;
 
 actions!(
     android,
@@ -41,8 +42,6 @@ actions!(
         Test,
         /// Runs Android lint for the selected variant.
         Lint,
-        /// Opens Logcat for the selected Android device.
-        Logcat,
     ]
 );
 

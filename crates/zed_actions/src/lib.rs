@@ -12,6 +12,16 @@ use std::{path::PathBuf, sync::Arc};
 // https://github.com/mmastrac/rust-ctor/issues/280
 pub fn init() {}
 
+pub mod android {
+    gpui::actions!(
+        android,
+        [
+            /// Opens Logcat for the selected Android device.
+            Logcat,
+        ]
+    );
+}
+
 /// Opens a URL in the system's default web browser.
 #[derive(Clone, PartialEq, Deserialize, JsonSchema, Action)]
 #[action(namespace = zed)]
