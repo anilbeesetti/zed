@@ -250,7 +250,7 @@
     },
   },
   {
-    "context": "SearchEverywhere",
+    "context": "SearchEverywhere > Editor",
     "bindings": {
       "tab": "search_everywhere::NextCategory",
       "shift-tab": "search_everywhere::PreviousCategory",

@@ -531,10 +531,9 @@ mod tests {
             theme_settings::init(theme::LoadThemes::JustBase, cx);
             menu::init();
             crate::init(cx);
-            cx.bind_keys(KeymapFile::load_panic_on_failure(r#"[
-                {"bindings":{"shift shift":"search_everywhere::Toggle","enter":"menu::Confirm","escape":"menu::Cancel","cmd-n":"workspace::NewFile"}},
-                {"context":"SearchEverywhere","bindings":{"tab":"search_everywhere::NextCategory","shift-tab":"search_everywhere::PreviousCategory"}}
-            ]"#, cx));
+            for asset in ["keymaps/default-macos.json", "keymaps/macos/jetbrains.json"] {
+                cx.bind_keys(KeymapFile::load_asset_allow_partial_failure(asset, cx).expect("Keymap asset"));
+            }
         });
         let mut cx = EditorLspTestContext::new_rust(
             lsp::ServerCapabilities {
