@@ -40,8 +40,8 @@ changing variants or dependencies.
 **Debug** builds and launches the selected app, then attaches the native debugger.
 Set breakpoints on the return in `Greeting.java` and `LibraryGreeting.kt`; inspect
 variables, step, and disconnect using the debugger controls. On macOS, Control-D
-starts Android debugging, F9 continues, Shift-F8 steps out, and Control-F2
-disconnects. `script/test-android-debugger --device emulator-5554` provides an
+starts Android debugging, Command-Option-R continues, Shift-F8 steps out, and
+Command-F2 disconnects. `script/test-android-debugger --device emulator-5554` provides an
 explicit emulator-only smoke test after building `demoDebug`.
 
 **Compose preview** builds the selected variant and opens a rendered image beside
