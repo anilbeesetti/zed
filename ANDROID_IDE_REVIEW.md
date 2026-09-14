@@ -104,8 +104,13 @@ Android targets, device states, and artifact selection. Commands identify the
 project and device explicitly. Reject ambiguous or unsafe APK metadata paths
 instead of guessing what to deploy.
 
+Preserve complete wireless ADB identifiers containing spaces; parse the state
+separately so the same full serial is used for selection, Run, Debug and Logcat.
+
 Validation: focused parser/artifact tests cover malformed output, multiple
-devices, module/flavor targets, metadata redirects, filters and missing files.
+devices, wireless mDNS identifiers, permission states, module/flavor targets,
+metadata redirects, filters and missing files. Native selection switches from a
+stopped AVD back to the physical device and enables Run.
 `cargo test -p android_tools` and `./script/clippy -p android_tools` pass.
 
 Release Notes:
@@ -259,6 +264,14 @@ Run upstream rename/definition/workspace-symbol/source-archive tests before inst
 
 Validation: bootstrap and upgrade, upstream tests, Rust settings tests and Clippy. The +android-sources-3 runtime returns native class search results. A real LSP probe and native editor navigation open ComponentActivity’s original source; the native file matches the source archive byte for byte. Native rename was checked at the earlier checkpoint. Mixed Java/Kotlin rename and full Kotlin semantic parity remain unsupported.
 
+The runtime follow-up also resolves compiled Kotlin descriptors without PSI to
+original attached source, with exact class/property/overload positions and renamed
+JVM facade filenames. An explicit root classpath hook supplies the selected
+project model without duplicate Gradle discovery. The native initialization
+measurement drops from 16.9–20.5 seconds to 1.17 seconds. Binary-definition and
+explicit-classpath fixtures pass; see the validation report for warm-up and
+Gradle DSL limitations. The managed installer version is `+android-sources-5`.
+
 Release Notes:
 
 - Fixed Kotlin object rename and navigation to attached library sources
@@ -333,6 +346,12 @@ bytes before emitting the existing reload event. A real-file GPUI regression
 fails before the change; all five image-viewer tests pass afterward, including
 asset-cache and split-pane checks. Project/image-viewer Clippy passes with the
 existing inspector feature flag.
+
+The editor toolbar now exposes Show/Hide Compose Preview. It preserves unrelated
+tabs and unsaved edits when hiding, then reopens a same-project/variant cached
+image without another build. A GPUI regression and two native hide/show cycles
+pass. Per-file Compose eligibility, automatic refresh and source-focus retention
+remain in the comparison backlog.
 
 Release Notes:
 

@@ -12,6 +12,131 @@ release packaging are not complete. The
 [research and implementation plan](ANDROID_IDE_PLAN.md) covers the longer-term
 work; [the review guide](ANDROID_IDE_REVIEW.md) describes the review stack.
 
+## Device and Compose navigation follow-up — 14 September 2026
+
+The connected wireless ADB device used a valid mDNS serial containing a space.
+Splitting every field on whitespace truncated its serial and treated the suffix
+as its state, so selecting it could not produce an available device. The shared
+parser now preserves the complete serial and separates it from a recognized ADB
+state. The regression uses an invented serial, including the `(2)` mDNS suffix;
+real device identifiers stay out of this report. Offline, unauthorized and
+`no permissions` states remain visible.
+
+Kotlin source lookup previously depended on PSI locations, which are absent for
+many compiled Kotlin descriptors. The runtime now resolves their owning binary,
+reads its SourceFile attribute, finds the attached original source and matches
+the Kotlin declaration using PSI. This covers properties, constructor properties,
+extension properties, overloads, objects versus same-named functions, implicit
+companions and renamed JVM facades. It also preserves multi-dot source names such
+as `StringResources.android.kt`.
+
+The actual sample resolves `ComponentActivity`, `headlineSmall`, `typography`,
+`MaterialTheme`, `Text`, `padding`, `dp`, `Modifier`, `Column` and `stringResource`.
+The native editor opened the original `Typography.kt` declaration of
+`headlineSmall` and the `MaterialTheme` object, rather than its same-named function.
+A protocol trace confirmed the editor's definition requests and response ranges.
+
+The same trace exposed duplicate Gradle discovery during server initialization.
+An explicit root `kls-classpath` hook is now authoritative for that workspace;
+projects without a hook retain ordinary build-system discovery. This reuses the
+IDE's selected-variant model and avoids a second Gradle import. It does not provide
+Gradle DSL semantic completion from that hook: Kotlin-script syntax highlighting
+remains available, while a separate accurate Gradle DSL model is future work.
+
+| Native Kotlin measurement | Before root-hook fix | After |
+| --- | --- | --- |
+| Initialize response | 16.9–20.5 seconds | 1.17 seconds |
+| First diagnostics | 19.5–23.2 seconds | 3.22 seconds |
+| Source navigation after initialization | 46–57 ms with descriptor fix | 79–124 ms in this run |
+
+These are small-sample wall-clock measurements on this machine while the Rust
+release build was running, not a benchmark against Android Studio. Standalone
+source probes measured warm lookups around 10–60 ms and a first ComponentActivity
+lookup around 1–2.4 seconds. JVM/compiler warm-up still exists; navigation before
+server readiness can still return no result. No claim of instant universal
+IntelliJ navigation or full Kotlin 2 semantic support is made.
+
+The editor quick-action area now has **Show/Hide Compose Preview** for Kotlin
+files in a trusted Android workspace. It uses the existing renderer and image
+viewer. Hiding closes the preview image, preserving other tabs and unsaved edits;
+showing it again reuses the rendered image for the same project and variant.
+The Android tool-window action still refreshes the render after source changes.
+
+Native physical-device verification: select a stopped AVD, then select the
+connected physical device again. The toolbar and Android panel both show the
+physical device and enable Run. A read-only `adb -s <complete-serial> get-state`
+returns `device`; no APK was installed on the physical device in this pass.
+
+Native preview verification: the new toolbar button rendered the fullDebug
+fixture, then passed two hide/show cycles with the existing source tabs intact.
+Cached reopening did not create another Gradle task. Showing the split currently
+focuses the preview pane; retaining editor focus is a remaining polish item.
+
+### Evidence and reproduction
+
+- `cargo test --locked -p android_tools`: four tests pass, including wireless
+  serial parsing and the existing project-artifact regressions.
+- `cargo test --locked -p android_ui`: four tests pass, including a GPUI test that
+  hides a preview beside another tab and preserves unsaved source without saving.
+- Pinned Kotlin runtime: rename, definition, attached-source, workspace-symbol and
+  explicit-classpath tests pass. The binary-definition fixture compiles real
+  Kotlin dependencies and checks exact original-source positions twice.
+- `./script/clippy -p android_tools -p android_ui --features gpui/inspector` passes.
+- Optimized app build passes in 20m 50s using `CARGO_PROFILE_RELEASE_DEBUG=0`,
+  `CARGO_INCREMENTAL=0` and four Cargo workers. The executable embeds commit
+  `32dc5e7d51d28655e4542383194842b1153e8c17`; subsequent changes are the separately
+  installed Kotlin runtime `+android-sources-5` and documentation. The linker and
+  `block 0.1.6` future-compatibility warnings remain upstream build warnings.
+- Local evidence is under `target/android-ide/validation/`: `native-navigation-timings.json`,
+  `compose-navigation-after.json`, `native-headlineSmall-source.png`, and the
+  `device-compose-*` / `compose-runtime-final-tests.log` logs. Protocol tracing was
+  temporary and the project's normal language-server settings were restored.
+
+### Android Studio source findings and next comparison passes
+
+The [Android Studio source guide](https://android.googlesource.com/platform/tools/base/+/studio-master-dev/source.md)
+is a checkout/build entry point for several repositories. A full checkout is not
+required for this comparison. The [Compose preview provider](https://github.com/JetBrains/android/blob/master/compose-designer/src/com/android/tools/idea/compose/preview/ComposePreviewRepresentationProvider.kt)
+checks Kotlin files, Compose modules, source rather than library files, and
+preview annotations. Its [preview representation](https://github.com/JetBrains/android/blob/master/compose-designer/src/com/android/tools/idea/compose/preview/ComposePreviewRepresentation.kt)
+coordinates activation, build invalidation, refresh and renderer disposal. These
+are the appropriate behavior references for the next preview pass; no JetBrains
+implementation was copied into GPUI.
+
+IntelliJ navigation uses a persistent semantic project model. The
+[Kotlin Analysis API](https://kotlin.github.io/analysis-api/index_md.html) exposes
+PSI-based symbol resolution with cached analysis, while its standalone mode is
+still under development. The official [Kotlin LSP](https://github.com/Kotlin/kotlin-lsp)
+is based on IntelliJ/Kotlin plugin infrastructure and currently labels Android
+Gradle support experimental. Its [263.4702.0 release notes](https://github.com/Kotlin/kotlin-lsp/blob/main/RELEASES.md)
+include source downloads, library workspace symbols and an AGP import fix. Evaluate
+it against this fixture and a larger project before changing the working default;
+it is not a proven drop-in replacement, and no expiration check was bypassed.
+
+| Comparison area | Current coverage | Next concrete acceptance check |
+| --- | --- | --- |
+| Device picker | Running devices and stopped AVDs; explicit serial and state | Connect/disconnect and wireless reconnect while the menu is open; retain a valid selection |
+| Source navigation | Ten Compose/Android symbols and compiled overload fixtures | Nested library-to-library navigation, persistent library tabs across server restarts, larger Kotlin 2 projects, per-source-set classpaths and readiness feedback |
+| Preview controls | Toolbar visibility toggle, annotation picker, reusable render split | Limit button to source files in Compose modules; per-file selection, dirty-source refresh, Code/Split/Design behavior |
+| Project and variants | Trusted automatic sync, selected variant restoration, flavor builds | Edit Gradle dependencies and switch source sets without manual language setup; actionable sync errors |
+| Keymaps and search | Common JetBrains actions, double Shift, floating Find/Replace | Compare remaining native menu bindings and search scopes systematically on macOS |
+| Resources and XML | Syntax colors and R-to-XML navigation | Qualifier/overlay precedence, resource usages and dependency resource navigation |
+| Logcat and build output | Left rail action and task terminals | Structured process/severity filtering, pause/clear, clickable file locations |
+| Debugging | Breakpoints, frames, variables, step/continue | Kotlin inline/coroutine stepping, expression evaluation, reconnect and multiple processes |
+| Studio tools | Basic run/build/test/preview workflows | Device manager UI, SDK manager, profiler, layout inspector, Apply Changes and signing workflows remain absent |
+
+Work proceeds one reproducible gap at a time: record Android Studio behavior,
+trace the equivalent Zed flow, reuse an existing component, add the smallest
+meaningful regression, validate in the native app and update the owning stack
+layer. This matrix is a comparison backlog, not a claim that every Android Studio
+element or function already matches.
+
+The existing daily 04:00 India-time maintenance follow-up now combines a bounded
+parity pass with the previously requested cache cleanup. It preserves the 30 GiB
+threshold, idle-build checks and protected binaries/dependencies. Meaningful
+progress is sent through the approved Telegram destination; unchanged state stays
+quiet. Full parity is ongoing work.
+
 ## Run it
 
 The optional language/debug/preview tools are installed in this checkout. To
@@ -64,8 +189,9 @@ launcher, not a signed installer or an independently branded release.
 9. Set Java/Kotlin breakpoints and choose **Debug**. Use the native debugger's
    variables, frames, step/continue and disconnect controls. The adapter supports
    local/field evaluation; arbitrary expression evaluation is not implemented.
-10. Choose **Compose preview**, then **Select preview…** for Default or Large text.
-    Refresh after editing. Preview works without a selected device and preserves
+10. Use the eye icon beside the Kotlin editor actions to show/hide Compose preview.
+    Choose **Compose preview** in the Android tool window to refresh, and
+    **Select preview…** for Default or Large text. Refresh after editing. Preview works without a selected device and preserves
     the previous image on failure. Its editor split is reused across refreshes.
 11. Use **Stop emulator** when finished. This preserves the AVD and releases its
    VM memory. It is disabled for a physical device.
