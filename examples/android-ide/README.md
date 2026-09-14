@@ -10,10 +10,10 @@ From the repository root, run:
 script/android-ide --release examples/android-ide
 ```
 
-Use the Android tools panel to **Sync project**, select **:mobile · demoDebug**,
-and **Configure Kotlin**. Install the Kotlin extension from Extensions if it is
-not already installed. Select a connected device or use **Start emulator…**,
-then **Run**. The app should display `dev.zed.androidsample.demo`. Repeat with
+Trusted Android projects sync automatically on open. Select **:mobile · demoDebug**
+in the topbar and use **Configure Kotlin** in the Android tools panel. Install the Kotlin extension from Extensions if it is
+not already installed. Select a connected device or a stopped emulator in the topbar,
+then **Run**; a stopped emulator is booted before deployment. The app should display `dev.zed.androidsample.demo`. Repeat with
 `fullDebug`; it should display `dev.zed.androidsample.full`. Both variants should
 also display `Android library connected`. Run **Configure
 Kotlin** again after switching variants so generated symbols use that variant.
