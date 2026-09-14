@@ -463,7 +463,7 @@
   //
   // 1. Open the results in a multibuffer: `multi_buffer` (default)
   // 2. Open the results in a filterable picker: `picker`
-  "lsp_results_location": "multi_buffer",
+  "lsp_results_location": "picker",
   // Which level to use to filter out diagnostics displayed in the editor.
   //
   // Affects the editor rendering only, and does not interrupt
@@ -2274,6 +2274,9 @@
   // and change the value to `false`.
   "auto_install_extensions": {
     "html": true,
+    "java": true,
+    "kotlin": true,
+    "xml": true,
   },
   // The capabilities granted to extensions.
   //
