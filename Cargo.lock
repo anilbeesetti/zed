@@ -14003,6 +14003,7 @@ dependencies = [
  "prettier",
  "pretty_assertions",
  "project",
+ "quick-xml 0.41.0",
  "rand 0.9.4",
  "regex",
  "release_channel",

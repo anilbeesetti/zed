@@ -21276,3 +21276,78 @@ async fn code_action_project(
 
     (project, buffer, handle, fake_servers)
 }
+
+#[gpui::test]
+async fn test_android_resource_definitions_without_language_server(cx: &mut TestAppContext) {
+    init_test(cx);
+    let filesystem = FakeFs::new(cx.executor());
+    filesystem.insert_tree(path!("/android"), json!({
+        "app": {
+            "build.gradle.kts": "android { namespace = \"example.app\" }",
+            "src": {
+                "main": {
+                    "java": {"Activity.kt": "package example.app\nval title = R.string.app_name\nval other = foreign.app.R.string.app_name\nval system = android.R.string.ok"},
+                    "AndroidManifest.xml": "<manifest><application android:label=\"@string/app_name\"/></manifest>",
+                    "res": {"values": {"strings.xml": "<resources><!-- <string name=\"app_name\">Ignored</string> --><string name=\"app_name\">App</string></resources>"},
+                            "values-fr": {"strings.xml": "<resources><item type=\"string\" name=\"app_name\">Appli</item></resources>"}}
+                },
+                "debug": {"res": {"values": {"broken.xml": "<resources><string name=\"app_name\">Broken"}}}
+            }
+        },
+        "other": {"build.gradle.kts": "", "src": {"main": {"res": {"values": {"strings.xml": "<resources><string name=\"app_name\">Wrong module</string></resources>"}}}}}
+    })).await;
+    let project = Project::test(filesystem, [path!("/android").as_ref()], cx).await;
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(path!("/android/app/src/main/java/Activity.kt"), cx)
+        })
+        .await
+        .expect("Open Kotlin source");
+    let definitions = project
+        .update(cx, |project, cx| {
+            project.definitions(&buffer, Point::new(1, 25), cx)
+        })
+        .await
+        .expect("Resolve resource")
+        .expect("Resource locations");
+    assert_eq!(definitions.len(), 2);
+    for definition in &definitions {
+        definition.target.buffer.read_with(cx, |buffer, cx| {
+            assert!(
+                buffer
+                    .file()
+                    .expect("Resource file")
+                    .full_path(cx)
+                    .to_string_lossy()
+                    .contains("app/src/main/res/values")
+            );
+            assert!(
+                buffer
+                    .text_for_range(definition.target.range.clone())
+                    .collect::<String>()
+                    .contains("name=\"app_name\"")
+            );
+        });
+    }
+    for position in [Point::new(2, 38), Point::new(3, 32)] {
+        let definitions = project
+            .update(cx, |project, cx| project.definitions(&buffer, position, cx))
+            .await
+            .expect("Fallback lookup");
+        assert!(definitions.is_none_or(|locations| locations.is_empty()));
+    }
+    let manifest = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(path!("/android/app/src/main/AndroidManifest.xml"), cx)
+        })
+        .await
+        .expect("Open manifest");
+    let definitions = project
+        .update(cx, |project, cx| {
+            project.definitions(&manifest, Point::new(0, 50), cx)
+        })
+        .await
+        .expect("Resolve manifest resource")
+        .expect("Resource locations");
+    assert_eq!(definitions.len(), 2);
+}

@@ -1,5 +1,6 @@
 pub mod agent_registry_store;
 pub mod agent_server_store;
+mod android_resources;
 pub mod bookmark_store;
 pub mod buffer_store;
 pub mod color_extractor;
@@ -4407,6 +4408,23 @@ impl Project {
     ) -> Task<Result<Option<Vec<LocationLink>>>> {
         let position = position.to_point_utf16(buffer.read(cx));
         let guard = self.retain_remotely_created_models(cx);
+        if let Some(resources) = self.android_resource_definitions(buffer, position, cx) {
+            let buffer = buffer.clone();
+            return cx.spawn(async move |project, cx| {
+                let _guard = guard;
+                let locations = resources.await?;
+                if !locations.is_empty() {
+                    return Ok(Some(locations));
+                }
+                project
+                    .update(cx, |project, cx| {
+                        project
+                            .lsp_store
+                            .update(cx, |store, cx| store.definitions(&buffer, position, cx))
+                    })?
+                    .await
+            });
+        }
         let task = self.lsp_store.update(cx, |lsp_store, cx| {
             lsp_store.definitions(buffer, position, cx)
         });

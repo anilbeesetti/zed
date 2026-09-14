@@ -317,7 +317,7 @@ impl LspLocationsPicker {
                 return;
             }
 
-            if matches.len() == 1 {
+            if matches.len() == 1 && kind != LspPickerKind::References {
                 if let Some(location_match) = matches.into_iter().next() {
                     let location = Location {
                         buffer: location_match.buffer,
@@ -334,6 +334,13 @@ impl LspLocationsPicker {
 
             workspace
                 .update_in(cx, |workspace, window, cx| {
+                    // A second completed query should replace the results, not toggle
+                    // away the popup opened by the first click.
+                    if workspace.active_modal::<Self>(cx).is_some()
+                        && !workspace.hide_modal(window, cx)
+                    {
+                        return;
+                    }
                     workspace.toggle_modal(window, cx, |window, cx| {
                         Self::new(kind, matches, project, editor, window, cx)
                     });
@@ -891,7 +898,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_single_result_jumps_without_picker(cx: &mut TestAppContext) {
+    async fn test_single_reference_stays_in_picker_after_repeated_query(cx: &mut TestAppContext) {
         let mut cx = rust_cx(
             lsp::ServerCapabilities {
                 references_provider: Some(lsp::OneOf::Left(true)),
@@ -909,18 +916,10 @@ mod tests {
 
         open(&mut cx, LspPickerKind::References);
 
-        assert!(
-            active_picker(&mut cx).is_none(),
-            "a single result should jump directly instead of opening the picker"
-        );
-        // The lone result at row 2 should be selected directly, moving the
-        // cursor off its starting position on row 1.
-        cx.assert_editor_state(indoc! {r#"
-            fn main() {
-                let abc = 123;
-                let xyz = «abcˇ»;
-            }
-        "#});
+        assert!(active_picker(&mut cx).is_some());
+        open(&mut cx, LspPickerKind::References);
+        assert!(active_picker(&mut cx).is_some());
+        cx.assert_editor_state(SOURCE);
     }
 
     #[gpui::test]
