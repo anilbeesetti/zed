@@ -17,7 +17,7 @@ use std::{
 };
 use task::{RevealStrategy, SaveStrategy, TaskContext, TaskTemplate};
 use ui::{ContextMenu, PopoverMenu, Tooltip, prelude::*};
-use util::{ResultExt as _, command::new_command};
+use util::{ResultExt as _, command::new_command, rel_path::RelPath};
 use workspace::{
     Workspace,
     dock::{DockPosition, Panel, PanelEvent},
@@ -51,6 +51,7 @@ pub fn init(cx: &mut App) {
         let Some(window) = window else { return };
         let panel = cx
             .new(|cx| AndroidPanel::new(workspace.weak_handle(), workspace.project().clone(), cx));
+        panel.update(cx, |panel, cx| panel.observe_project_open(window, cx));
         workspace.add_panel(panel, window, cx);
         workspace
             .register_action(|workspace, _: &ToggleFocus, window, cx| {
@@ -160,6 +161,8 @@ pub struct AndroidPanel {
     sync_task: Option<Task<()>>,
     device_task: Option<Task<()>>,
     deploy_task: Option<Task<()>>,
+    auto_sync_root: Option<PathBuf>,
+    _startup_subscriptions: Vec<Subscription>,
 }
 
 impl AndroidPanel {
@@ -192,7 +195,96 @@ impl AndroidPanel {
             sync_task: None,
             device_task: None,
             deploy_task: None,
+            auto_sync_root: None,
+            _startup_subscriptions: Vec::new(),
         }
+    }
+
+    fn observe_project_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self._startup_subscriptions.push(cx.subscribe_in(
+            &self.project,
+            window,
+            |_, _, event, window, cx| {
+                if matches!(
+                    event,
+                    project::Event::WorktreeAdded(_)
+                        | project::Event::WorktreeRemoved(_)
+                        | project::Event::WorktreeUpdatedEntries(_, _)
+                ) {
+                    cx.defer_in(window, |panel, window, cx| {
+                        panel.auto_sync_project(window, cx)
+                    });
+                }
+            },
+        ));
+        if let Some(trusted) = TrustedWorktrees::try_get_global(cx) {
+            self._startup_subscriptions.push(cx.subscribe_in(
+                &trusted,
+                window,
+                |_, _, _, window, cx| {
+                    // Trust events are emitted while the trust store is being updated.
+                    cx.defer_in(window, |panel, window, cx| {
+                        panel.auto_sync_project(window, cx)
+                    });
+                },
+            ));
+        }
+        cx.defer_in(window, |panel, window, cx| {
+            panel.auto_sync_project(window, cx)
+        });
+    }
+
+    fn auto_sync_candidate(&self, cx: &App) -> Option<PathBuf> {
+        let root = self.trusted_root(cx).ok()?;
+        let worktree = self
+            .project
+            .read(cx)
+            .visible_worktrees(cx)
+            .find(|worktree| worktree.read(cx).abs_path().as_ref() == root.as_path())?;
+        let snapshot = worktree.read(cx).snapshot();
+        let has_file = |name: &str| {
+            RelPath::new(Path::new(name), snapshot.path_style())
+                .log_err()
+                .and_then(|path| snapshot.entry_for_path(&path))
+                .is_some_and(|entry| entry.is_file())
+        };
+        (["gradlew", "gradlew.bat"].into_iter().any(has_file)
+            && [
+                "settings.gradle.kts",
+                "settings.gradle",
+                "build.gradle.kts",
+                "build.gradle",
+            ]
+            .into_iter()
+            .any(has_file))
+        .then_some(root)
+    }
+
+    fn auto_sync_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .root
+            .as_ref()
+            .is_some_and(|root| !self.roots(cx).contains(root))
+        {
+            self.sync_task = None;
+            self.syncing = false;
+            self.root = None;
+            self.auto_sync_root = None;
+            self.targets.clear();
+            self.selected_target = None;
+            cx.notify();
+        }
+        if self.syncing || self.running {
+            return;
+        }
+        let Some(root) = self.auto_sync_candidate(cx) else {
+            return;
+        };
+        if self.auto_sync_root.as_ref() == Some(&root) {
+            return;
+        }
+        self.auto_sync_root = Some(root);
+        self.sync_project(window, cx);
     }
 
     fn roots(&self, cx: &App) -> Vec<PathBuf> {
@@ -258,6 +350,7 @@ impl AndroidPanel {
             }
         };
         self.root = Some(root.clone());
+        self.auto_sync_root = Some(root.clone());
         self.syncing = true;
         self.targets.clear();
         self.error = None;
@@ -613,7 +706,14 @@ impl AndroidPanel {
             .selected_target
             .as_ref()
             .map(AndroidTarget::label)
-            .unwrap_or_else(|| "Select build variant".into());
+            .unwrap_or_else(|| {
+                if self.syncing {
+                    "Syncing project…"
+                } else {
+                    "Select build variant"
+                }
+                .into()
+            });
         PopoverMenu::new(id)
             .trigger(
                 Button::new("target", label)
@@ -1044,11 +1144,15 @@ mod tests {
             .expect("Android panel should register with a new workspace");
         panel.read_with(cx, |panel, cx| {
             assert!(panel.trusted_root(cx).is_err());
+            assert!(panel.auto_sync_candidate(cx).is_none());
+            assert!(panel.auto_sync_root.is_none());
             assert!(panel.selected_device().is_err());
             assert!(!panel.running);
             assert!(!panel.syncing);
         });
         let store = project.read_with(cx, |project, _| project.worktree_store());
+        // Device subprocesses use the host SDK, outside the deterministic fake filesystem.
+        panel.update(cx, |panel, _| panel.refreshing_devices = true);
         cx.update(|_, cx| {
             TrustedWorktrees::try_get_global(cx)
                 .expect("Trust store should exist")
@@ -1061,6 +1165,14 @@ mod tests {
                         cx,
                     )
                 });
+        });
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, cx| {
+            assert_eq!(
+                panel.auto_sync_candidate(cx),
+                Some(PathBuf::from("/android"))
+            );
+            assert_eq!(panel.auto_sync_root, Some(PathBuf::from("/android")));
         });
         panel.update(cx, |panel, cx| {
             assert_eq!(panel.trusted_root(cx).ok(), Some(PathBuf::from("/android")));
