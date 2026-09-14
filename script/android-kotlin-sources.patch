@@ -1,0 +1,115 @@
+--- a/server/src/main/kotlin/org/javacs/kt/Configuration.kt
++++ b/server/src/main/kotlin/org/javacs/kt/Configuration.kt
+@@ -53,7 +53,8 @@
+     /** Whether kls-URIs should be sent to the client to describe classes in JARs. */
+     var useKlsScheme: Boolean = false,
+     /** Whether external classes should be automatically converted to Kotlin. */
+-    var autoConvertToKotlin: Boolean = false
++    var autoConvertToKotlin: Boolean = false,
++    var sourceArchives: List<String> = emptyList()
+ )
+ 
+ data class InlayHintsConfiguration(
+--- a/server/src/main/kotlin/org/javacs/kt/KotlinWorkspaceService.kt
++++ b/server/src/main/kotlin/org/javacs/kt/KotlinWorkspaceService.kt
+@@ -187,6 +187,7 @@
+                 val externalSources = config.externalSources
+                 get("useKlsScheme")?.asBoolean?.let { externalSources.useKlsScheme = it }
+                 get("autoConvertToKotlin")?.asBoolean?.let { externalSources.autoConvertToKotlin = it }
++                get("sourceArchives")?.asJsonArray?.let { externalSources.sourceArchives = it.map { path -> path.asString } }
+             }
+         }
+ 
+--- a/server/src/main/kotlin/org/javacs/kt/externalsources/ClassContentProvider.kt
++++ b/server/src/main/kotlin/org/javacs/kt/externalsources/ClassContentProvider.kt
+@@ -11,6 +11,9 @@
+ import java.io.FileNotFoundException
+ import java.nio.file.Files
+ import java.util.LinkedHashMap
++import java.net.URI
++import java.nio.file.Paths
++import java.util.zip.ZipFile
+ 
+ /**
+  * Provides the source code for classes located inside
+@@ -36,7 +39,7 @@
+      */
+     fun contentOf(uri: KlsURI): Pair<KlsURI, String> {
+         LOG.info("Resolving {} for contents", uri)
+-        val resolvedUri = sourceArchiveProvider.fetchSourceArchive(uri.archivePath)?.let(uri.withSource(true)::withArchivePath) ?: uri
++        val resolvedUri = attachedSource(uri, config.sourceArchives) ?: sourceArchiveProvider.fetchSourceArchive(uri.archivePath)?.let(uri.withSource(true)::withArchivePath) ?: uri
+         val key = resolvedUri.toString()
+         val (contents, extension) = cachedContents[key] ?: run {
+                 LOG.info("Reading contents of {}", describeURI(resolvedUri.fileUri))
+@@ -69,3 +72,24 @@
+         }
+     } catch (e: FileNotFoundException) { null }
+ }
++
++internal fun attachedSource(uri: KlsURI, archives: List<String>): KlsURI? {
++    val classPath = uri.fileUri.schemeSpecificPart.substringAfter("!/", "")
++        .substringBeforeLast('.').substringBefore('$')
++    if (classPath.isEmpty()) return null
++    for (archive in archives) {
++        try {
++            ZipFile(archive).use { zip ->
++                // AndroidX multiplatform sources retain their source-set directory.
++                val entry = listOf("", "androidMain/", "jvmMain/", "commonMain/")
++                    .asSequence().flatMap { prefix -> sequenceOf("$prefix$classPath.kt", "$prefix$classPath.java") }
++                    .mapNotNull(zip::getEntry).firstOrNull() ?: return@use
++                return URI(Paths.get(archive).toUri().toString() + "!" + URI(null, null, "/${entry.name}", null).rawPath)
++                    .toKlsURI()?.withSource(true)
++            }
++        } catch (exception: java.io.IOException) {
++            LOG.warn("Could not read attached source archive {}: {}", archive, exception.message)
++        }
++    }
++    return null
++}
+--- a/server/src/main/kotlin/org/javacs/kt/definition/GoToDefinition.kt
++++ b/server/src/main/kotlin/org/javacs/kt/definition/GoToDefinition.kt
+@@ -71,7 +71,7 @@
+                     destination.uri = tmpFile.toUri().toString()
+                 }
+ 
+-                if (destination.range.isZero) {
++                if (klsSourceURI.source || destination.range.isZero) {
+                     // Try to find the definition inside the source directly
+                     val name = when (target) {
+                         is ConstructorDescriptor -> target.constructedClass.name.toString()
+--- /dev/null
++++ b/server/src/test/kotlin/org/javacs/kt/externalsources/AttachedSourcesTest.kt
+@@ -0,0 +1,33 @@
++package org.javacs.kt.externalsources
++
++import java.net.URI
++import java.nio.file.Files
++import java.util.zip.ZipEntry
++import java.util.zip.ZipOutputStream
++import org.junit.Assert.*
++import org.junit.Test
++
++class AttachedSourcesTest {
++    @Test
++    fun `resolve source sets inner classes and paths with spaces`() {
++        val directory = Files.createTempDirectory("attached sources ")
++        val archive = directory.resolve("library sources.jar")
++        try {
++            ZipOutputStream(Files.newOutputStream(archive)).use { zip ->
++                zip.putNextEntry(ZipEntry("androidMain/androidx/activity/ComponentActivity.kt"))
++                zip.write("package androidx.activity\nclass ComponentActivity".toByteArray())
++                zip.closeEntry()
++            }
++            val uri = URI("file:///compiled.jar!/androidx/activity/ComponentActivity${'$'}Nested.class").toKlsURI()!!
++            val source = attachedSource(uri, listOf(archive.toString()))!!
++            assertTrue(source.source)
++            assertEquals("kt", source.fileExtension)
++            assertTrue(source.readContents().contains("class ComponentActivity"))
++            assertNull(attachedSource(uri, emptyList()))
++            assertNull(attachedSource(URI("file:///compiled.jar!/unknown/Class.class").toKlsURI()!!, listOf(archive.toString())))
++        } finally {
++            Files.deleteIfExists(archive)
++            Files.deleteIfExists(directory)
++        }
++    }
++}

@@ -12,6 +12,7 @@ import tempfile
 import urllib.request
 
 REVISION = "6d9e61b79d4631e75516def7ab7ff0d8b9310467"
+VERSION = REVISION + "+android-sources-1"
 SOURCE_SHA256 = "c82e551b82db7066a8f4c0cc83ce6ef58efb14489882fdf5560af6594bc06ce2"
 JDK_SHA256 = "c487a1c3a56588b3a32d0d07cdd526bf3d401c4b8422be772ca178bfcd647f3f"
 REPOSITORY = Path(__file__).resolve().parent.parent
@@ -46,12 +47,13 @@ def main():
         raise RuntimeError("This bootstrap currently supports Apple Silicon macOS")
     DEPENDENCIES.mkdir(parents=True, exist_ok=True)
     if INSTALLATION.exists():
-        if INSTALLATION.is_symlink() or (INSTALLATION / ".revision").read_text().strip() != REVISION:
+        if INSTALLATION.is_symlink() or not (INSTALLATION / ".revision").is_file() or (INSTALLATION / ".revision").read_text().strip() not in (REVISION, VERSION):
             raise RuntimeError(f"Preserving the existing installation at {INSTALLATION}; move it aside first")
         if not (INSTALLATION / "bin/kotlin-language-server").is_file():
             raise RuntimeError("The Kotlin installation is incomplete; move it aside and rerun")
-        print(f"Already installed: {INSTALLATION}")
-        return
+        if (INSTALLATION / ".revision").read_text().strip() == VERSION:
+            print(f"Already installed: {INSTALLATION}")
+            return
     java_home = os.environ.get("JAVA21_HOME") or subprocess.check_output(
         ["/usr/libexec/java_home", "-v", "21"], text=True
     ).strip()
@@ -76,19 +78,30 @@ def main():
         with tarfile.open(archive) as source:
             source.extractall(temporary, filter="data")
         source = temporary / f"kotlin-language-server-{REVISION}"
+        patch = Path(__file__).with_name("android-kotlin-sources.patch").resolve()
+        subprocess.run(["patch", "--batch", "-p1", "-i", str(patch)], cwd=source, check=True)
         environment = dict(os.environ, JAVA_HOME=java_home)
         subprocess.run(
             [str(source / "gradlew"), "-p", str(source),
              f"-Porg.gradle.java.installations.paths={java11}",
              ":server:test", "--tests", "org.javacs.kt.Rename*",
+             "--tests", "org.javacs.kt.DefinitionTest", "--tests", "org.javacs.kt.externalsources.AttachedSourcesTest",
              ":server:installDist", "--console=plain", "--max-workers=2"],
             env=environment, check=True,
         )
         distribution = source / "server/build/install/server"
         shutil.copy2(source / "LICENSE.txt", distribution / "LICENSE.txt")
-        (distribution / ".revision").write_text(REVISION + "\n")
-        (distribution / "SOURCE.txt").write_text(f"https://github.com/fwcd/kotlin-language-server/tree/{REVISION}\n")
-        distribution.rename(INSTALLATION)
+        (distribution / ".revision").write_text(VERSION + "\n")
+        (distribution / "SOURCE.txt").write_text(f"https://github.com/fwcd/kotlin-language-server/tree/{REVISION}\nPatch: script/android-kotlin-sources.patch\n")
+        backup = temporary / "previous-installation"
+        if INSTALLATION.exists():
+            INSTALLATION.rename(backup)
+        try:
+            distribution.rename(INSTALLATION)
+        except BaseException:
+            if backup.exists():
+                backup.rename(INSTALLATION)
+            raise
     print(f"Installed: {INSTALLATION}")
     print("Relaunch script/android-ide, then run Android: Configure Kotlin in your project.")
     print("Kotlin rename updates Kotlin callers; Java callers still require manual review.")

@@ -1610,9 +1610,7 @@ fn kotlin_settings(
                 serde_json::json!({"externalSources": {"sourceArchives": source_archives}}),
                 server.settings.get_or_insert_with(|| serde_json::json!({})),
             );
-            server
-                .binary
-                .get_or_insert_default();
+            let binary = server.binary.get_or_insert_default();
             binary
                 .env
                 .get_or_insert_default()
