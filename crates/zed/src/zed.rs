@@ -5906,6 +5906,7 @@ mod tests {
                 "activity_indicator",
                 "agent",
                 "agents_sidebar",
+                "android",
                 "app_menu",
                 "assistant",
                 "assistant2",
