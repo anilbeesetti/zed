@@ -1115,7 +1115,7 @@ fn kotlin_settings(
                 .entry("kotlin-language-server".into())
                 .or_default();
             util::merge_json_value_into(
-                serde_json::json!({"kotlin": {"externalSources": {"sourceArchives": source_archives}}}),
+                serde_json::json!({"externalSources": {"sourceArchives": source_archives}}),
                 server.settings.get_or_insert_with(|| serde_json::json!({})),
             );
             server
@@ -1250,7 +1250,7 @@ mod tests {
             assert_eq!(parsed["languages"]["Rust"]["format_on_save"], "off");
             assert_eq!(parsed["languages"]["Kotlin"]["language_servers"], json!(["kotlin-language-server"]));
             assert_eq!(parsed["lsp"]["kotlin-language-server"]["binary"]["env"]["JAVA_HOME"], "/jdk 21");
-            assert_eq!(parsed["lsp"]["kotlin-language-server"]["settings"]["kotlin"]["externalSources"]["sourceArchives"], json!(["/sources/activity.jar"]));
+            assert_eq!(parsed["lsp"]["kotlin-language-server"]["settings"]["externalSources"]["sourceArchives"], json!(["/sources/activity.jar"]));
         });
         let filesystem = FakeFs::new(cx.executor());
         filesystem
