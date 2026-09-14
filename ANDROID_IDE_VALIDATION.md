@@ -1,7 +1,8 @@
 # Android IDE prototype: validation and handoff
 
-Session: 13–14 September 2026. Platform: Apple Silicon macOS. All changes and stack
-branches remain local; no branches were pushed and no GitHub PRs were created.
+Session: 13–14 September 2026. Platform: Apple Silicon macOS. Changes are published
+as draft stacked PRs following the author’s later authorization. Historical
+checkpoints below retain their original measurements and limitations.
 
 This is a working Android edit/build/run/debug/Compose-preview prototype with an
 Android Studio-inspired shell. Android-aware Java editing and Kotlin object
@@ -9,7 +10,7 @@ rename also work on the fixture. It remains a development build: mixed-language
 refactoring, advanced Kotlin debugging, broad project-model compatibility and
 release packaging are not complete. The
 [research and implementation plan](ANDROID_IDE_PLAN.md) covers the longer-term
-work; [the review guide](ANDROID_IDE_REVIEW.md) describes the local stack.
+work; [the review guide](ANDROID_IDE_REVIEW.md) describes the review stack.
 
 ## Run it
 
@@ -40,8 +41,9 @@ Kotlin and Java extensions, and select the community Kotlin server. This is a de
 launcher, not a signed installer or an independently branded release.
 
 1. Open the Android tool window using the hammer on the right tool rail.
-2. Save any Gradle-file edits, then choose **Sync project**. Four runnable
-   variants should appear for `:mobile`. Sync currently reads files from disk;
+2. Trusted Android projects sync automatically on open. Four runnable variants
+   should appear for `:mobile`. After Gradle edits, save and choose **Sync project**.
+   Sync reads files from disk;
    Build/Run/Test/Lint use the task system's save-before-run behavior.
 3. Select **:mobile · demoDebug** or **:mobile · fullDebug**.
    The choice is remembered for this project and restored after the next sync.
@@ -49,7 +51,8 @@ launcher, not a signed installer or an independently branded release.
    compile classpath, and configures the project with a JDK 21 language server.
    The Kotlin extension must be installed; new launcher profiles request it
    automatically. Repeat setup after changing variants or dependencies.
-5. Select a connected device, or choose an existing AVD using **Start emulator…**.
+5. Select a connected device or a stopped AVD in the top device picker.
+   **Run** and **Debug** start a stopped selection and wait for it before deploying.
 6. Choose **Run**. The app displays the selected flavor, its application ID,
    and `Android library connected`.
 7. Use **Test**, **Lint**, or **Open Logcat** as needed. Build output remains in
@@ -537,3 +540,84 @@ All requested progress messages were sent using `telegram-send` to the
 explicitly approved configured destination. Screenshots show running local
 software, not generated mockups. The root README review notice remains in place
 for the human author to remove only after reviewing the stack.
+
+## Review regression pass — 14 September 2026
+
+### Fixes and focused evidence
+
+- Dependency sources: Configure Kotlin exports the selected Gradle variant’s
+  source archives. The pinned runtime reads the original Java/Kotlin file before
+  trying decompilation. The disposable fixture resolved `ComponentActivity` to
+  the original Java source, with a 1.22-second definition request in the recorded
+  probe. This is one functional probe, not a performance benchmark.
+- Resources: `R.string.app_name` and `@string/app_name` resolve from module XML
+  buffers before calling the language server. The test covers locales, module
+  boundaries, framework/foreign namespaces, ignored comments, and malformed XML.
+  This works without waiting for a generated `R` class or an initialized server.
+- Language installation: default automatic extensions now include Kotlin, Java
+  and XML. The Java extension supplies Gradle Kotlin DSL highlighting; XML handles
+  both the manifest and values files. User extension overrides remain respected.
+- Repeated command-clicks: cached definition links move the caret to the actual
+  clicked symbol before falling back to references. The existing picker now
+  handles one reference and replaces an already-open query instead of closing it.
+- Search Everywhere: actual Shift press/release pairs, class filtering, combined
+  file/action/symbol results, category navigation and opening a class have GPUI
+  coverage. Language-server failure is visible while file/action search remains
+  available.
+- Find/Replace: common Mac shortcuts and Ctrl+Shift+F/R aliases deploy a modal.
+  Project-panel Find keeps the selected directory filter. The regression replaces
+  three occurrences in two files, preserves tabs, cancels close, then saves safely.
+- Automatic sync, selected stopped AVDs, trust boundaries and device eligibility
+  are covered in the Android panel test. Debug shares the same emulator startup
+  path as Run.
+
+The combined run passed 128 tests: Android tools 4, Android UI 3, command palette
+20, LSP locations 8, and search 93. The final resource navigation integration
+test also passed. `cargo fmt --all -- --check` and the repository Clippy script
+for all changed crates passed. Raw logs
+and screenshots remain in ignored `target/android-ide/validation/review-*` files.
+
+Re-run the focused checks from the repository root, with the installed WebRTC
+path exported as in the build instructions above:
+
+```sh
+cargo test --locked -p search -p command_palette -p android_ui -p android_tools -p lsp_locations
+cargo test --locked -p project --features test-support test_android_resource_definitions_without_language_server
+cargo test --locked -p editor test_cached_declaration_click_moves_caret_before_usages
+./script/clippy -p android_ui -p android_tools -p platform_title_bar -p project -p editor -p lsp_locations -p command_palette -p search -p project_panel --features gpui/inspector
+```
+
+### Shortcut audit
+
+Checked the [Android Studio shortcut reference](https://developer.android.com/studio/intro/keyboard-shortcuts)
+and [IntelliJ macOS keymap](https://www.jetbrains.com/help/idea/reference-keymap-mac-default.html).
+The Mac map now corrects documentation, breakpoints, Resume, tab switching,
+Version Control, block comments and auto-indent. Both maps retain separate Find
+Usages results and the Show Usages popup. Search Everywhere and floating project
+Find/Replace are implemented by the new layers, with existing editor features
+used for navigation, folding, formatting, completion and rename.
+
+This is not complete IntelliJ action parity: live templates, statement completion,
+smart completion, Generate, and several structural refactorings need additional
+language support. An untitled Zed buffer substitutes for a scratch file. macOS
+may reserve Ctrl+Left/Right for Spaces; change the OS shortcut if it intercepts
+editor-tab switching. Linux/Windows keymap loading is tested on macOS, not on
+those operating systems.
+
+### JetBrains Android plugin reference
+
+The [resource model documentation](https://github.com/JetBrains/android/blob/master/android/src/com/android/tools/idea/res/README.md)
+is useful for the next resource-navigation phase: it distinguishes module,
+project, dependency and framework resources and explains source-set overlays.
+The current implementation intentionally returns matching declarations in this
+module’s source sets/locales, without pretending to choose the runtime qualifier
+or selected-variant overlay. Resources in other modules/AARs fall back to LSP.
+
+The [Android light-class documentation](https://github.com/JetBrains/android/blob/master/android/docs/android-light-classes.md)
+explains why navigating to generated `R` code is the wrong editor destination
+and how Studio redirects those symbols to their source resources before a build.
+Our implementation follows that behavior through Zed’s existing definition
+pipeline. The plugin’s PSI extension points are IntelliJ-specific; directly
+embedding them into GPUI is not a small integration. No JetBrains plugin code was
+copied. A Gradle-backed resource overlay model is the next step for namespace,
+flavor, dependency and framework resource parity.

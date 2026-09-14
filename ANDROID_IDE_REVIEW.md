@@ -1,15 +1,18 @@
-# Local stack review guide
+# Stacked pull request review guide
 
-No branches have been pushed and no GitHub PRs have been created. These are
-local `gh-stack` branches with review-ready descriptions. The current top is
-`codex/android-ide/final-validation`; the base is local `main` at `7960b2a7c9568e90fbe0727332149e5b2a5fd57a`.
+The changes are reviewed as draft pull requests in
+[GitHub stacked PRs](https://github.com/anilbeesetti/zed/pulls) (stack #16).
+The original fifteen layers remain in order; this review adds navigation,
+Search Everywhere, floating Find/Replace, and validation layers. The combined
+application is on `codex/android-ide/review-validation`. The base is `main` at
+`7960b2a7c9568e90fbe0727332149e5b2a5fd57a`.
 
 ## Inspect and test the stack
 
 ```sh
 gh stack view --json
-git log --oneline main..codex/android-ide/final-validation
-git diff --stat main..codex/android-ide/final-validation
+git log --oneline main..codex/android-ide/review-validation
+git diff --stat main..codex/android-ide/review-validation
 ```
 
 For one layer, compare its branch against the parent in this table. This keeps
@@ -17,7 +20,7 @@ review focused without losing the runnable combined application at the top.
 The actual Git branch tips are authoritative if a cached `gh-stack` head field
 has not refreshed after a commit.
 
-| Layer | Branch suffix under `codex/android-ide/` | Parent | Source tip before the report commit |
+| Layer | Branch suffix under `codex/android-ide/` | Parent | Original checkpoint (before review fixes) |
 | --- | --- | --- | --- |
 | 1 | `research` | `main` | `bbcbb5f406` |
 | 2 | `studio-defaults` | `research` | `600b860c56` |
@@ -33,7 +36,11 @@ has not refreshed after a commit.
 | 12 | `kotlin-runtime` | `java-support` | `66dc0548c9` |
 | 13 | `debugger` | `kotlin-runtime` | `136b384657` |
 | 14 | `compose-preview` | `debugger` | `371380b5a7` |
-| 15 | `final-validation` | `compose-preview` | This report commit |
+| 15 | `final-validation` | `compose-preview` | Original report |
+| 16 | `navigation` | `final-validation` | See current branch tip |
+| 17 | `search-everywhere` | `navigation` | See current branch tip |
+| 18 | `find-replace-popup` | `search-everywhere` | See current branch tip |
+| 19 | `review-validation` | `find-replace-popup` | This report |
 
 For example:
 
@@ -46,7 +53,7 @@ Fixes were committed to their owning layer and descendants rebased locally.
 Future edits should follow the same approach: check out that layer, make and
 validate the change, commit, then use `gh stack rebase --upstack --remote origin`
 and return with `gh stack top`. A rebase may fetch its base; that is not a push.
-Do not run stack push/submit or create PRs without new authorization.
+The author authorized publishing this stack as draft PRs. Do not merge it without a separate request.
 
 Start with the [validation report](ANDROID_IDE_VALIDATION.md) for build commands,
 supported workflows, known failures, performance caveats, and reproduction.
@@ -355,3 +362,26 @@ ancestry, diff hygiene and absence of pushed branches or created PRs.
 Release Notes:
 
 - N/A
+
+## Review fixes, 14 September
+
+The owning layers contain the defaults/shortcut corrections (2), trusted-project
+auto-sync (4), traffic-light alignment and Logcat rail control (5), dependency
+source archive export (6), stopped-AVD selection and Run startup (8), patched
+source navigation runtime (12), and Debug startup for a stopped AVD (13).
+Their descendants were rebased with `gh stack rebase --upstack --remote origin`.
+
+Layer 16 adds Android resource-to-XML navigation and fixes cached declaration
+clicks to find usages at the clicked location. It uses the existing references
+picker, including one-result and repeated-query cases.
+
+Layer 17 combines existing file, workspace-symbol and action search in Search
+Everywhere. It includes category tabs and Double Shift/Go to Class shortcuts.
+File/action results appear while the language server is still searching.
+
+Layer 18 wraps the existing project search view/bar in a floating modal. Find and
+Replace retain filters, matching, replacements and save handling. Closing a dirty
+result asks Save/Discard/Cancel, and the prior editor tabs remain in place.
+
+Layer 19 records the review evidence and limits. See the latest section of
+[the validation report](ANDROID_IDE_VALIDATION.md) before testing.
