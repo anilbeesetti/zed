@@ -1,6 +1,8 @@
 [
   {
     "bindings": {
+      // Match the inherited global Open binding's scope so it cannot win in editors.
+      "cmd-o": ["search_everywhere::Toggle", {"category": "classes"}],
       "cmd-{": "pane::ActivatePreviousItem",
       "cmd-}": "pane::ActivateNextItem",
       "cmd-0": "git_panel::ToggleFocus", // overrides `cmd-0` zoom reset
@@ -140,7 +142,6 @@
       "cmd-shift-a": "command_palette::Toggle",
       "shift shift": "search_everywhere::Toggle",
       "cmd-alt-o": "project_symbols::Toggle", // JetBrains: Go to Symbol
-      "cmd-o": ["search_everywhere::Toggle", {"category": "classes"}], // JetBrains: Go to Class
       "cmd-1": "project_panel::ToggleFocus",
       "cmd-9": "git_panel::ToggleFocus",
       "cmd-5": "debug_panel::ToggleFocus",

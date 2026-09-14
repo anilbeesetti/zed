@@ -641,5 +641,16 @@ mod tests {
             workspace.active_modal::<SearchEverywhere>(cx).is_none()
         }));
         cx.assert_editor_state("struct ˇFileType;\nfn file_function() {}\n");
+        cx.simulate_keystrokes("cmd-o");
+        cx.run_until_parked();
+        workspace.read_with(&cx.cx.cx, |workspace, cx| {
+            let search = workspace
+                .active_modal::<SearchEverywhere>(cx)
+                .expect("Go to Class overrides the global Open shortcut");
+            assert_eq!(
+                search.read(cx).picker.read(cx).delegate.category,
+                Category::Classes
+            );
+        });
     }
 }
