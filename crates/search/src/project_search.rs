@@ -7030,8 +7030,10 @@ pub mod tests {
         init_test(cx);
         cx.update(|cx| {
             for asset in ["keymaps/default-macos.json", "keymaps/macos/jetbrains.json"] {
-                cx.bind_keys(settings::KeymapFile::load_asset_allow_partial_failure(asset, cx)
-                    .expect("Keymap asset"));
+                cx.bind_keys(
+                    settings::KeymapFile::load_asset_allow_partial_failure(asset, cx)
+                        .expect("Keymap asset"),
+                );
             }
         });
         let filesystem = FakeFs::new(cx.background_executor.clone());
