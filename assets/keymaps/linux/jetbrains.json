@@ -124,8 +124,6 @@
     "context": "Workspace",
     "bindings": {
       "ctrl-shift-f12": "workspace::ToggleAllDocks",
-      "ctrl-shift-f": ["pane::DeploySearch", { "modal": true }],
-      "ctrl-shift-r": ["pane::DeploySearch", { "replace_enabled": true, "modal": true }],
       "alt-shift-f10": "task::Spawn",
       "shift-f10": "task::Spawn",
       "ctrl-f5": "task::Rerun",
@@ -161,8 +159,10 @@
     },
   },
   {
-    "context": "Workspace || Editor",
+    "context": "Workspace || Pane || Editor",
     "bindings": {
+      "ctrl-shift-f": ["pane::DeploySearch", { "modal": true }],
+      "ctrl-shift-r": ["pane::DeploySearch", { "replace_enabled": true, "modal": true }],
       "alt-f12": "terminal_panel::Toggle",
       "ctrl-shift-k": "git::Push",
     },

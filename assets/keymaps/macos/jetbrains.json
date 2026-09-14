@@ -130,10 +130,6 @@
     "context": "Workspace",
     "bindings": {
       "cmd-shift-f12": "workspace::ToggleAllDocks",
-      "cmd-shift-f": ["pane::DeploySearch", { "modal": true }],
-      "ctrl-shift-f": ["pane::DeploySearch", { "modal": true }],
-      "ctrl-shift-r": ["pane::DeploySearch", { "replace_enabled": true, "modal": true }],
-      "cmd-shift-r": ["pane::DeploySearch", { "replace_enabled": true, "modal": true }],
       "ctrl-alt-r": "task::Spawn",
       "shift-f10": "task::Spawn",
       "cmd-f5": "task::Rerun",
@@ -168,8 +164,10 @@
     },
   },
   {
-    "context": "Workspace || Editor",
+    "context": "Workspace || Pane || Editor",
     "bindings": {
+      "cmd-shift-f": ["pane::DeploySearch", { "modal": true }],
+      "cmd-shift-r": ["pane::DeploySearch", { "replace_enabled": true, "modal": true }],
       "alt-f12": "terminal_panel::Toggle",
       "cmd-shift-k": "git::Push",
     },
@@ -188,7 +186,6 @@
     "bindings": {
       "enter": "project_panel::Open",
       "cmd-shift-f": ["project_panel::NewSearchInDirectory", { "modal": true }],
-      "ctrl-shift-f": ["project_panel::NewSearchInDirectory", { "modal": true }],
       "cmd-backspace": ["project_panel::Trash", { "skip_prompt": false }],
       "backspace": ["project_panel::Trash", { "skip_prompt": false }],
       "delete": ["project_panel::Trash", { "skip_prompt": false }],

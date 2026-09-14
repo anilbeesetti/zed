@@ -7028,14 +7028,6 @@ pub mod tests {
     #[gpui::test]
     async fn test_find_replace_modal_preserves_tabs_and_unsaved_changes(cx: &mut TestAppContext) {
         init_test(cx);
-        cx.update(|cx| {
-            for asset in ["keymaps/default-macos.json", "keymaps/macos/jetbrains.json"] {
-                cx.bind_keys(
-                    settings::KeymapFile::load_asset_allow_partial_failure(asset, cx)
-                        .expect("Keymap asset"),
-                );
-            }
-        });
         let filesystem = FakeFs::new(cx.background_executor.clone());
         filesystem
             .insert_tree(
@@ -7050,6 +7042,63 @@ pub mod tests {
             .read_with(cx, |workspace, _| workspace.workspace().clone())
             .expect("Workspace");
         let cx = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        let worktree_id = project.read_with(cx, |project, cx| {
+            project
+                .worktrees(cx)
+                .next()
+                .expect("Test worktree")
+                .read(cx)
+                .id()
+        });
+        workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.open_path((worktree_id, rel_path("one.txt")), None, true, window, cx)
+            })
+            .await
+            .expect("Open the existing editor tab");
+        cx.run_until_parked();
+        for (platform, shortcuts) in [
+            (
+                "macos",
+                &[("cmd-shift-f", false), ("cmd-shift-r", true)][..],
+            ),
+            (
+                "linux",
+                &[("ctrl-shift-f", false), ("ctrl-shift-r", true)][..],
+            ),
+        ] {
+            cx.update(|_, cx| {
+                cx.clear_key_bindings();
+                for asset in [
+                    format!("keymaps/default-{platform}.json"),
+                    format!("keymaps/{platform}/jetbrains.json"),
+                ] {
+                    cx.bind_keys(
+                        settings::KeymapFile::load_asset_allow_partial_failure(&asset, cx)
+                            .expect("Keymap asset"),
+                    );
+                }
+            });
+            for &(shortcut, replace_enabled) in shortcuts {
+                cx.simulate_keystrokes(shortcut);
+                cx.run_until_parked();
+                workspace.read_with(cx, |workspace, cx| {
+                    let modal = workspace
+                        .active_modal::<ProjectSearchModal>(cx)
+                        .unwrap_or_else(|| panic!("{shortcut} must open a popup from the editor"));
+                    assert_eq!(
+                        modal.read(cx).search.read(cx).replace_enabled,
+                        replace_enabled
+                    );
+                    assert_eq!(workspace.active_pane().read(cx).items().count(), 1);
+                });
+                cx.simulate_keystrokes("escape");
+                cx.run_until_parked();
+                assert!(workspace.read_with(cx, |workspace, cx| {
+                    workspace.active_modal::<ProjectSearchModal>(cx).is_none()
+                }));
+            }
+        }
         workspace.update_in(cx, |workspace, window, cx| {
             ProjectSearchView::deploy_search(
                 workspace,
@@ -7065,7 +7114,7 @@ pub mod tests {
         });
         cx.run_until_parked();
         let modal = workspace.read_with(cx, |workspace, cx| {
-            assert_eq!(workspace.active_pane().read(cx).items().count(), 0);
+            assert_eq!(workspace.active_pane().read(cx).items().count(), 1);
             workspace
                 .active_modal::<ProjectSearchModal>(cx)
                 .expect("Floating search")
