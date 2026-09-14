@@ -643,7 +643,7 @@ impl AndroidPanel {
         let executor = cx.background_executor().clone();
         self.kotlin_task = Some(cx.spawn_in(window, async move |panel, cx| {
             let result = async {
-                let (paths, java_home, previous_settings) = cx.background_spawn({
+                let (paths, sources, java_home, previous_settings) = cx.background_spawn({
                     let root = root.clone();
                     async move {
                         let java_home = kotlin::java_home()?;
@@ -656,12 +656,12 @@ impl AndroidPanel {
                         args.extend(["--init-script".into(), init.to_string_lossy().into_owned(),
                             format!("-Dzed.android.compileTask={compile}"), task, "--console=plain".into()]);
                         let output = tool_output(program, args, &root, &executor, Duration::from_secs(300)).await?;
-                        Ok::<_, anyhow::Error>((kotlin::parse_classpath(&output)?, java_home, kotlin::read_settings(&root)?))
+                        Ok::<_, anyhow::Error>((kotlin::parse_classpath(&output)?, kotlin::parse_sources(&output)?, java_home, kotlin::read_settings(&root)?))
                     }
                 }).await?;
                 let updated_settings = panel.update_in(cx, |panel, _, cx| {
                     ensure!(panel.trusted_root(cx)? == root, "The Android project changed during Kotlin setup");
-                    kotlin_settings(previous_settings.clone(), &java_home, cx)
+                    kotlin_settings(previous_settings.clone(), &java_home, &sources, cx)
                 })??;
                 cx.background_spawn(async move { kotlin::finish(&root, &paths, &previous_settings, &updated_settings) }).await
             }.await;
@@ -1092,7 +1092,12 @@ impl Render for AndroidToolbar {
     }
 }
 
-fn kotlin_settings(previous: String, java_home: &Path, cx: &App) -> Result<String> {
+fn kotlin_settings(
+    previous: String,
+    java_home: &Path,
+    source_archives: &[PathBuf],
+    cx: &App,
+) -> Result<String> {
     cx.global::<settings::SettingsStore>()
         .new_text_for_update(previous, |content| {
             content
@@ -1103,12 +1108,17 @@ fn kotlin_settings(previous: String, java_home: &Path, cx: &App) -> Result<Strin
                 .entry("Kotlin".into())
                 .or_default()
                 .language_servers = Some(vec!["kotlin-language-server".into()]);
-            content
+            let server = content
                 .project
                 .lsp
                 .0
                 .entry("kotlin-language-server".into())
-                .or_default()
+                .or_default();
+            util::merge_json_value_into(
+                serde_json::json!({"kotlin": {"externalSources": {"sourceArchives": source_archives}}}),
+                server.settings.get_or_insert_with(|| serde_json::json!({})),
+            );
+            server
                 .binary
                 .get_or_insert_default()
                 .env
@@ -1233,13 +1243,14 @@ mod tests {
                 }
             }
             let previous = "{\n// keep this comment\n\"tab_size\": 2, \"languages\": {\"Rust\": {\"format_on_save\": \"off\"}}\n}";
-            let updated = kotlin_settings(previous.into(), Path::new("/jdk 21"), cx).expect("Kotlin settings update should succeed");
+            let updated = kotlin_settings(previous.into(), Path::new("/jdk 21"), &[PathBuf::from("/sources/activity.jar")], cx).expect("Kotlin settings update should succeed");
             assert!(updated.contains("// keep this comment"));
             let parsed: serde_json::Value = settings::parse_json_with_comments(&updated).expect("Generated settings should parse");
             assert_eq!(parsed["tab_size"], 2);
             assert_eq!(parsed["languages"]["Rust"]["format_on_save"], "off");
             assert_eq!(parsed["languages"]["Kotlin"]["language_servers"], json!(["kotlin-language-server"]));
             assert_eq!(parsed["lsp"]["kotlin-language-server"]["binary"]["env"]["JAVA_HOME"], "/jdk 21");
+            assert_eq!(parsed["lsp"]["kotlin-language-server"]["settings"]["kotlin"]["externalSources"]["sourceArchives"], json!(["/sources/activity.jar"]));
         });
         let filesystem = FakeFs::new(cx.executor());
         filesystem
