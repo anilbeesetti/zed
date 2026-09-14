@@ -12,7 +12,7 @@ import tempfile
 import urllib.request
 
 REVISION = "6d9e61b79d4631e75516def7ab7ff0d8b9310467"
-VERSION = REVISION + "+android-sources-2"
+VERSION = REVISION + "+android-sources-3"
 SOURCE_SHA256 = "c82e551b82db7066a8f4c0cc83ce6ef58efb14489882fdf5560af6594bc06ce2"
 JDK_SHA256 = "c487a1c3a56588b3a32d0d07cdd526bf3d401c4b8422be772ca178bfcd647f3f"
 REPOSITORY = Path(__file__).resolve().parent.parent
@@ -47,7 +47,7 @@ def main():
         raise RuntimeError("This bootstrap currently supports Apple Silicon macOS")
     DEPENDENCIES.mkdir(parents=True, exist_ok=True)
     if INSTALLATION.exists():
-        if INSTALLATION.is_symlink() or not (INSTALLATION / ".revision").is_file() or (INSTALLATION / ".revision").read_text().strip() not in (REVISION, REVISION + "+android-sources-1", VERSION):
+        if INSTALLATION.is_symlink() or not (INSTALLATION / ".revision").is_file() or (INSTALLATION / ".revision").read_text().strip() not in (REVISION, REVISION + "+android-sources-1", REVISION + "+android-sources-2", VERSION):
             raise RuntimeError(f"Preserving the existing installation at {INSTALLATION}; move it aside first")
         if not (INSTALLATION / "bin/kotlin-language-server").is_file():
             raise RuntimeError("The Kotlin installation is incomplete; move it aside and rerun")
@@ -85,7 +85,7 @@ def main():
             [str(source / "gradlew"), "-p", str(source),
              f"-Porg.gradle.java.installations.paths={java11}",
              ":server:test", "--tests", "org.javacs.kt.Rename*",
-             "--tests", "org.javacs.kt.DefinitionTest", "--tests", "org.javacs.kt.externalsources.AttachedSourcesTest",
+             "--tests", "org.javacs.kt.DefinitionTest", "--tests", "org.javacs.kt.WorkspaceSymbolsTest", "--tests", "org.javacs.kt.externalsources.AttachedSourcesTest",
              ":server:installDist", "--console=plain", "--max-workers=2"],
             env=environment, check=True,
         )

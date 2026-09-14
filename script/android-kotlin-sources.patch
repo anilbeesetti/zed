@@ -115,10 +115,56 @@
 +}
 --- a/server/src/main/kotlin/org/javacs/kt/externalsources/FernFlowerDecompiler.kt
 +++ b/server/src/main/kotlin/org/javacs/kt/externalsources/FernFlowerDecompiler.kt
-@@ -17,6 +17,7 @@
+@@ -17,5 +17,6 @@
      private val decompilerOptions =
          arrayOf(
 +            "-log=WARN", // Per-class INFO messages can block the LSP output pipe.
              "-iec=1", // Include entire classpath for better context
              "-jpr=1", // Include parameter names in method signatures
          )
+--- a/server/src/main/kotlin/org/javacs/kt/symbols/Symbols.kt
++++ b/server/src/main/kotlin/org/javacs/kt/symbols/Symbols.kt
+@@ -7,7 +7,7 @@
+ import org.eclipse.lsp4j.SymbolKind
+ import org.eclipse.lsp4j.DocumentSymbol
+ import org.eclipse.lsp4j.WorkspaceSymbol
+-import org.eclipse.lsp4j.WorkspaceSymbolLocation
++import org.eclipse.lsp4j.Location
+ import org.eclipse.lsp4j.jsonrpc.messages.Either
+ import org.javacs.kt.SourcePath
+ import org.javacs.kt.position.range
+@@ -59,7 +59,7 @@
+ private fun workspaceSymbol(d: KtNamedDeclaration): WorkspaceSymbol? {
+     val name = d.name ?: return null
+ 
+-    return WorkspaceSymbol(name, symbolKind(d), Either.forRight(workspaceLocation(d)), symbolContainer(d))
++    return WorkspaceSymbol(name, symbolKind(d), Either.forLeft(workspaceLocation(d)), symbolContainer(d))
+ }
+ 
+ private fun symbolKind(d: KtNamedDeclaration): SymbolKind =
+@@ -73,11 +73,11 @@
+             else -> throw IllegalArgumentException("Unexpected symbol $d")
+         }
+ 
+-private fun workspaceLocation(d: KtNamedDeclaration): WorkspaceSymbolLocation {
++private fun workspaceLocation(d: KtNamedDeclaration): Location {
+     val file = d.containingFile
+     val uri = file.toPath().toUri().toString()
+ 
+-    return WorkspaceSymbolLocation(uri)
++    return Location(uri, range(file.text, d.nameIdentifier?.textRange ?: d.textRange))
+ }
+ 
+ private fun symbolContainer(d: KtNamedDeclaration): String? =
+--- a/server/src/test/kotlin/org/javacs/kt/WorkspaceSymbolsTest.kt
++++ b/server/src/test/kotlin/org/javacs/kt/WorkspaceSymbolsTest.kt
+@@ -10,6 +10,9 @@
+ class WorkspaceSymbolsTest : SingleFileTestFixture("symbols", "DocumentSymbols.kt") {
+     @Test fun `find symbols in OtherFileSymbols`() {
+         val found = languageServer.workspaceService.symbol(WorkspaceSymbolParams("")).get().right
++        org.junit.Assert.assertTrue(found.isNotEmpty())
++        org.junit.Assert.assertTrue(found.all { it.location.isLeft })
++        org.junit.Assert.assertTrue(found.all { it.location.left.range.end.line > it.location.left.range.start.line || it.location.left.range.end.character > it.location.left.range.start.character })
+         val byKind = found.groupBy({ it.kind }, { it.name })
+         val all = found.map { it.name }.toList()
+ 
