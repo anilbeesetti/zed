@@ -252,4 +252,10 @@
       "shift-tab": "search_everywhere::PreviousCategory",
     },
   },
+  {
+    "context": "ProjectSearchModal > Editor",
+    "bindings": {
+      "escape": "menu::Cancel"
+    }
+  }
 ]

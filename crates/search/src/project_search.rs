@@ -7028,6 +7028,12 @@ pub mod tests {
     #[gpui::test]
     async fn test_find_replace_modal_preserves_tabs_and_unsaved_changes(cx: &mut TestAppContext) {
         init_test(cx);
+        cx.update(|cx| {
+            for asset in ["keymaps/default-macos.json", "keymaps/macos/jetbrains.json"] {
+                cx.bind_keys(settings::KeymapFile::load_asset_allow_partial_failure(asset, cx)
+                    .expect("Keymap asset"));
+            }
+        });
         let filesystem = FakeFs::new(cx.background_executor.clone());
         filesystem
             .insert_tree(
@@ -7073,17 +7079,13 @@ pub mod tests {
             search.replace_all(&ReplaceAll, window, cx);
             assert!(search.is_dirty(cx));
         });
-        workspace.update_in(cx, |workspace, window, cx| {
-            assert!(!workspace.hide_modal(window, cx));
-        });
+        cx.simulate_keystrokes("escape");
         cx.simulate_prompt_answer("Cancel");
         cx.run_until_parked();
         assert!(workspace.read_with(cx, |workspace, cx| {
             workspace.active_modal::<ProjectSearchModal>(cx).is_some()
         }));
-        workspace.update_in(cx, |workspace, window, cx| {
-            assert!(!workspace.hide_modal(window, cx));
-        });
+        cx.simulate_keystrokes("escape");
         cx.simulate_prompt_answer("Save");
         cx.run_until_parked();
         assert!(workspace.read_with(cx, |workspace, cx| {
