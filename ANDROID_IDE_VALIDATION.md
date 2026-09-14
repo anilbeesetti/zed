@@ -110,7 +110,9 @@ SDK packages.
 | Build selected Android variant | Cmd+F9 | Ctrl+F9 |
 | Run selected Android variant | Ctrl+R | Shift+F10 |
 | Debug selected Android variant | Ctrl+D | Shift+F9 |
-| Continue / step out / disconnect | F9 / Shift+F8 / Ctrl+F2 | Existing JetBrains debugger mappings |
+| Continue / step out / disconnect | Cmd+Option+R / Shift+F8 / Cmd+F2 | F9 / Shift+F8 / Ctrl+F2 |
+| Search Everywhere / Go to Class | Double Shift / Cmd+O | Double Shift / Ctrl+N |
+| Find / Replace in Files | Cmd+Shift+F / Cmd+Shift+R | Ctrl+Shift+F / Ctrl+Shift+R |
 | Sync Android project | Cmd+Option+Y | Ctrl+Alt+Y |
 | Open selected-device Logcat | Cmd+6 | Alt+6 |
 
@@ -448,7 +450,7 @@ These artifacts are local and ignored. Telegram updates were sent to the
 explicitly approved configured destination, including native debugger and Compose
 images. They contain only this test IDE/project evidence.
 
-## Final running build and process snapshot
+## Historical running build and process snapshot
 
 The optimized `371380b5a7420ba8d937c9b642e8feaec3c1078e` executable is left open
 on the smoke project. Sync restored `:mobile · fullDebug`, and the existing source
@@ -566,14 +568,15 @@ for the human author to remove only after reviewing the stack.
   file/action/symbol results, category navigation and opening a class have GPUI
   coverage. Language-server failure is visible while file/action search remains
   available.
-- Find/Replace: common Mac shortcuts and Ctrl+Shift+F/R aliases deploy a modal.
+- Find/Replace: Cmd+Shift+F/R on macOS and Ctrl+Shift+F/R on Linux/Windows
+  deploy a modal, including with an editor focused.
   Project-panel Find keeps the selected directory filter. The regression replaces
   three occurrences in two files, preserves tabs, cancels close, then saves safely.
 - Automatic sync, selected stopped AVDs, trust boundaries and device eligibility
   are covered in the Android panel test. Debug shares the same emulator startup
   path as Run.
 
-The combined run passed 128 tests: Android tools 4, Android UI 3, command palette
+The initial combined review run passed 128 tests: Android tools 4, Android UI 3, command palette
 20, LSP locations 8, and search 93. The final resource navigation integration
 test also passed. `cargo fmt --all -- --check` and the repository Clippy script
 for all changed crates passed. Raw logs
@@ -601,9 +604,13 @@ and relaunch, it automatically restored `:mobile · demoDebug`.
   extension wraps its settings in `kotlin`, so our generated configuration must
   contain `externalSources` directly. The corrected configuration opened
   `ComponentActivity.java` at its declaration, with bytes identical to the
-  AndroidX activity source archive. Runtime `+android-sources-2` also limits
+  AndroidX activity source archive. A final native Configure Kotlin run generated
+  the correct settings shape with 76 source archives. Runtime `+android-sources-3` also limits
   fallback decompiler logging to warnings/errors so per-class logs cannot block
-  the LSP connection. Its attached-source, definition and rename tests passed.
+  the LSP connection. Workspace symbols now contain full locations because Zed
+  does not advertise deferred symbol resolution. Native Go to Class returned and
+  opened `MainActivity`. Attached-source, definition, workspace-symbol and rename
+  tests passed before installing this runtime.
 - Go to Definition on a `LibraryGreeting` use opened its Kotlin declaration;
   invoking it on the declaration opened a four-entry usages popup.
 - The top device picker included stopped AVDs. Selecting `medium_phone` and
@@ -611,10 +618,16 @@ and relaunch, it automatically restored `:mobile · demoDebug`.
   the expected flavor, package ID and library text. `adb emu avd name` verified
   the selected AVD. The bottom-left Logcat icon opened that emulator’s stream.
   The stream and this test emulator were stopped afterward.
-- Find in Files opened a floating window with results instead of adding a tab.
-  Full shipped-keymap regressions caught category Tab and result-editor Escape
-  conflicts. Scoped bindings now pass the existing category and dirty-close
-  Save/Cancel tests.
+- Cmd+Shift+F and Cmd+Shift+R opened floating Find and Replace windows after a
+  clean native restart. Escape returned to the existing editor. Full inherited
+  keymap tests caught category Tab, result-editor Escape, global Cmd+O Open, and
+  Pane-level Cmd+Shift+F conflicts. The final tests cover macOS Cmd and Linux
+  Ctrl Find/Replace from a focused editor, preserving tabs and dirty-close safety.
+  Search Everywhere keeps category buttons visible with zero matches.
+- Both `build.gradle.kts` and `settings.gradle.kts` were highlighted in the native
+  editor. The grammar fix qualifies the actual loader configuration as well as
+  registry metadata. Its regression loads a language using the owning grammar,
+  so checking registry names alone cannot hide another loading regression.
 
 The app-level strict loader test resolves every binding in both shipped JetBrains
 maps, and the action-namespace registration test passes. These checks caught
@@ -628,10 +641,21 @@ WASI SDK download was denied by the sandbox’s network restriction. The grammar
 registration and extension removal/restoration tests passed in that run.
 
 Screenshots: `review-resource-native.png`, `review-component-source-native.png`,
-`review-usages-native.png`, and `review-stopped-emulator-run.png` in the local
+`review-usages-native.png`, `review-stopped-emulator-run.png`,
+`review-class-search-native.png`, `review-gradle-native.png`, and
+`review-find-final-native.png` in the local
 validation directory. The macOS screen-sharing badge obscures the window buttons
 in captures; their native vertical position uses the titlebar height and actual
 button height rather than a fixed inset.
+
+Latest focused logs: `review-go-to-class-before.log` / `review-go-to-class-after.log`,
+`review-find-shortcuts-before.log` / `review-find-shortcuts-after.log`,
+`review-grammar-loading-test.log`, `review-android-ui-final-tests.log`,
+`review-strict-keymap-test.log`, `review-action-namespaces-test.log`,
+`review-kotlin-symbols-build.log`, and `review-native-kotlin-settings.log`.
+The shortcut tests failed before the fixes and pass afterward. The latest
+normal debug build and focused Clippy checks passed; the optimized build is
+recorded separately below. No temporary user keymap override remains.
 
 The Kotlin configuration contract was checked against the
 [installed extension’s implementation](https://github.com/zed-extensions/kotlin/blob/main/src/kotlin.rs).
@@ -670,3 +694,9 @@ pipeline. The plugin’s PSI extension points are IntelliJ-specific; directly
 embedding them into GPUI is not a small integration. No JetBrains plugin code was
 copied. A Gradle-backed resource overlay model is the next step for namespace,
 flavor, dependency and framework resource parity.
+
+### Optimized review build
+
+The corrected optimized build is compiling. Native checks above used the normal
+debug executable with the shipped keymaps and isolated profile. The final release
+result and source/binary identity will be recorded here after startup validation.

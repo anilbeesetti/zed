@@ -79,17 +79,19 @@ Release Notes:
 
 Branch: `codex/android-ide/studio-defaults`
 
-Provide Studio Dark/Light themes and licensed JetBrains Mono fonts, choose
-JetBrains keybindings by default, and adjust typography and initial tool-window
-placement. Preserve user overrides. Add Android shortcut mappings with explicit
-workspace and full-editor contexts so Sync is not intercepted by Git Stage.
+Provide Studio Dark/Light themes, licensed JetBrains Mono fonts, compact typography, initial tool-window placement, and the JetBrains keymap by default. Automatically request Kotlin, Java and XML extensions and use the existing LSP results picker, preserving user overrides.
 
-Validation: native dark/light rendering, fresh-profile launch, deep Kotlin-file
-discovery, and combined GPUI shortcut precedence tests for both keymap assets.
+Align common editing/debugging shortcuts with the Android Studio reference, including Mac documentation, breakpoints, Resume, editor-tab switching, Version Control, block comments and auto-indent. Search Everywhere and floating Find/Replace behavior are introduced in their later dependent layers.
+
+Validation: native theme/layout checks from the original checkpoint, shortcut precedence regression for both platform maps, combined 128-test run, formatting, and changed-crate Clippy. Strict app-level keymap loading and action-namespace tests pass, including the debugger action names that previously caused native startup failure. Full IntelliJ refactoring/action parity is not claimed.
+
+Suggested .rules additions
+
+“When adding built-in keybindings, validate the platform assets with `KeymapFile::load_asset` in the app-level regression. Partial keymap loading can silently drop unknown action names that make native startup fail.”
 
 Release Notes:
 
-- Added Studio-inspired appearance and familiar JetBrains editing defaults
+- Improved Android Studio appearance, language defaults and familiar shortcuts
 
 ## 3. Model Android projects, devices, and build artifacts
 
@@ -112,56 +114,45 @@ Release Notes:
 
 Branch: `codex/android-ide/android-workflow`
 
-Add the Android panel, target/device pickers, toolbar controls and Run menu
-actions. Schedule Build, Run, Test, Lint and Logcat in existing task terminals.
-Reuse workspace trust and error handling; save edits before builds and deploy
-only a successful selected-variant artifact to the selected serial. Remember the
-selected module/variant in the local state database and restore it only against
-a fresh model; a removed variant requires an explicit new selection.
+Add Android targets, device selection, toolbar controls and Build/Run/Test/Lint/Logcat tasks using the existing workspace, trust and terminal mechanisms. Save edits before builds and deploy only a validated selected-variant artifact to the selected serial. Restore the saved module/variant only against a fresh Gradle model.
 
-Validation: native edit/build/run loop, intentional build failure and recovery,
-terminal interruption, Logcat, and GPUI trust/root/device/dock/action coverage.
-`cargo test -p android_ui` and `./script/clippy -p android_ui` pass.
+Trusted Android projects synchronize automatically after their worktree is loaded. Root/trust changes are observed without reentrant entity updates; a new root clears the old model and the picker shows sync progress. Manual sync remains available after Gradle edits.
+
+Validation: native build/run/failure/cancellation workflows and GPUI trust, root, auto-sync, device, dock and shortcut coverage. Combined regressions and changed-crate Clippy pass.
 
 Release Notes:
 
-- Added Android build, run, test, lint, and device-log workflows
+- Added native Android workflows and automatic trusted-project synchronization
 
 ## 5. Arrange the workspace around Studio-style tool rails
 
 Branch: `codex/android-ide/studio-shell`
 
-Place existing dock controls on side tool rails, keep bottom output controls
-together, and add Project-pane collapse/hide affordances. Use the existing panel
-and docking mechanisms. Keep the center content at full height so the editor
-cannot collapse when wrapped by the new rails.
+Place existing dock controls on side tool rails, keep bottom controls together at the lower left, and add Project collapse/hide affordances. Preserve editor height and reuse existing dock state.
 
-Validation: native normal/small-window checks and the existing workspace dock
-test with an added editor-geometry assertion. Shell Clippy passes with the
-documented `gpui/inspector` feature flag.
+Center macOS traffic lights against the actual titlebar and native button heights. Add a keyboard-accessible lower-left Logcat icon that dispatches the shared Android action.
+
+Validation: workspace geometry/dock regressions, platform-titlebar and Android compilation, changed-crate Clippy, plus native layout checks recorded in the combined validation report.
 
 Release Notes:
 
-- Improved workspace layout for Android Studio users
+- Improved Studio-style tool rails, macOS window controls and Logcat access
 
 ## 6. Configure Kotlin with the selected Android classpath
 
 Branch: `codex/android-ide/kotlin-setup`
 
-Add explicit project-level Kotlin compatibility setup. Build the selected
-variant, export evaluated Gradle libraries and generated Java output, write a
-protected classpath hook, select the community Kotlin server with JDK 21, and
-restart language support. Preserve existing hooks and unrelated settings.
+Configure Kotlin using the selected Android variant’s evaluated Gradle classpath, generated Java output and dependency source archives. Write a protected classpath hook and merge project settings without replacing unrelated preferences. Use JDK 21 and restart Kotlin language support.
 
-Validation: generated `R`/`BuildConfig`, Compose symbols, Java helper use,
-Android-library hover/navigation, configuration-cache reuse, no-Java variants,
-and filesystem safety checks. This layer initially reproduced a community-server
-object-rename crash; layer 12 supplies the tested upstream fix. The compatibility
-path still does not provide full Android Studio language parity.
+Resolve source artifacts from the variant compile configuration and export them separately from runtime/compiler binaries. The later pinned-runtime layer consumes those archives for original library source navigation.
+
+Validation: Gradle source/classpath export and configuration-cache reuse; Rust settings/path tests, generated R/BuildConfig and library integration probes; changed-crate Clippy. The initial community object-rename failure is fixed in the later runtime layer.
+
+Use the Kotlin extension’s configuration shape: it adds the outer kotlin key, so generated sourceArchives belong directly under settings.externalSources. Native ComponentActivity source navigation passes after this correction.
 
 Release Notes:
 
-- Added Kotlin compatibility setup for a selected Android build variant
+- Added selected-variant Kotlin classpaths and attached dependency sources
 
 ## 7. Launch the fork with an isolated development profile
 
@@ -179,20 +170,19 @@ Release Notes:
 
 - Added an isolated macOS launcher for Android IDE development
 
-## 8. Start and stop a selected Android emulator
+## 8. Start and run a selected Android emulator
 
 Branch: `codex/android-ide/emulator-start`
 
-List existing SDK AVDs and start one through Android CLI in a task terminal.
-Refresh devices on completion. Stop only the selected connected emulator,
-preserving the AVD; disable stop for physical or unavailable devices.
+Show running devices and stopped SDK AVDs in the same device picker. Resolve a connected emulator’s AVD name through adb so the selected virtual device keeps its identity across startup. Run starts a stopped selection, waits for Android CLI readiness, resolves that exact emulator serial, then deploys the requested variant. Reject stale completion after a project change.
 
-Validation: native start, boot, run, stop, and empty-device refresh on
-`medium_phone`; malformed AVD-name parsing and physical-device rejection tests.
+Keep standalone start/stop actions, preserve the AVD when stopping, and disable stop for physical or unavailable devices. Device refresh remains available with an empty device list.
+
+Validation: Android panel state/trust tests and native selected-emulator workflows in the combined report. Debug reuses this startup path in its later dependent layer. Changed-crate Clippy passes.
 
 Release Notes:
 
-- Added existing-emulator startup and shutdown controls
+- Added stopped-emulator selection and automatic startup before Run
 
 ## 9. Add a multi-module Android smoke project
 
@@ -249,29 +239,27 @@ Proposed for Android/JDT integration rules: “When changing JDT LS Gradle impor
 arguments, send `java/projectConfigurationsUpdate` for the Gradle root URI.
 Updating only module URIs can retain the previous root import arguments.”
 
+Java and Kotlin extensions now retain their own grammar versions, so installing both cannot break Gradle Kotlin DSL highlighting. Unqualified grammar aliases remain available for languages borrowing a grammar. Qualify both registry metadata and the actual language loader configuration. The regression loads a language, beyond checking registry names. Focused grammar loading/removal/restoration checks and native highlighting in build.gradle.kts and settings.gradle.kts pass. A wider run passed 44 tests; the unrelated extension fixture failed while downloading its WASI SDK in the restricted environment.
+
 Release Notes:
 
 - Added selected-variant Android Java language support
 
-## 12. Install a reproducible Kotlin runtime with the object rename fix
+## 12. Install Kotlin runtime fixes for rename and library sources
 
 Branch: `codex/android-ide/kotlin-runtime`
 
-The shipped community release crashes when renaming the fixture's Kotlin object.
-Build a checksum-pinned upstream revision containing its existing front-end
-fallback, run upstream rename tests, and install it under the task-local tool
-cache. Keep build JDK 11 separate from runtime JDK 21 and enable the installed
-server through the isolated launcher and Configure Kotlin.
+Build a checksum-pinned Kotlin server revision containing the upstream object-rename fix. Apply a small source-navigation patch that resolves configured dependency source archives before decompilation, including Java/Kotlin files, common Android/KMP source folders, nested classes, and paths with spaces. Recompute declaration ranges in original source. Limit fallback decompiler logging to warnings/errors so thousands of per-class messages cannot block the LSP output pipe.
 
-Validation: clean source bootstrap, repeated installation, upstream rename tests,
-native cross-file Kotlin rename, Rust tests, Clippy and native build. A disposable
-regression checks the object and a shadowed parameter. Java callers are not part
-of the Kotlin rename transaction; the community project's maintenance status
-remains a production dependency risk.
+Return complete workspace-symbol locations because Zed does not advertise deferred symbol resolution. This restores Kotlin classes and symbols in Search Everywhere.
+
+Run upstream rename/definition/workspace-symbol/source-archive tests before installing. Managed runtime upgrades keep the old installation until replacement succeeds; unmanaged installations are preserved. The launcher and Configure Kotlin use the pinned runtime with JDK 21, independently of the build JDK 11.
+
+Validation: bootstrap and upgrade, upstream tests, Rust settings tests and Clippy. The +android-sources-3 runtime returns native class search results. A real LSP probe and native editor navigation open ComponentActivity’s original source; the native file matches the source archive byte for byte. Native rename was checked at the earlier checkpoint. Mixed Java/Kotlin rename and full Kotlin semantic parity remain unsupported.
 
 Release Notes:
 
-- Fixed the reproduced Kotlin object rename failure with a pinned runtime
+- Fixed Kotlin object rename and navigation to attached library sources
 
 ## 13. Add native Android Java and Kotlin debugging
 
@@ -307,6 +295,8 @@ A cold launch also showed that Android CLI can finish before ActivityManager
 creates the app process. Retry process discovery with bounded attempts and
 per-command timeouts; preserve the final failure for the UI. A deterministic
 test covers delayed success, exhaustion and invalid process IDs.
+
+Debug also accepts a stopped AVD from the shared device picker, waits for that exact emulator, and then continues the existing deploy/attach path. Run and Debug share the startup/trust/project-change checks.
 
 Release Notes:
 
@@ -357,7 +347,8 @@ measurements as historical evidence rather than attributing them to the final
 build. Keep all screenshots, logs and runtime downloads local and ignored.
 
 Validation: cross-check the final build and feature evidence, local branch
-ancestry, diff hygiene and absence of pushed branches or created PRs.
+ancestry and diff hygiene. At this historical checkpoint publication had not
+yet been authorized; the current stack is published as draft PRs.
 
 Release Notes:
 
