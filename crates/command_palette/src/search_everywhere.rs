@@ -532,7 +532,9 @@ mod tests {
             menu::init();
             crate::init(cx);
             for asset in ["keymaps/default-macos.json", "keymaps/macos/jetbrains.json"] {
-                cx.bind_keys(KeymapFile::load_asset_allow_partial_failure(asset, cx).expect("Keymap asset"));
+                cx.bind_keys(
+                    KeymapFile::load_asset_allow_partial_failure(asset, cx).expect("Keymap asset"),
+                );
             }
         });
         let mut cx = EditorLspTestContext::new_rust(
