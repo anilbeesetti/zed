@@ -3586,6 +3586,18 @@ async fn test_extensions_keep_their_own_grammar_versions(cx: &mut TestAppContext
         ).await;
     }
     let store = create_extension_store_with(fs.clone(), proxy, cx);
+    language_registry.register_native_grammars([(
+        "java/kotlin",
+        language::rust_lang()
+            .grammar()
+            .expect("Test grammar")
+            .ts_language
+            .clone(),
+    )]);
+    language_registry
+        .language_for_name("Gradle KTS")
+        .await
+        .expect("Loading must use the owning extension grammar, not the global alias");
     for (language, grammar) in [("Gradle KTS", "java/kotlin"), ("Kotlin", "kotlin/kotlin")] {
         assert_eq!(
             language_registry

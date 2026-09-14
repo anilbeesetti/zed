@@ -1520,19 +1520,20 @@ impl ExtensionStore {
             ]);
             let rules_path = language_path.join(SemanticTokenRules::FILE_NAME);
 
+            let grammar = language.grammar.as_ref().map(|grammar| {
+                if new_index
+                    .extensions
+                    .get(&language.extension)
+                    .is_some_and(|entry| entry.manifest.grammars.contains_key(grammar))
+                {
+                    format!("{}/{grammar}", language.extension).into()
+                } else {
+                    grammar.clone()
+                }
+            });
             let registered = self.proxy.register_language(
                 language_name.clone(),
-                language.grammar.as_ref().map(|grammar| {
-                    if new_index
-                        .extensions
-                        .get(&language.extension)
-                        .is_some_and(|entry| entry.manifest.grammars.contains_key(grammar))
-                    {
-                        format!("{}/{grammar}", language.extension).into()
-                    } else {
-                        grammar.clone()
-                    }
-                }),
+                grammar.clone(),
                 language.matcher.clone(),
                 language.hidden,
                 Arc::new({
@@ -1541,8 +1542,14 @@ impl ExtensionStore {
                     move || {
                         let fs = fs.clone();
                         let language_path = language_path.clone();
-                        async move { load_plugin_language(fs, &language_path, query_files).await }
-                            .boxed()
+                        let grammar = grammar.clone();
+                        async move {
+                            let mut language =
+                                load_plugin_language(fs, &language_path, query_files).await?;
+                            language.config.grammar = grammar;
+                            Ok(language)
+                        }
+                        .boxed()
                     }
                 }),
             );
