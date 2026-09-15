@@ -12,6 +12,75 @@ release packaging are not complete. The
 [research and implementation plan](ANDROID_IDE_PLAN.md) covers the longer-term
 work; [the review guide](ANDROID_IDE_REVIEW.md) describes the review stack.
 
+## Library archive identity and cold navigation — 15 September 2026
+
+Android Studio was inspected on the same navigation fixture. Its Typography tab
+identifies `Gradle: androidx.compose.material3:material3-android:1.4.0@aar`, opens
+`commonMain/androidx/compose/material3/Typography.kt` from the attached sources
+JAR, and exposes reader mode. The `!/` separator denotes an entry inside an
+archive; it is not a directory that a shell can enter.
+
+The relevant IntelliJ implementation is small at the file-system boundary:
+[CoreJarFileSystem](https://github.com/JetBrains/intellij-community/blob/master/platform/core-impl/src/com/intellij/openapi/vfs/impl/jar/CoreJarFileSystem.java)
+splits the archive path from the entry and reuses an archive handler;
+[CoreJarVirtualFile](https://github.com/JetBrains/intellij-community/blob/master/platform/core-impl/src/com/intellij/openapi/vfs/impl/jar/CoreJarVirtualFile.java)
+constructs the `archive!/entry` identity, reads bytes through that handler and
+rejects writes. Source files for this comparison are retained locally under
+`target/android-ide/validation/studio-reference/`. No full Studio source checkout
+or extraction of dependency archives was needed.
+
+The prototype had two separate problems:
+
+- The Gradle source query included every component in the resolution graph,
+  including multiplatform metadata redirects. Alphabetical source lookup chose
+  the common `material3` source JAR before `material3-android`. The exporter now
+  queries the actual resolved external artifacts. The fixture exports 46 source
+  archives and selects the exact Android artifact used by Studio. Project
+  components are excluded from the artifact view to avoid ambiguous Android
+  library variants. A real Gradle compile/classpath task verifies this path.
+- The server found original source, then exported it to a random temporary file
+  for clients without archive support. Android Kotlin setup now enables stable
+  archive URIs. Zed reads JAR/ZIP entries through its existing filesystem and
+  worktree/buffer flow, with read-only metadata, original file names, directory
+  metadata and file watching. Filesystem mutations reject archive-entry paths.
+  Attached sources no longer need a temporary copy. Decompiled fallback still
+  uses the existing temporary-file path when original source is unavailable.
+
+Cold navigation also exposed a duplicate-analysis race. Diagnostics and a first
+navigation request could both observe an uncompiled file, then serialize two
+compilations through the compiler's lock. The source-path cache now coordinates
+conditional compilation, batch diagnostics and refresh, so the second request
+reuses the first result. Already-cached navigation does not take the compilation
+monitor. The new concurrency regression failed before the fix and passes after
+it, checking one compilation and shared declaration identity. Open archive
+sources are excluded from the project source set, preventing duplicate library
+classes from entering subsequent project analysis.
+
+Studio also has persistent semantic indexes and serialized declaration stubs;
+these are separate from archive file loading. Its
+[indexing documentation](https://plugins.jetbrains.com/docs/intellij/indexing-and-psi-stubs.html)
+explains both the cached lookup mechanism and background indexing readiness.
+This change does not replace the prototype's Kotlin compiler engine or eliminate
+JVM startup and the first required semantic analysis. It removes redundant work
+and preserves source identity without introducing another persistent symbol
+cache.
+
+Validation evidence:
+
+- `archive-runtime-install.log`: runtime archive URI, source-content and
+  definition regressions from a clean application of the pinned patch.
+- `cold-definition-race-before.log`, `cold-definition-race-after.log`: reproduced
+  duplicate compilation and passing definition suite after sharing analysis.
+- `archive-diagnostics-compatible-stdlib.log`: diagnostics, including edits while
+  linting, pass with the server's Kotlin 2.1 standard library. The first run
+  picked the host's newer Kotlin 2.3 library and failed on incompatible metadata;
+  that was isolated through the test JVM's Gradle cache environment.
+- `archive-fs-suite.log`: filesystem unit and integration tests, including
+  archive reads, implicit directories, canonical paths, handles, read-only
+  enforcement and reopening through a new filesystem instance.
+- `archive-clippy.log`, `archive-android-ui-tests.log`: changed-crate Clippy and
+  all five Android UI tests pass.
+
 ## Device picker refresh — 15 September 2026
 
 Both Android device selectors previously captured the device and AVD lists when
