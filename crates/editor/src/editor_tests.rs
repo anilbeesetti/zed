@@ -22000,6 +22000,202 @@ async fn test_completion_can_run_commands(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_kotlin_command_completion_with_incremental_edits(cx: &mut TestAppContext) {
+    init_test(cx, |settings| {
+        settings.defaults.show_completions_on_input = Some(false);
+    });
+    let command_name = "jetbrains.kotlin.completion.apply";
+    let mut cx = EditorLspTestContext::new(
+        language::Language::new(
+            LanguageConfig {
+                name: "Kotlin".into(),
+                matcher: LanguageMatcher {
+                    path_suffixes: vec!["kt".into()],
+                    ..Default::default()
+                }
+                .into(),
+                ..Default::default()
+            },
+            None,
+        ),
+        lsp::ServerCapabilities {
+            text_document_sync: Some(lsp::TextDocumentSyncCapability::Kind(
+                lsp::TextDocumentSyncKind::INCREMENTAL,
+            )),
+            completion_provider: Some(lsp::CompletionOptions {
+                resolve_provider: Some(true),
+                ..Default::default()
+            }),
+            execute_command_provider: Some(lsp::ExecuteCommandOptions {
+                commands: vec![command_name.into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        cx,
+    )
+    .await;
+    cx.set_state("@Composable\nfun Screen() {\n    ˇ\n}");
+    let initial_change = cx
+        .lsp
+        .receive_notification::<lsp::notification::DidChangeTextDocument>()
+        .await;
+    let changes = Arc::new(Mutex::new(Vec::new()));
+    cx.lsp
+        .handle_notification::<lsp::notification::DidChangeTextDocument, _>({
+            let changes = changes.clone();
+            move |params, _| changes.lock().push(params)
+        });
+    let position = lsp::Position::new(2, 7);
+    let empty_range = lsp::Range::new(position, position);
+    let item = lsp::CompletionItem {
+        label: "Button".into(),
+        text_edit: Some(lsp::CompletionTextEdit::InsertAndReplace(
+            lsp::InsertReplaceEdit {
+                new_text: String::new(),
+                insert: empty_range,
+                replace: empty_range,
+            },
+        )),
+        command: Some(lsp::Command {
+            title: "Apply Completion".into(),
+            command: command_name.into(),
+            arguments: Some(vec![json!(1)]),
+        }),
+        data: Some(json!({
+            "KotlinCompletionItemKey": 1,
+            "configurationEntryId": "KotlinCompletionProvider",
+        })),
+        ..Default::default()
+    };
+    cx.set_request_handler::<lsp::request::Completion, _, _>({
+        let changes = changes.clone();
+        let item = item.clone();
+        move |uri, params, _| {
+            assert_eq!(params.text_document_position.text_document.uri, uri);
+            assert_eq!(params.text_document_position.position, position);
+            assert_eq!(
+                *changes.lock(),
+                vec![lsp::DidChangeTextDocumentParams {
+                    text_document: lsp::VersionedTextDocumentIdentifier::new(
+                        uri,
+                        initial_change.text_document.version + 1,
+                    ),
+                    content_changes: vec![lsp::TextDocumentContentChangeEvent {
+                        range: Some(lsp::Range::new(
+                            lsp::Position::new(2, 4),
+                            lsp::Position::new(2, 4)
+                        )),
+                        range_length: None,
+                        text: "But".into(),
+                    }],
+                }],
+                "the unsaved incremental change must arrive before completion",
+            );
+            let item = item.clone();
+            async move { Ok(Some(lsp::CompletionResponse::Array(vec![item]))) }
+        }
+    });
+    let mut resolved = cx.set_request_handler::<lsp::request::ResolveCompletionItem, _, _>(
+        move |_, mut received, _| {
+            assert_eq!(received, item, "resolve must preserve the command and data");
+            received.documentation = Some(lsp::Documentation::String("A Compose button".into()));
+            async move { Ok(received) }
+        },
+    );
+    let mut executed = cx.set_request_handler::<lsp::request::ExecuteCommand, _, _>({
+        let server = cx.lsp.server.clone();
+        let editor = cx.editor.downgrade();
+        move |uri, params, cx| {
+            assert_eq!(params.command, command_name);
+            assert_eq!(params.arguments, vec![json!(1)]);
+            editor
+                .read_with(&cx, |editor, cx| {
+                    assert_eq!(editor.text(cx), "@Composable\nfun Screen() {\n    But\n}");
+                })
+                .expect("editor should remain open during completion");
+            let server = server.clone();
+            async move {
+                let result = server
+                    .request::<lsp::request::ApplyWorkspaceEdit>(
+                        lsp::ApplyWorkspaceEditParams {
+                            label: Some("Apply Completion".into()),
+                            edit: lsp::WorkspaceEdit::new(
+                                [(
+                                    uri.clone(),
+                                    vec![
+                                        lsp::TextEdit::new(
+                                            lsp::Range::default(),
+                                            "import androidx.compose.material3.Button\n\n".into(),
+                                        ),
+                                        lsp::TextEdit::new(
+                                            lsp::Range::new(lsp::Position::new(2, 4), position),
+                                            "Button()".into(),
+                                        ),
+                                    ],
+                                )]
+                                .into_iter()
+                                .collect(),
+                            ),
+                        },
+                        DEFAULT_LSP_REQUEST_TIMEOUT,
+                    )
+                    .await
+                    .into_response()?;
+                assert!(result.applied);
+                let caret = lsp::Position::new(4, 11);
+                let result = server
+                    .request::<lsp::request::ShowDocument>(
+                        lsp::ShowDocumentParams {
+                            uri,
+                            external: None,
+                            take_focus: Some(true),
+                            selection: Some(lsp::Range::new(caret, caret)),
+                        },
+                        DEFAULT_LSP_REQUEST_TIMEOUT,
+                    )
+                    .await
+                    .into_response()?;
+                assert!(result.success);
+                Ok(None)
+            }
+        }
+    });
+
+    cx.update_editor(|editor, window, cx| {
+        editor.handle_input("But", window, cx);
+        editor.show_completions(&ShowCompletions, window, cx);
+    });
+    resolved
+        .next()
+        .await
+        .expect("completion should be resolved");
+    cx.run_until_parked();
+    cx.assert_editor_state("@Composable\nfun Screen() {\n    Butˇ\n}");
+    cx.update_editor(|editor, window, cx| {
+        editor
+            .confirm_completion(&ConfirmCompletion::default(), window, cx)
+            .expect("completion menu should be open")
+    })
+    .await
+    .expect("completion command should succeed");
+    executed
+        .next()
+        .await
+        .expect("completion command should execute");
+    cx.run_until_parked();
+    cx.assert_editor_state(
+        "import androidx.compose.material3.Button\n\n@Composable\nfun Screen() {\n    Button(ˇ)\n}",
+    );
+    cx.update_editor(|editor, window, cx| editor.undo(&Undo, window, cx));
+    cx.assert_editor_state("@Composable\nfun Screen() {\n    Butˇ\n}");
+    cx.update_editor(|editor, window, cx| editor.redo(&Redo, window, cx));
+    cx.assert_editor_state(
+        "import androidx.compose.material3.Button\n\n@Composable\nfun Screen() {\n    Button(ˇ)\n}",
+    );
+}
+
+#[gpui::test]
 async fn test_completion_reuse(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 

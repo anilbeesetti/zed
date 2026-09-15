@@ -979,6 +979,7 @@ impl Editor {
             text: new_text[common_prefix_len..].into(),
         });
 
+        let selections_before = self.selections.disjoint_anchors_arc();
         let tx_id = self.transact(window, cx, |editor, window, cx| {
             if let Some(mut snippet) = snippet {
                 snippet.text = new_text.to_string();
@@ -1085,10 +1086,44 @@ impl Editor {
                 let title = command.lsp_action.title().to_owned();
                 let project_transaction = lsp_store
                     .update(cx, |lsp_store, cx| {
-                        lsp_store.apply_code_action(buffer_handle, command, false, cx)
+                        lsp_store.apply_code_action(buffer_handle.clone(), command, false, cx)
                     })
                     .await
                     .context("applying post-completion command")?;
+                if let Some(command_transaction) = project_transaction.0.get(&buffer_handle) {
+                    editor.update(cx, |editor, cx| {
+                        let transaction_id = editor.buffer.update(cx, |buffer, cx| {
+                            let command_transaction_id = if buffer.is_singleton() {
+                                Some(command_transaction.id)
+                            } else {
+                                buffer.push_transaction(&project_transaction.0, cx);
+                                buffer.last_transaction_id(cx)
+                            }?;
+                            if let Some(transaction_id) = tx_id {
+                                buffer.merge_transactions(
+                                    command_transaction_id,
+                                    transaction_id,
+                                    cx,
+                                );
+                                Some(transaction_id)
+                            } else {
+                                Some(command_transaction_id)
+                            }
+                        });
+                        if let Some(transaction_id) = transaction_id {
+                            let selections_after = editor.selections.disjoint_anchors_arc();
+                            editor
+                                .selection_history
+                                .selections_by_transaction
+                                .entry(transaction_id)
+                                .or_insert(TransactionSelections {
+                                    undo: selections_before,
+                                    redo: None,
+                                })
+                                .redo = Some(selections_after);
+                        }
+                    })?;
+                }
                 if let Some(workspace) = editor.read_with(cx, |editor, _| editor.workspace())? {
                     Self::open_project_transaction(
                         &editor,
