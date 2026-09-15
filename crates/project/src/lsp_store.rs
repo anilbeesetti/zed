@@ -50,7 +50,7 @@ use crate::{
         ManifestTree,
     },
     prettier_store::{self, PrettierStore, PrettierStoreEvent},
-    project_settings::{BinarySettings, LspSettings, ProjectSettings},
+    project_settings::{BinarySettings, LspSettings, ProjectSettings, SettingsObserver},
     toolchain_store::{LocalToolchainStore, ToolchainStoreEvent},
     trusted_worktrees::{PathTrust, TrustedWorktrees, TrustedWorktreesEvent},
     worktree_store::{WorktreeStore, WorktreeStoreEvent},
@@ -346,6 +346,8 @@ fn virtual_document_settings_fingerprint(
     Ok(Sha256::digest(serde_json::to_vec(&value)?).into())
 }
 
+type KotlinSetupTask = Shared<Task<Result<(), Arc<anyhow::Error>>>>;
+
 struct LspFile {
     document: VirtualDocumentId,
     path: Arc<RelPath>,
@@ -456,6 +458,8 @@ pub struct LocalLspStore {
     virtual_buffer_loads:
         HashMap<VirtualDocumentId, Shared<Task<Result<Entity<Buffer>, Arc<anyhow::Error>>>>>,
     virtual_document_versions: HashMap<LanguageServerId, u64>,
+    settings_observer: Entity<SettingsObserver>,
+    kotlin_setup_tasks: HashMap<PathBuf, watch::Sender<Option<KotlinSetupTask>>>,
     kotlin_workspace_imports: HashMap<LanguageServerId, watch::Sender<Option<Result<(), String>>>>,
     next_completion_session_id: u64,
     completion_sessions: HashMap<LanguageServerId, CompletionSession>,
@@ -5210,6 +5214,7 @@ impl LspStore {
     }
 
     pub fn new_local(
+        settings_observer: Entity<SettingsObserver>,
         buffer_store: Entity<BufferStore>,
         worktree_store: Entity<WorktreeStore>,
         prettier_store: Entity<PrettierStore>,
@@ -5282,6 +5287,8 @@ impl LspStore {
                 virtual_buffers: HashMap::default(),
                 virtual_buffer_loads: HashMap::default(),
                 virtual_document_versions: HashMap::default(),
+                settings_observer,
+                kotlin_setup_tasks: HashMap::default(),
                 kotlin_workspace_imports: HashMap::default(),
                 next_completion_session_id: 0,
                 completion_sessions: HashMap::default(),
@@ -10674,6 +10681,13 @@ impl LspStore {
     fn remove_worktree(&mut self, id_to_remove: WorktreeId, cx: &mut Context<Self>) {
         self.diagnostic_summaries.remove(&id_to_remove);
         if let Some(local) = self.as_local_mut() {
+            local.kotlin_setup_tasks.retain(|root, _| {
+                local
+                    .worktree_store
+                    .read(cx)
+                    .visible_worktrees(cx)
+                    .any(|worktree| worktree.read(cx).abs_path().as_ref() == root.as_path())
+            });
             let to_remove = local.remove_worktree(id_to_remove, cx);
             for server in to_remove {
                 self.language_server_statuses.remove(&server);
@@ -11288,7 +11302,78 @@ impl LspStore {
         }))
     }
 
+    pub fn wait_for_local_settings(&self, cx: &mut Context<Self>) -> Task<Result<()>> {
+        let Some(local) = self.as_local() else {
+            return Task::ready(Err(anyhow!("Local settings require a local workspace")));
+        };
+        local
+            .settings_observer
+            .update(cx, |observer, cx| observer.wait_for_local_settings(cx))
+    }
+
+    pub fn set_kotlin_setup_task(
+        &mut self,
+        root: PathBuf,
+        task: Task<Result<()>>,
+        cx: &mut Context<Self>,
+    ) {
+        let task = cx
+            .spawn(async move |_, _| task.await.map_err(Arc::new))
+            .shared();
+        if let Some(local) = self.as_local_mut() {
+            *local
+                .kotlin_setup_tasks
+                .entry(root)
+                .or_insert_with(|| watch::channel().0)
+                .borrow_mut() = Some(task.clone());
+        }
+        cx.spawn(async move |_, _| task.await)
+            .detach_and_log_err(cx);
+    }
+
     pub fn restore_language_server_document(
+        &mut self,
+        location: LanguageServerDocumentLocation,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Entity<Buffer>>> {
+        let settings = self.wait_for_local_settings(cx);
+        let setup = self.as_local_mut().map(|local| {
+            local
+                .kotlin_setup_tasks
+                .entry(location.worktree_root.clone())
+                .or_insert_with(|| watch::channel().0)
+                .subscribe()
+        });
+        cx.spawn(async move |this, cx| {
+            settings.await?;
+            let mut setup = setup.context("Library document restoration requires its local workspace")?;
+            let mut pending = setup.recv().await.flatten();
+            loop {
+                if let Some(task) = pending.take() {
+                    let timeout = this.read_with(cx, |_, cx| ProjectSettings::get_global(cx).global_lsp_settings.get_request_timeout())?;
+                    let timeout = cx.background_executor().timer(timeout).fuse();
+                    futures::pin_mut!(timeout);
+                    select_biased! {
+                        next = setup.recv().fuse() => { pending = next.context("The library document's workspace was removed")?; continue; }
+                        task = task.fuse() => task.map_err(|error| anyhow!("Kotlin project setup failed: {error:#}"))?,
+                        _ = timeout => anyhow::bail!("Timed out waiting for Kotlin project setup before restoring a library document"),
+                    }
+                }
+                let restore = this.update(cx, |store, cx| store.restore_language_server_document_once(location.clone(), cx))?;
+                // Only a managed setup transition can replace a persisted restore attempt.
+                // Live history keeps its original server/model identity and must still fail when stale.
+                select_biased! {
+                    next = setup.recv().fuse() => {
+                        anyhow::ensure!(location.session.is_none(), "This library document belongs to an outdated language server or project model");
+                        pending = next.context("The library document's workspace was removed")?;
+                    }
+                    result = restore.fuse() => return result,
+                }
+            }
+        })
+    }
+
+    fn restore_language_server_document_once(
         &mut self,
         location: LanguageServerDocumentLocation,
         cx: &mut Context<Self>,
@@ -14124,6 +14209,22 @@ impl LspStore {
         clear_stopped: bool,
         cx: &mut Context<Self>,
     ) {
+        self.restart_language_servers_for_buffers_task(
+            buffers,
+            only_restart_servers,
+            clear_stopped,
+            cx,
+        )
+        .detach_and_log_err(cx);
+    }
+
+    pub fn restart_language_servers_for_buffers_task(
+        &mut self,
+        buffers: Vec<Entity<Buffer>>,
+        only_restart_servers: HashSet<LanguageServerSelector>,
+        clear_stopped: bool,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
         if let Some((client, project_id)) = self.upstream_client() {
             let request = client.request(proto::RestartLanguageServers {
                 project_id,
@@ -14153,7 +14254,10 @@ impl LspStore {
                     .collect(),
                 all: false,
             });
-            cx.background_spawn(request).detach_and_log_err(cx);
+            cx.background_spawn(async move {
+                request.await?;
+                Ok(())
+            })
         } else {
             let (stopped_names, stop_task) = if only_restart_servers.is_empty() {
                 self.stop_local_language_servers_for_buffers(&buffers, HashSet::default(), cx)
@@ -14181,8 +14285,10 @@ impl LspStore {
                     .collect()
             };
             if !only_restart_servers.is_empty() && register_servers.is_empty() {
-                stop_task.detach();
-                return;
+                return cx.background_spawn(async move {
+                    stop_task.await;
+                    Ok(())
+                });
             }
             cx.spawn(async move |lsp_store, cx| {
                 stop_task.await;
@@ -14216,7 +14322,6 @@ impl LspStore {
                     }
                 })
             })
-            .detach();
         }
     }
 

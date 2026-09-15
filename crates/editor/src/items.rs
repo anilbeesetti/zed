@@ -2961,9 +2961,22 @@ mod tests {
 
         init_test(cx, |_| {});
         let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(path!("/project"), json!({"main.rs": "fn main() {}"}))
-            .await;
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                "main.rs": "fn main() {}",
+                ".zed": {"settings.json": json!({"lsp": {"kotlin-lsp": {
+                    "initialization_options": {"project": "fixture"}
+                }}}).to_string()}
+            }),
+        )
+        .await;
         let project = Project::test(fs.clone(), [Path::new(path!("/project"))], cx).await;
+        project
+            .read_with(cx, |project, _| project.lsp_store())
+            .update(cx, |store, cx| store.wait_for_local_settings(cx))
+            .await
+            .unwrap();
         let languages = project.read_with(cx, |project, _| project.languages().clone());
         languages.add(languages::rust_lang());
         let mut capabilities = lsp::LanguageServer::full_capabilities();
@@ -3212,7 +3225,77 @@ mod tests {
                 .contains("session")
         );
 
-        let restarted_project = Project::test(fs, [Path::new(path!("/project"))], cx).await;
+        // A workspace reopened in the same app already has its adapter, but its
+        // worktree settings can still be loading when editor deserialization starts.
+        let reopened_project = Project::test(fs.clone(), std::iter::empty::<&Path>(), cx).await;
+        let reopened_languages =
+            reopened_project.read_with(cx, |project, _| project.languages().clone());
+        reopened_languages.add(languages::rust_lang());
+        let mut reopened_servers = reopened_languages.register_fake_lsp(
+            "Rust",
+            FakeLspAdapter {
+                name: "kotlin-lsp",
+                capabilities: capabilities.clone(),
+                initializer: Some(Box::new(|server| {
+                    server.set_request_handler::<lsp::request::ExecuteCommand, _, _>(
+                        |_, _| async {
+                            Ok(Some(
+                                json!({"code": "pub fn reopened() {}", "language": "rust"}),
+                            ))
+                        },
+                    );
+                })),
+                ..Default::default()
+            },
+        );
+        reopened_project
+            .update(cx, |project, cx| {
+                project.find_or_create_worktree(Path::new(path!("/project")), true, cx)
+            })
+            .await
+            .unwrap();
+        let mut reopen = workspace.update_in(cx, |_, window, cx| {
+            Editor::deserialize(
+                reopened_project.clone(),
+                workspace.downgrade(),
+                workspace_id,
+                item_id,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let early_reopen = (&mut reopen).now_or_never();
+        assert!(
+            early_reopen.is_none(),
+            "Reopening must wait for local settings and import: {early_reopen:?}"
+        );
+        let reopened_server = reopened_servers
+            .next()
+            .now_or_never()
+            .flatten()
+            .expect("Reopening waits for local settings before starting the library's owner");
+        reopened_server.notify::<ImportState>(imported.clone());
+        let reopened_editor = reopen.await.unwrap();
+        reopened_editor.read_with(cx, |editor, cx| {
+            assert_eq!(editor.text(cx), "pub fn reopened() {}");
+            assert_eq!(
+                editor
+                    .buffer
+                    .read(cx)
+                    .as_singleton()
+                    .unwrap()
+                    .read(cx)
+                    .capability(),
+                Capability::ReadOnly
+            );
+        });
+        reopened_project.update(cx, |project, cx| {
+            let worktree_id = project.worktrees(cx).next().unwrap().read(cx).id();
+            project.remove_worktree(worktree_id, cx);
+        });
+
+        let restarted_project = Project::test(fs.clone(), [Path::new(path!("/project"))], cx).await;
         let restarted_languages =
             restarted_project.read_with(cx, |project, _| project.languages().clone());
         restarted_languages.add(languages::rust_lang());
@@ -3261,6 +3344,44 @@ mod tests {
             (&mut restore).now_or_never().is_none(),
             "Library restoration must wait for the project import"
         );
+        let store = restarted_project.read_with(cx, |project, _| project.lsp_store());
+        let (setup_finished, setup) = futures::channel::oneshot::channel::<anyhow::Result<()>>();
+        store.update(cx, |store, cx| {
+            let task = cx.spawn(async move |_, _| setup.await?);
+            store.set_kotlin_setup_task(PathBuf::from(path!("/project")), task, cx);
+            store.restart_language_servers_for_buffers(
+                Vec::new(),
+                collections::HashSet::from_iter([lsp::LanguageServerSelector::Id(
+                    restarted_server.server.server_id(),
+                )]),
+                true,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        let interrupted_restore = (&mut restore).now_or_never();
+        assert!(
+            interrupted_restore.is_none(),
+            "Managed setup must hold restoration while it replaces the importing server: {interrupted_restore:?}"
+        );
+        assert!(restarted_servers.next().now_or_never().is_none());
+        store.update(cx, |store, cx| {
+            setup_finished
+                .send(Err(anyhow!("Superseded setup")))
+                .unwrap();
+            store.set_kotlin_setup_task(PathBuf::from(path!("/project")), Task::ready(Ok(())), cx);
+        });
+        cx.run_until_parked();
+        let replacement = restarted_servers
+            .next()
+            .now_or_never()
+            .flatten()
+            .expect("Restoration starts the replacement after setup finishes");
+        assert_ne!(
+            replacement.server.server_id(),
+            restarted_server.server.server_id()
+        );
+        let restarted_server = replacement;
         restarted_server.notify::<ImportState>(imported);
         assert_ne!(
             restarted_project.read_with(cx, |project, _| project.lsp_store().entity_id()),
@@ -3373,6 +3494,19 @@ mod tests {
                 .to_string()
                 .contains("settings changed")
         );
+        let (_setup_finished, setup) = futures::channel::oneshot::channel::<()>();
+        store.update(cx, |store, cx| {
+            let task = cx.spawn(async move |_, _| {
+                setup.await?;
+                anyhow::Ok(())
+            });
+            store.set_kotlin_setup_task(PathBuf::from(path!("/project")), task, cx);
+        });
+        let mut closing_restore = store.update(cx, |store, cx| {
+            store.restore_language_server_document(location.clone(), cx)
+        });
+        cx.run_until_parked();
+        assert!((&mut closing_restore).now_or_never().is_none());
         restarted_project.update(cx, |project, cx| {
             let worktree_id = project.worktrees(cx).next().unwrap().read(cx).id();
             project.remove_worktree(worktree_id, cx);
@@ -3383,6 +3517,13 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("stopped")
+        );
+        assert!(
+            closing_restore
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("workspace was removed")
         );
         assert!(
             store

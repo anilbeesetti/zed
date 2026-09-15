@@ -22494,44 +22494,47 @@ async fn test_real_kotlin_editor_completion_and_navigation(cx: &mut TestAppConte
         workspace::init(state.clone(), cx);
         state
     });
-    let project = Project::test(fs, [root.as_path()], cx).await;
-    let registry = project.read_with(cx, |project, _| project.languages().clone());
-    registry.add(Arc::new(language::Language::new(
-        LanguageConfig {
-            name: "Kotlin".into(),
-            matcher: LanguageMatcher {
-                path_suffixes: vec!["kt".into()],
+    let project = Project::test(fs.clone(), [root.as_path()], cx).await;
+    let register_adapter = |project: &Entity<Project>, cx: &mut TestAppContext| {
+        let registry = project.read_with(cx, |project, _| project.languages().clone());
+        registry.add(Arc::new(language::Language::new(
+            LanguageConfig {
+                name: "Kotlin".into(),
+                matcher: LanguageMatcher {
+                    path_suffixes: vec!["kt".into()],
+                    ..Default::default()
+                }
+                .into(),
                 ..Default::default()
-            }
-            .into(),
-            ..Default::default()
-        },
-        None,
-    )));
-    registry.register_fake_lsp_adapter(
-        "Kotlin",
-        FakeLspAdapter {
-            name: "kotlin-lsp",
-            language_server_binary: lsp::LanguageServerBinary {
-                path: config["binary"]["path"]
-                    .as_str()
-                    .expect("server path")
-                    .into(),
-                arguments: config["binary"]["arguments"]
-                    .as_array()
-                    .expect("server arguments")
-                    .iter()
-                    .map(|argument| argument.as_str().expect("argument string").into())
-                    .collect(),
-                env: Some(
-                    serde_json::from_value(config["binary"]["env"].clone())
-                        .expect("server environment"),
-                ),
             },
-            initialization_options: Some(config["initialization_options"].clone()),
-            ..Default::default()
-        },
-    );
+            None,
+        )));
+        registry.register_fake_lsp_adapter(
+            "Kotlin",
+            FakeLspAdapter {
+                name: "kotlin-lsp",
+                language_server_binary: lsp::LanguageServerBinary {
+                    path: config["binary"]["path"]
+                        .as_str()
+                        .expect("server path")
+                        .into(),
+                    arguments: config["binary"]["arguments"]
+                        .as_array()
+                        .expect("server arguments")
+                        .iter()
+                        .map(|argument| argument.as_str().expect("argument string").into())
+                        .collect(),
+                    env: Some(
+                        serde_json::from_value(config["binary"]["env"].clone())
+                            .expect("server environment"),
+                    ),
+                },
+                initialization_options: Some(config["initialization_options"].clone()),
+                ..Default::default()
+            },
+        );
+    };
+    register_adapter(&project, cx);
     let buffer = project
         .update(cx, |project, cx| {
             project.open_local_buffer(&source_path, cx)
@@ -22861,14 +22864,129 @@ async fn test_real_kotlin_editor_completion_and_navigation(cx: &mut TestAppConte
         .as_array_mut()
         .expect("memory samples")
         .push(kotlin_live_memory("after_samples", server.process_id().expect("server PID")).await);
-    report["phase"] = json!("complete");
-    write_report(&report);
+    let saved_library = if config["restore_library_tabs"] == true {
+        let uri: lsp::Uri = report["samples"][0]["target"]
+            .as_str()
+            .expect("library URI")
+            .parse()
+            .unwrap();
+        let library = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer_via_lsp(uri, server.server_id(), cx)
+            })
+            .await
+            .expect("library before restart");
+        let location = lsp_store
+            .read_with(cx, |store, cx| {
+                store.language_server_document_location(library.read(cx), cx)
+            })
+            .expect("library location")
+            .expect("server-owned library");
+        Some((
+            serde_json::from_value::<project::lsp_store::LanguageServerDocumentLocation>(
+                serde_json::to_value(location).expect("serialize library location"),
+            )
+            .expect("deserialize library location"),
+            library.read_with(cx, |buffer, _| buffer.text()),
+        ))
+    } else {
+        None
+    };
     lsp_store
         .update(cx, |store, cx| {
             store.stop_language_servers_for_buffers(vec![buffer], HashSet::default(), cx)
         })
         .await
         .expect("stop real language server");
+    if let Some((location, original_library_text)) = saved_library {
+        report["phase"] = json!("restoring_libraries");
+        report["restorations"] = json!([]);
+        write_report(&report);
+        project.update(cx, |project, cx| {
+            let worktree_id = project
+                .worktrees(cx)
+                .next()
+                .expect("source workspace")
+                .read(cx)
+                .id();
+            project.remove_worktree(worktree_id, cx);
+        });
+        for restart_during_import in [true, false] {
+            let reopened = Project::test(fs.clone(), [root.as_path()], cx).await;
+            register_adapter(&reopened, cx);
+            let store = reopened.read_with(cx, |project, _| project.lsp_store());
+            let (started, starting) = oneshot::channel();
+            let mut started = Some(started);
+            let _subscription = store.update(cx, |_, cx| {
+                cx.subscribe(&cx.entity(), move |_, _, event, _| {
+                    if let project::lsp_store::LspStoreEvent::LanguageServerAdded(id, _, _) = event
+                        && let Some(started) = started.take()
+                    {
+                        started.send(*id).expect("initial server listener");
+                    }
+                })
+            });
+            let mut restore = store.update(cx, |store, cx| {
+                store.restore_language_server_document(location.clone(), cx)
+            });
+            if restart_during_import {
+                let server_id = starting.await.expect("server starts");
+                assert!(
+                    (&mut restore).now_or_never().is_none(),
+                    "Inject managed setup before real import finishes"
+                );
+                store.update(cx, |store, cx| {
+                    let restart = store.restart_language_servers_for_buffers_task(
+                        Vec::new(),
+                        HashSet::from_iter([lsp::LanguageServerSelector::Id(server_id)]),
+                        true,
+                        cx,
+                    );
+                    store.set_kotlin_setup_task(root.clone(), restart, cx);
+                });
+            }
+            let library = restore.await.expect("restore real persisted library");
+            let owner = library.read_with(cx, |buffer, _| {
+                assert!(buffer.read_only());
+                assert_eq!(buffer.text(), original_library_text);
+                buffer
+                    .language_server_document()
+                    .expect("restored library owner")
+                    .server_id
+            });
+            let process_id = store.read_with(cx, |store, _| {
+                store
+                    .language_server_for_id(owner)
+                    .expect("current owner")
+                    .process_id()
+            });
+            report["restorations"].as_array_mut().unwrap().push(json!({
+                "restart_during_import": restart_during_import, "server_pid": process_id, "read_only": true,
+            }));
+            write_report(&report);
+            store
+                .update(cx, |store, cx| {
+                    store.stop_language_servers_for_buffers(
+                        Vec::new(),
+                        HashSet::from_iter([lsp::LanguageServerSelector::Id(owner)]),
+                        cx,
+                    )
+                })
+                .await
+                .expect("stop restored library owner");
+            reopened.update(cx, |project, cx| {
+                let worktree_id = project
+                    .worktrees(cx)
+                    .next()
+                    .expect("reopened workspace")
+                    .read(cx)
+                    .id();
+                project.remove_worktree(worktree_id, cx);
+            });
+        }
+    }
+    report["phase"] = json!("complete");
+    write_report(&report);
     drop(app_state);
 }
 
