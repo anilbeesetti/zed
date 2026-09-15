@@ -1,0 +1,159 @@
+--- a/workspace-import/gradle-plugin/src/com/jetbrains/ls/imports/gradle/model/builder/android/androidUtils.kt
++++ b/workspace-import/gradle-plugin/src/com/jetbrains/ls/imports/gradle/model/builder/android/androidUtils.kt
+@@ -2,30 +2,66 @@
+ package com.jetbrains.ls.imports.gradle.model.builder.android
+ 
+ import com.jetbrains.ls.imports.gradle.utils.AndroidVariantReflection
++import org.gradle.api.GradleException
+ import org.gradle.api.Project
++import org.gradle.api.artifacts.Configuration
++import org.gradle.api.artifacts.component.ProjectComponentIdentifier
++import org.gradle.api.artifacts.result.ResolvedDependencyResult
+ 
+ const val SELECTED_ANDROID_VARIANT_KEY: String = "lsp.android.variant"
+ const val SELECTED_ANDROID_VARIANT_ENV_KEY: String = "LSP_ANDROID_VARIANT"
+ 
+-/**
+- * Android's buildType and flavors will form a matrix of 'variants' (e.g. debug, release, debugPaidGermany, ...)
+- * Resolving sources, however, requires selecting one 'active' variant.
+- *
+- */
++private fun Project.selection(key: String, environment: String): String? =
++    providers.gradleProperty(key).orElse(providers.systemProperty(key))
++        .orElse(providers.environmentVariable(environment)).orNull
++
+ internal fun Iterable<AndroidVariantReflection>.selectActiveVariant(): AndroidVariantReflection? {
+-    val selected = firstOrNull { variant ->
+-        val selectedVariant = variant.project.providers.gradleProperty(SELECTED_ANDROID_VARIANT_KEY)
+-            .orElse(variant.project.providers.systemProperty(SELECTED_ANDROID_VARIANT_KEY))
+-            .orElse(variant.project.providers.environmentVariable(SELECTED_ANDROID_VARIANT_ENV_KEY))
+-            .orNull
++    val variants = toList()
++    val project = variants.firstOrNull()?.project ?: return null
++    val selectedName = project.selection(SELECTED_ANDROID_VARIANT_KEY, SELECTED_ANDROID_VARIANT_ENV_KEY)
++    val selectedModule = project.selection("lsp.android.module", "LSP_ANDROID_MODULE")
++    val selectedProject = selectedModule?.let { module ->
++        project.rootProject.findProject(module)
++            ?: throw GradleException("The selected Android module $module does not exist")
++    }
++    if (selectedProject != null && selectedName != null) {
++        val selectedVariant = selectedProject.androidVariants.orEmpty().singleOrNull { it.name == selectedName }
++            ?: throw GradleException("Android variant $selectedName does not exist in ${selectedProject.path}")
++        if (project == selectedProject) return selectedVariant
++        val resolvedVariants = selectedVariant.compileConfiguration?.incoming?.resolutionResult?.allDependencies.orEmpty()
++            .filterIsInstance<ResolvedDependencyResult>()
++            .filter { (it.selected.id as? ProjectComponentIdentifier)?.buildTreePath == project.buildTreePath }
++            .map { it.resolvedVariant.attributes }
++        val selectedVariants = resolvedVariants.map { attributes ->
++            val variantAttributes = attributes.keySet().filter {
++                it.name == "com.android.build.api.attributes.BuildTypeAttr" ||
++                    it.name.startsWith("com.android.build.api.attributes.ProductFlavor:")
++            }
++            variants.singleOrNull { candidate ->
++                val candidateAttributes = candidate.compileConfiguration?.attributes
++                variantAttributes.isNotEmpty() && variantAttributes.all { attribute ->
++                    val candidateAttribute = candidateAttributes?.keySet()?.singleOrNull { it.name == attribute.name }
++                    candidateAttribute != null && candidateAttributes.getAttribute(candidateAttribute)?.toString() == attributes.getAttribute(attribute)?.toString()
++                }
++            } ?: throw GradleException("Cannot map Gradle's selected attributes $attributes to an Android variant of ${project.path}")
++        }.distinct()
++        if (selectedVariants.size > 1) {
++            throw GradleException("The selected Android module requires multiple variants of ${project.path}; one active variant cannot represent this graph")
++        }
++        selectedVariants.singleOrNull()?.let { return it }
++    }
++    return variants.firstOrNull { it.name == selectedName }
++        ?: variants.sortedBy { if ("debug" in it.name.orEmpty()) 0 else 1 }.minByOrNull { it.name?.length ?: 0 }
++}
+ 
+-        selectedVariant != null && variant.name == selectedVariant
+-    }
+-
+-    return selected ?: sortedBy { if ("debug" in it.name.orEmpty()) 0 else 1 }.minByOrNull { it.name?.length ?: 0 }
++fun Project.selectedAndroidConfigurations(): List<Configuration> {
++    val variant = androidVariants?.selectActiveVariant() ?: return emptyList()
++    return (listOfNotNull(variant.compileConfiguration) +
++        variant.nestedComponents.orEmpty().mapNotNull { it.compileConfiguration }).distinct()
+ }
+ 
+ fun Project.isAndroidProject(): Boolean {
+     return pluginManager.hasPlugin("com.android.application") ||
+-            pluginManager.hasPlugin("com.android.library")
++        pluginManager.hasPlugin("com.android.library") ||
++        pluginManager.hasPlugin("com.android.dynamic-feature")
+ }
+--- a/workspace-import/gradle-plugin/src/com/jetbrains/ls/imports/gradle/model/builder/android/collectAndroidVariants.kt
++++ b/workspace-import/gradle-plugin/src/com/jetbrains/ls/imports/gradle/model/builder/android/collectAndroidVariants.kt
+@@ -43,6 +43,10 @@
+         project.plugins.withId("com.android.library") {
+             project.collectAndroidVariants()
+         }
++
++        project.plugins.withId("com.android.dynamic-feature") {
++            project.collectAndroidVariants()
++        }
+     }
+ }
+ 
+--- a/workspace-import/gradle-plugin/src/com/jetbrains/ls/imports/gradle/model/builder/ExternalModuleDependencySetModuleBuilder.java
++++ b/workspace-import/gradle-plugin/src/com/jetbrains/ls/imports/gradle/model/builder/ExternalModuleDependencySetModuleBuilder.java
+@@ -38,7 +38,6 @@
+ import java.util.Map;
+ import java.util.Set;
+ import java.util.function.Consumer;
+-import java.util.stream.Collectors;
+ 
+ @SuppressWarnings("IO_FILE_USAGE")
+ public final class ExternalModuleDependencySetModuleBuilder implements ToolingModelBuilder {
+@@ -59,9 +58,16 @@
+ 
+     @Override
+     public @Nullable Object buildAll(@NotNull String modelName, @NotNull Project project) {
+-        /* Generically resolving dependencies in Android Projects is not allowed */
+-        if(AndroidUtilsKt.isAndroidProject(project)) {
+-            return null;
++        if (AndroidUtilsKt.isAndroidProject(project)) {
++            Set<ExternalModuleDependency> result = new HashSet<>();
++            boolean downloadSources = modelName.equals(ExternalModuleFullDependencySet.class.getCanonicalName());
++            for (Configuration configuration : AndroidUtilsKt.selectedAndroidConfigurations(project)) {
++                result.addAll(joinSourcesAndBinaries(
++                        resolveConfiguration(configuration),
++                        downloadSources ? resolveConfigurationSources(project, configuration) : Collections.emptySet()
++                ));
++            }
++            return new ExternalModuleDependencySetImpl(result);
+         }
+ 
+         ExtensionContainer extensions = project.getExtensions();
+@@ -102,21 +108,18 @@
+             @NotNull Set<@NotNull ResolvedArtifactResult> binaries,
+             @NotNull Set<@NotNull ResolvedArtifactResult> sources
+     ) {
+-        Map<String, File> artifactSources = new HashMap<>();
++        Map<String, Set<File>> artifactSources = new HashMap<>();
+         for (ResolvedArtifactResult source : sources) {
+-            artifactSources.put(getArtifactId(source), source.getFile());
++            artifactSources.computeIfAbsent(getArtifactId(source), ignored -> new HashSet<>()).add(source.getFile());
+         }
+-        return binaries.stream()
+-                .map(it -> {
+-                    String id = getArtifactId(it);
+-                    File sourceFile = artifactSources.get(id);
+-                    return new ExternalModuleDependencyImpl(
+-                            getArtifactMavenCoordinates(it),
+-                            it.getFile(),
+-                            sourceFile
+-                    );
+-                })
+-                .collect(Collectors.toSet());
++        Set<ExternalModuleDependency> result = new HashSet<>();
++        for (ResolvedArtifactResult binary : binaries) {
++            // A selected component can publish several source archives (AndroidX also publishes samples).
++            for (File source : artifactSources.getOrDefault(getArtifactId(binary), Collections.singleton(null))) {
++                result.add(new ExternalModuleDependencyImpl(getArtifactMavenCoordinates(binary), binary.getFile(), source));
++            }
++        }
++        return result;
+     }
+ 
+     private static @NotNull Set<@NotNull ResolvedArtifactResult> resolveConfiguration(@NotNull Configuration configuration) {
