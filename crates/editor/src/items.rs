@@ -1492,6 +1492,11 @@ impl SerializableItem for Editor {
 
         let buffer = self.buffer().read(cx).as_singleton()?;
 
+        // Server documents need URI-aware restoration, not filesystem paths.
+        if buffer.read(cx).language_server_document().is_some() {
+            return None;
+        }
+
         let abs_path = buffer.read(cx).file().and_then(|file| {
             let worktree_id = file.worktree_id(cx);
             project

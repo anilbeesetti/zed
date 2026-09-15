@@ -309,6 +309,73 @@ struct DocumentSelectorContext {
     scheme: &'static str,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct VirtualDocumentId {
+    server_id: LanguageServerId,
+    model_version: u64,
+    uri: Uri,
+}
+
+struct LspFile {
+    document: VirtualDocumentId,
+    path: Arc<RelPath>,
+    worktree_id: WorktreeId,
+}
+
+impl LspFile {
+    fn from_buffer(buffer: &Buffer) -> Option<&Self> {
+        let file: &dyn std::any::Any = buffer.file()?.as_ref();
+        file.downcast_ref()
+    }
+}
+
+impl language::File for LspFile {
+    fn as_local(&self) -> Option<&dyn LocalFile> {
+        None
+    }
+    fn disk_state(&self) -> language::DiskState {
+        language::DiskState::Historic { was_deleted: false }
+    }
+    fn path(&self) -> &Arc<RelPath> {
+        &self.path
+    }
+    fn full_path(&self, _: &App) -> PathBuf {
+        self.document.uri.as_str().into()
+    }
+    fn path_style(&self, _: &App) -> PathStyle {
+        PathStyle::Unix
+    }
+    fn file_name<'a>(&'a self, _: &'a App) -> &'a str {
+        self.path.file_name().unwrap_or(self.document.uri.as_str())
+    }
+    fn worktree_id(&self, _: &App) -> WorktreeId {
+        self.worktree_id
+    }
+    fn to_proto(&self, _: &App) -> proto::File {
+        proto::File {
+            worktree_id: self.worktree_id.to_proto(),
+            entry_id: None,
+            path: self.path.as_unix_str().to_owned(),
+            mtime: None,
+            is_deleted: false,
+            is_historic: true,
+        }
+    }
+    fn is_private(&self) -> bool {
+        false
+    }
+    fn can_open(&self) -> bool {
+        true
+    }
+}
+
+enum KotlinImportLog {}
+
+impl lsp::notification::Notification for KotlinImportLog {
+    type Params = Value;
+    const METHOD: &'static str = "intellij/importLog";
+}
+
 pub struct LocalLspStore {
     weak: WeakEntity<LspStore>,
     pub worktree_store: Entity<WorktreeStore>,
@@ -348,6 +415,10 @@ pub struct LocalLspStore {
     lsp_tree: LanguageServerTree,
     registered_buffers: HashMap<BufferId, usize>,
     buffers_opened_in_servers: HashMap<BufferId, HashSet<LanguageServerId>>,
+    virtual_buffers: HashMap<VirtualDocumentId, WeakEntity<Buffer>>,
+    virtual_buffer_loads:
+        HashMap<VirtualDocumentId, Shared<Task<Result<Entity<Buffer>, Arc<anyhow::Error>>>>>,
+    virtual_document_versions: HashMap<LanguageServerId, u64>,
     buffer_pull_diagnostics_result_ids: HashMap<
         LanguageServerId,
         HashMap<Option<SharedString>, HashMap<PathBuf, Option<SharedString>>>,
@@ -366,6 +437,39 @@ pub struct LocalLspStore {
 }
 
 impl LocalLspStore {
+    fn virtual_document_is_current(&self, document: &VirtualDocumentId) -> bool {
+        self.language_servers.contains_key(&document.server_id)
+            && self
+                .virtual_document_versions
+                .get(&document.server_id)
+                .copied()
+                .unwrap_or_default()
+                == document.model_version
+    }
+
+    fn invalidate_virtual_documents(&mut self, server_id: LanguageServerId, cx: &App) {
+        for (document, buffer) in &self.virtual_buffers {
+            if document.server_id != server_id {
+                continue;
+            }
+            if let Some(buffer) = buffer.upgrade() {
+                let buffer_id = buffer.read(cx).remote_id();
+                if let Some(snapshots) = self.buffer_snapshots.remove(&buffer_id)
+                    && snapshots.contains_key(&server_id)
+                    && let Some(LanguageServerState::Running { server, .. }) =
+                        self.language_servers.get(&server_id)
+                {
+                    server.unregister_buffer(document.uri.clone());
+                }
+                self.buffers_opened_in_servers.remove(&buffer_id);
+            }
+        }
+        let version = self.virtual_document_versions.entry(server_id).or_default();
+        *version += 1;
+        self.virtual_buffers
+            .retain(|document, _| document.server_id != server_id);
+    }
+
     /// Returns the running language server for the given ID. Note if the language server is starting, it will not be returned.
     pub fn running_language_server_for_id(
         &self,
@@ -893,6 +997,24 @@ impl LocalLspStore {
     ) {
         let name = language_server.name();
         let server_id = language_server.server_id();
+        if name.0.as_ref() == "kotlin-lsp" {
+            language_server
+                .on_notification::<KotlinImportLog, _>({
+                    let lsp_store = lsp_store.clone();
+                    move |params, cx| {
+                        if params.get("started").and_then(Value::as_bool) == Some(true) {
+                            lsp_store
+                                .update(cx, |store, cx| {
+                                    if let Some(local) = store.as_local_mut() {
+                                        local.invalidate_virtual_documents(server_id, cx);
+                                    }
+                                })
+                                .log_err();
+                        }
+                    }
+                })
+                .detach();
+        }
         language_server
             .on_notification::<lsp::notification::PublishDiagnostics, _>({
                 let adapter = adapter.clone();
@@ -1434,6 +1556,13 @@ impl LocalLspStore {
         buffer: &Buffer,
         cx: &mut App,
     ) -> Vec<LanguageServerId> {
+        if let Some(file) = LspFile::from_buffer(buffer) {
+            return self
+                .virtual_document_is_current(&file.document)
+                .then_some(file.document.server_id)
+                .into_iter()
+                .collect();
+        }
         if let Some((file, language)) = File::from_dyn(buffer.file()).zip(buffer.language()) {
             let worktree_id = file.worktree_id(cx);
 
@@ -3115,6 +3244,50 @@ impl LocalLspStore {
         let buffer = buffer_handle.read(cx);
         let buffer_id = buffer.remote_id();
 
+        if let Some(file) = LspFile::from_buffer(buffer) {
+            if !self.virtual_document_is_current(&file.document) {
+                return;
+            }
+            let server_id = file.document.server_id;
+            let Some(LanguageServerState::Running {
+                server, adapter, ..
+            }) = self.language_servers.get(&server_id)
+            else {
+                return;
+            };
+            if !only_register_servers.is_empty()
+                && !only_register_servers.contains(&LanguageServerSelector::Id(server_id))
+                && !only_register_servers.contains(&LanguageServerSelector::Name(adapter.name()))
+            {
+                return;
+            }
+            let Some(language) = buffer.language() else {
+                return;
+            };
+            self.buffer_snapshots
+                .entry(buffer_id)
+                .or_default()
+                .entry(server_id)
+                .or_insert_with(|| {
+                    let snapshot = buffer.text_snapshot();
+                    server.register_buffer(
+                        file.document.uri.clone(),
+                        adapter.language_id(&language.name()),
+                        0,
+                        snapshot.text_with_line_endings(),
+                    );
+                    vec![LspBufferSnapshot {
+                        version: 0,
+                        snapshot,
+                    }]
+                });
+            self.buffers_opened_in_servers
+                .entry(buffer_id)
+                .or_default()
+                .insert(server_id);
+            return;
+        }
+
         let Some(file) = File::from_dyn(buffer.file()) else {
             return;
         };
@@ -3887,6 +4060,12 @@ impl LocalLspStore {
                         })
                         .await?;
 
+                    anyhow::ensure!(
+                        !buffer_to_edit.read_with(cx, |buffer, _| buffer.read_only()),
+                        "cannot edit read-only document {}",
+                        op.text_document.uri,
+                    );
+
                     let edits = this
                         .update(cx, |this, cx| {
                             let path = buffer_to_edit.read(cx).project_path(cx);
@@ -4009,7 +4188,7 @@ impl LocalLspStore {
         let language_server = this
             .read_with(cx, |this, _| this.language_server_for_id(server_id))
             .context("language server not found")?;
-        let transaction = Self::deserialize_workspace_edit(
+        let transaction = match Self::deserialize_workspace_edit(
             this.clone(),
             params.edit,
             true,
@@ -4017,17 +4196,25 @@ impl LocalLspStore {
             cx,
         )
         .await
-        .log_err();
-        this.update(cx, |this, cx| {
-            if let Some(transaction) = transaction {
-                cx.emit(LspStoreEvent::WorkspaceEditApplied(transaction.clone()));
-
-                this.as_local_mut()
-                    .unwrap()
-                    .last_workspace_edits_by_language_server
-                    .insert(server_id, transaction);
+        {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                log::error!("Failed to apply workspace edit: {error:#}");
+                return Ok(lsp::ApplyWorkspaceEditResponse {
+                    applied: false,
+                    failed_change: None,
+                    failure_reason: Some(format!("{error:#}")),
+                });
             }
-        });
+        };
+        this.update(cx, |this, cx| {
+            this.as_local_mut()
+                .context("local language server store is unavailable")?
+                .last_workspace_edits_by_language_server
+                .insert(server_id, transaction.clone());
+            cx.emit(LspStoreEvent::WorkspaceEditApplied(transaction));
+            anyhow::Ok(())
+        })?;
         Ok(lsp::ApplyWorkspaceEditResponse {
             applied: true,
             failed_change: None,
@@ -4952,6 +5139,9 @@ impl LspStore {
                 toolchain_store,
                 registered_buffers: HashMap::default(),
                 buffers_opened_in_servers: HashMap::default(),
+                virtual_buffers: HashMap::default(),
+                virtual_buffer_loads: HashMap::default(),
+                virtual_document_versions: HashMap::default(),
                 buffer_pull_diagnostics_result_ids: HashMap::default(),
                 workspace_pull_diagnostics_result_ids: HashMap::default(),
                 restricted_worktrees_tasks: HashMap::default(),
@@ -5002,7 +5192,7 @@ impl LspStore {
         })
     }
 
-    pub(super) fn new_remote(
+    pub fn new_remote(
         buffer_store: Entity<BufferStore>,
         worktree_store: Entity<WorktreeStore>,
         languages: Arc<LanguageRegistry>,
@@ -5231,7 +5421,9 @@ impl LspStore {
         })
         .detach();
 
-        self.parse_modeline(buffer, cx);
+        if buffer.read(cx).language_server_document().is_none() {
+            self.parse_modeline(buffer, cx);
+        }
         self.detect_language_for_buffer(buffer, cx);
         if let Some(local) = self.as_local_mut() {
             local.initialize_buffer(buffer, cx);
@@ -5316,11 +5508,10 @@ impl LspStore {
             // We run early exits on non-existing buffers AFTER we mark the buffer as registered in order to handle buffer saving.
             // When a new unnamed buffer is created and saved, we will start loading it's language. Once the language is loaded, we go over all "language-less" buffers and try to fit that new language
             // with them. However, we do that only for the buffers that we think are open in at least one editor; thus, we need to keep tab of unnamed buffers as well, even though they're not actually registered with any language
-            // servers in practice (we don't support non-file URI schemes in our LSP impl).
-            let Some(file) = File::from_dyn(buffer.read(cx).file()) else {
-                return handle;
-            };
-            if !file.is_local() {
+            // servers in practice.
+            if LspFile::from_buffer(buffer.read(cx)).is_none()
+                && !File::from_dyn(buffer.read(cx).file()).is_some_and(File::is_local)
+            {
                 return handle;
             }
 
@@ -5346,6 +5537,15 @@ impl LspStore {
                         local.registered_buffers.remove(&buffer_id);
 
                         local.buffers_opened_in_servers.remove(&buffer_id);
+                        if let Some(file) = LspFile::from_buffer(buffer.0.read(cx)) {
+                            if let Some(snapshots) = local.buffer_snapshots.remove(&buffer_id)
+                                && snapshots.contains_key(&file.document.server_id)
+                                && let Some(LanguageServerState::Running { server, .. }) =
+                                    local.language_servers.get(&file.document.server_id)
+                            {
+                                server.unregister_buffer(file.document.uri.clone());
+                            }
+                        }
                         if let Some(file) = File::from_dyn(buffer.0.read(cx).file()).cloned() {
                             local.unregister_old_buffer_from_language_servers(&buffer.0, &file, cx);
 
@@ -5598,6 +5798,30 @@ impl LspStore {
     ) {
         // If the buffer has a language, set it and start the language server if we haven't already.
         let buffer = buffer_handle.read(cx);
+        if let Some(document) = buffer.language_server_document() {
+            if buffer.language().is_some_and(|language| {
+                language
+                    .name()
+                    .as_ref()
+                    .eq_ignore_ascii_case(&document.language)
+            }) {
+                return;
+            }
+            let language_name = document.language.clone();
+            let languages = self.languages.clone();
+            let buffer = buffer_handle.clone();
+            cx.spawn(async move |this, cx| {
+                let language = languages
+                    .language_for_name_or_extension(&language_name)
+                    .await?;
+                this.update(cx, |this, cx| {
+                    this.set_language_for_buffer(&buffer, language, cx)
+                })?;
+                anyhow::Ok(())
+            })
+            .detach_and_log_err(cx);
+            return;
+        }
         let Some(file) = buffer.file() else {
             return;
         };
@@ -5801,6 +6025,14 @@ impl LspStore {
                 .collect();
         }
 
+        if let Some(document) = buffer.read(cx).language_server_document() {
+            return self
+                .language_server_statuses
+                .contains_key(&document.server_id)
+                .then_some(document.server_id)
+                .into_iter()
+                .collect();
+        }
         let Some(language) = buffer.read(cx).language().cloned() else {
             return HashSet::default();
         };
@@ -5991,8 +6223,18 @@ impl LspStore {
         cx: &App,
     ) -> bool {
         let registration_method = text_document_registration_method(method);
-        let language = buffer.read(cx).language().map(|language| language.name());
-        let context = self.remote_document_selector_context(server_id, language.as_ref());
+        let buffer = buffer.read(cx);
+        if buffer
+            .language_server_document()
+            .is_some_and(|document| document.server_id != server_id)
+        {
+            return false;
+        }
+        let language = buffer.language().map(|language| language.name());
+        let context = buffer
+            .language_server_document()
+            .map(document_selector_context_for_server_document)
+            .or_else(|| self.remote_document_selector_context(server_id, language.as_ref()));
         remote_text_document_capabilities_match(
             self.lsp_server_initial_capabilities.get(&server_id),
             self.lsp_server_capabilities.get(&server_id),
@@ -6183,6 +6425,11 @@ impl LspStore {
             );
         }
 
+        let uri = match self.buffer_lsp_uri(buffer.read(cx), cx) {
+            Ok(Some(uri)) => uri,
+            Ok(None) => return Task::ready(Ok(Default::default())),
+            Err(error) => return Task::ready(Err(error)),
+        };
         let query_outcome = buffer.update(cx, |buffer, cx| {
             let mut early_response = None;
             if let Some(local) = self.as_local() {
@@ -6227,28 +6474,21 @@ impl LspStore {
             LanguageServerQueryOutcome::Respond(response) => return Task::ready(Ok(response)),
         };
 
-        let file = File::from_dyn(buffer.read(cx).file()).and_then(File::as_local);
-
-        let Some(file) = file else {
-            return Task::ready(Ok(Default::default()));
-        };
-
-        let lsp_params =
-            match request.to_lsp(&file.abs_path(cx), buffer.read(cx), &language_server, cx) {
-                Ok(lsp_params) => lsp_params,
-                Err(err) => {
-                    let err = err.context(format!(
-                        "{} via {} failed",
-                        request.display_name(),
-                        language_server.name(),
-                    ));
-                    let message = format!("{err:#}");
-                    if should_log_lsp_request_failure(&message) {
-                        log::warn!("{message}");
-                    }
-                    return Task::ready(Err(err));
+        let lsp_params = match request.to_lsp(&uri, buffer.read(cx), &language_server, cx) {
+            Ok(lsp_params) => lsp_params,
+            Err(err) => {
+                let err = err.context(format!(
+                    "{} via {} failed",
+                    request.display_name(),
+                    language_server.name(),
+                ));
+                let message = format!("{err:#}");
+                if should_log_lsp_request_failure(&message) {
+                    log::warn!("{message}");
                 }
-            };
+                return Task::ready(Err(err));
+            }
+        };
 
         let status = request.status();
         let request_timeout = ProjectSettings::get_global(cx)
@@ -6312,15 +6552,20 @@ impl LspStore {
                 err.context(context)
             })?;
 
-            request
+            let lsp_store = this.upgrade().context("no app context")?;
+            lsp_store.read_with(cx, |store, cx| store.buffer_lsp_uri(buffer.read(cx), cx))?;
+            let response = request
                 .response_from_lsp(
                     response,
-                    this.upgrade().context("no app context")?,
-                    buffer,
+                    lsp_store.clone(),
+                    buffer.clone(),
                     language_server.server_id(),
                     cx.clone(),
                 )
-                .await
+                .await?;
+            // Converting a response can await opening a target while the project model changes.
+            lsp_store.read_with(cx, |store, cx| store.buffer_lsp_uri(buffer.read(cx), cx))?;
+            Ok(response)
         })
     }
 
@@ -10462,12 +10707,125 @@ impl LspStore {
         }
     }
 
+    pub(crate) fn buffer_lsp_uri(&self, buffer: &Buffer, cx: &App) -> Result<Option<Uri>> {
+        if let Some(file) = LspFile::from_buffer(buffer) {
+            anyhow::ensure!(
+                self.as_local()
+                    .is_some_and(|local| local.virtual_document_is_current(&file.document)),
+                "This library document belongs to an outdated language server or project model. Open its definition again."
+            );
+            return Ok(Some(file.document.uri.clone()));
+        }
+        File::from_dyn(buffer.file())
+            .and_then(File::as_local)
+            .map(|file| file_path_to_lsp_url(&file.abs_path(cx)))
+            .transpose()
+    }
+
+    fn open_kotlin_virtual_buffer(
+        &mut self,
+        uri: Uri,
+        server_id: LanguageServerId,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Entity<Buffer>>> {
+        let Some(local) = self.as_local() else {
+            return Task::ready(Err(anyhow!(
+                "Library documents require a local language server"
+            )));
+        };
+        let document = VirtualDocumentId {
+            server_id,
+            model_version: local
+                .virtual_document_versions
+                .get(&server_id)
+                .copied()
+                .unwrap_or_default(),
+            uri,
+        };
+        if let Some(buffer) = local
+            .virtual_buffers
+            .get(&document)
+            .and_then(WeakEntity::upgrade)
+        {
+            return Task::ready(Ok(buffer));
+        }
+        let load = if let Some(load) = local.virtual_buffer_loads.get(&document) {
+            load.clone()
+        } else {
+            let Some(worktree_id) = self
+                .language_server_statuses
+                .get(&server_id)
+                .and_then(|status| status.worktree)
+            else {
+                return Task::ready(Err(anyhow!(
+                    "The library document's source worktree is no longer available"
+                )));
+            };
+            let decompile = self.execute_lsp_command(
+                server_id,
+                "decompile".into(),
+                vec![serde_json::json!(document.uri)],
+                cx,
+            );
+            let languages = self.languages.clone();
+            let load = cx.spawn({
+                let document = document.clone();
+                async move |this, cx| {
+                    let result = async {
+                        #[derive(serde::Deserialize)]
+                        struct DecompiledDocument { code: String, language: String }
+                        let content: DecompiledDocument = serde_json::from_value(decompile.await?.context("Kotlin decompile returned no document")?)
+                            .context("Invalid Kotlin decompile response; expected code and language")?;
+                        let language = languages.language_for_name_or_extension(&content.language).await?;
+                        let path = RelPath::new(Path::new(document.uri.as_str()), PathStyle::Unix)?.into_arc();
+                        this.update(cx, |store, cx| {
+                            anyhow::ensure!(store.as_local().is_some_and(|local| local.virtual_document_is_current(&document)),
+                                "Kotlin server or project model changed while loading the library document");
+                            let buffer = store.buffer_store.update(cx, |store, cx| store.create_local_buffer(&content.code, Some(language), false, cx));
+                            buffer.update(cx, |buffer, cx| {
+                                buffer.file_updated(Arc::new(LspFile { document: document.clone(), path, worktree_id }), cx);
+                                buffer.set_language_server_document(language::LanguageServerDocument {
+                                    uri: document.uri.clone(), server_id, language: content.language,
+                                }, cx);
+                            });
+                            if let Some(local) = store.as_local_mut() {
+                                local.virtual_buffers.insert(document.clone(), buffer.downgrade());
+                            }
+                            Ok(buffer)
+                        })?
+                    }.await;
+                    this.update(cx, |store, _| {
+                        if let Some(local) = store.as_local_mut() {
+                            local.virtual_buffer_loads.remove(&document);
+                        }
+                    }).log_err();
+                    result.map_err(Arc::new)
+                }
+            }).shared();
+            if let Some(local) = self.as_local_mut() {
+                local.virtual_buffer_loads.insert(document, load.clone());
+            }
+            load
+        };
+        cx.spawn(async move |_, _| load.await.map_err(|error| anyhow!("{error:#}")))
+    }
+
     pub(crate) fn open_local_buffer_via_lsp(
         &mut self,
         abs_path: lsp::Uri,
         language_server_id: LanguageServerId,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Buffer>>> {
+        if matches!(abs_path.scheme(), "jar" | "jrt") {
+            let Some(server) = self.language_server_for_id(language_server_id) else {
+                return Task::ready(Err(anyhow!(
+                    "The library document's language server is no longer available"
+                )));
+            };
+            if server.name().0.as_ref() == "kotlin-lsp" {
+                return self.open_kotlin_virtual_buffer(abs_path, language_server_id, cx);
+            }
+        }
         let path_style = self.worktree_store.read(cx).path_style();
         cx.spawn(async move |lsp_store, cx| {
             // Escape percent-encoded string.
@@ -11653,7 +12011,10 @@ impl LspStore {
                                 .and_then(|buffer| {
                                     Some(buffer.read(cx).file()?.as_local()?.abs_path(cx))
                                 })
-                                .map(|path| make_text_document_identifier(&path))
+                                .map(|path| {
+                                    file_path_to_lsp_url(&path)
+                                        .and_then(|uri| make_text_document_identifier(&uri))
+                                })
                         })
                         .transpose()?
                 } else {
@@ -14236,6 +14597,13 @@ impl LspStore {
             lsp_data.remove_server_data(for_server);
         }
         if let Some(local) = self.as_local_mut() {
+            local
+                .virtual_buffers
+                .retain(|document, _| document.server_id != for_server);
+            local
+                .virtual_buffer_loads
+                .retain(|document, _| document.server_id != for_server);
+            local.virtual_document_versions.remove(&for_server);
             local.buffer_pull_diagnostics_result_ids.remove(&for_server);
             local
                 .workspace_pull_diagnostics_result_ids
@@ -14913,11 +15281,27 @@ fn document_selector_context_for_buffer(
     buffer: &Buffer,
     adapter: &CachedLspAdapter,
 ) -> Option<DocumentSelectorContext> {
+    if let Some(document) = buffer.language_server_document() {
+        return Some(document_selector_context_for_server_document(document));
+    }
     let language = buffer.language()?;
     Some(document_selector_context_for_language(
         &language.name(),
         adapter,
     ))
+}
+
+fn document_selector_context_for_server_document(
+    document: &language::LanguageServerDocument,
+) -> DocumentSelectorContext {
+    DocumentSelectorContext {
+        language_id: document.language.clone(),
+        scheme: match document.uri.scheme() {
+            "jar" => "jar",
+            "jrt" => "jrt",
+            _ => "file",
+        },
+    }
 }
 
 fn document_selector_context_for_language(
