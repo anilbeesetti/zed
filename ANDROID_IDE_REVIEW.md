@@ -277,7 +277,13 @@ JVM facade filenames. An explicit root classpath hook supplies the selected
 project model without duplicate Gradle discovery. The native initialization
 measurement drops from 16.9–20.5 seconds to 1.17 seconds. Binary-definition and
 explicit-classpath fixtures pass; see the validation report for warm-up and
-Gradle DSL limitations. The managed installer version is `+android-sources-5`.
+Gradle DSL limitations. The current managed installer version is `+android-sources-8`.
+
+The latest runtime preserves attached `archive!/entry` URIs, queries sources for
+the actual selected Gradle artifacts, shares in-flight diagnostics compilation,
+and prioritizes the active file before workspace indexing. Explicitly opened
+archive sources support further navigation without becoming project sources.
+See the latest validation section for measured cold-start limits and tests.
 
 Release Notes:
 
@@ -393,7 +399,10 @@ Their descendants were rebased with `gh stack rebase --upstack --remote origin`.
 
 Layer 16 adds Android resource-to-XML navigation and fixes cached declaration
 clicks to find usages at the clicked location. It uses the existing references
-picker, including one-result and repeated-query cases.
+picker, including one-result and repeated-query cases. It also adds read-only
+JAR/ZIP entry support to the existing filesystem, preserving Gradle source paths
+across restarts. Reused language-server nodes retain project settings for library
+buffer requests. Filesystem and project-LSP regressions cover these paths.
 
 Layer 17 combines existing file, workspace-symbol and action search in Search
 Everywhere. It includes category tabs and Double Shift/Go to Class shortcuts.

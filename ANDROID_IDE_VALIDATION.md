@@ -50,11 +50,26 @@ Cold navigation also exposed a duplicate-analysis race. Diagnostics and a first
 navigation request could both observe an uncompiled file, then serialize two
 compilations through the compiler's lock. The source-path cache now coordinates
 conditional compilation, batch diagnostics and refresh, so the second request
-reuses the first result. Already-cached navigation does not take the compilation
-monitor. The new concurrency regression failed before the fix and passes after
-it, checking one compilation and shared declaration identity. Open archive
-sources are excluded from the project source set, preventing duplicate library
-classes from entering subsequent project analysis.
+reuses the first result. The lock is fair so navigation can run between indexing
+batches, and initial workspace indexing gives the active editor file priority.
+Already-cached navigation does not take the compilation lock. The concurrency
+regression failed before the fix and passes after it, checking one compilation
+and shared declaration identity.
+
+Explicitly opened archive sources can be analyzed outside the workspace root,
+but are excluded from the project source set to prevent duplicate library
+classes. A runtime regression opens an archive entry and navigates within it.
+The actual Compose probe also resolves Typography's `TextStyle` reference into
+`ui-text-android-1.10.4-sources.jar!/commonMain/androidx/compose/ui/text/TextStyle.kt`.
+
+Native testing found another routing issue: external buffers registered with
+the project's server, but subsequent requests re-applied global language-server
+settings. Those settings can select a different Kotlin server. Reused server
+nodes now retain the project's server during lookup. The regression reproduces
+an empty definition result with different project/global server selections,
+then verifies navigation and worktree cleanup after the fix. Virtual archive
+paths also skip shell-environment loading because they cannot be process working
+directories.
 
 Studio also has persistent semantic indexes and serialized declaration stubs;
 these are separate from archive file loading. Its
@@ -63,12 +78,38 @@ explains both the cached lookup mechanism and background indexing readiness.
 This change does not replace the prototype's Kotlin compiler engine or eliminate
 JVM startup and the first required semantic analysis. It removes redundant work
 and preserves source identity without introducing another persistent symbol
-cache.
+cache. The community server's
+[SymbolIndex](https://github.com/fwcd/kotlin-language-server/blob/6d9e61b79d4631e75516def7ab7ff0d8b9310467/server/src/main/kotlin/org/javacs/kt/index/SymbolIndex.kt)
+stores searchable symbol names and locations; it does not serialize the compiler
+binding context required for expression definitions such as `headlineSmall`.
 
-Validation evidence:
+The managed runtime is `+android-sources-8`. Timing separates readiness from
+request duration; these are local samples, not statistically established speedups:
 
-- `archive-runtime-install.log`: runtime archive URI, source-content and
-  definition regressions from a clean application of the pinned patch.
+| Measurement | Before scheduling fix | After scheduling fix |
+| --- | --- | --- |
+| First definition, requested 100 ms after `didOpen` (3 alternating JVM runs) | 1.38–1.45 s; median 1.41 s | 1.29–1.35 s; median 1.34 s |
+| Initialization in those runs (measured separately) | 0.834–0.908 s | 0.852–0.898 s |
+
+With the final installed runtime, an isolated readiness probe initialized in
+1.706 s, published diagnostics at 3.180 s, and resolved the first `headlineSmall`
+request in 60 ms. An earlier pass measured 40 ms after readiness. Cold JVM and
+machine-load variation remain visible; the archive identity fix does not claim
+Android Studio's cold-start responsiveness.
+
+Validation evidence (local files under `target/android-ide/validation/`):
+
+- `archive-runtime-v8-install.log`: rename, archive URI, source-content,
+  definition, concurrency, workspace-symbol and explicit-classpath regressions
+  pass from a clean application of the pinned patch, before atomic installation.
+- `archive-open-library-tests.log`, `archive-nested-navigation-fixed.log`:
+  archive buffers remain outside the project source set while supporting further
+  navigation, including the actual Typography → TextStyle cross-archive lookup.
+- `archive-reused-lsp-registered-before.log`, `archive-reused-lsp-final.log`:
+  reproduced external-buffer routing failure and all 19 project LSP integration
+  tests passing after the fix.
+- `archive-latency-comparison.json`, `archive-navigation-ready-v8.log`:
+  alternating cold-request comparison and final installed-runtime readiness probe.
 - `cold-definition-race-before.log`, `cold-definition-race-after.log`: reproduced
   duplicate compilation and passing definition suite after sharing analysis.
 - `archive-diagnostics-compatible-stdlib.log`: diagnostics, including edits while
@@ -78,8 +119,15 @@ Validation evidence:
 - `archive-fs-suite.log`: filesystem unit and integration tests, including
   archive reads, implicit directories, canonical paths, handles, read-only
   enforcement and reopening through a new filesystem instance.
-- `archive-clippy.log`, `archive-android-ui-tests.log`: changed-crate Clippy and
-  all five Android UI tests pass.
+- `archive-final-clippy.log`, `archive-android-ui-tests.log`: the repository
+  Clippy wrapper passes for filesystem, project and Android UI crates; all five
+  Android UI tests pass.
+
+To update an existing project, relaunch the rebuilt app, run **Android: Configure
+Kotlin** for the selected variant, and restart the IDE once so the runtime and
+workspace settings are both fresh. This writes `externalSources.useArchiveUris`
+and the selected variant's source archives. An existing random temporary source
+tab can be closed; a fresh definition lookup opens the stable archive path.
 
 ## Device picker refresh — 15 September 2026
 
