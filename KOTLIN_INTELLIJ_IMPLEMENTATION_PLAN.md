@@ -668,7 +668,7 @@ reports. The Java probe then completed successfully. No performance claim uses
 these build-overlapping checks.
 
 Community remains the default. Final release UI timings and complete-process
-memory results will be recorded separately from these protocol checks.
+memory results are recorded below, separately from these protocol checks.
 
 ### Release restart and timing follow-up
 
@@ -689,3 +689,68 @@ editor-only trace. Its direct-jump path now uses the same rendered-frame logger.
 Completion tracing is confirmed active; the one 5,312 ms sample collected while
 compilation ran is excluded. No cold-navigation timing is claimed from that run.
 The final follow-up binary and controlled UI/memory results are recorded below.
+
+
+### Final release measurements and promotion decision — 2026-09-15
+
+The release build at source `1280189101b3097ebebf7069120fe51c63bf63f1` passed in
+25m16s. Binary SHA-256 is
+`18d1efdf4cb5e7cc80cff8eeb94e5ceafd03111adc39341c74cef43b25ec5e85`.
+The embedded commit is its parent; `target/kotlin-rollout-validation/late-adapter-source.json`
+records the exact source diff and binary identity. The native runtime is the final
+`263.4702.0+android-2` package, including the Java definition-provider fix.
+
+On the M4/16 GiB machine with the isolated larger project, official Kotlin and
+JDT active, and no concurrent build/test/profiler, all 30 warm original Compose
+Text navigation operations succeeded: p50 24.52 ms, p95 26.06 ms, maximum
+26.58 ms. All 30 explicit String completion requests after unsaved dot edits
+showed the correct menu: p50 800.27 ms, p95 961.40 ms, maximum 1,104.21 ms.
+These measure the action handler through a rendered GPUI editor frame, excluding
+the OS compositor. Every completion result was visually checked before the next
+request. Automatic completion was disabled only for this explicit-request test,
+then restored. Warm navigation passes the 150 ms target; completion fails 200 ms.
+
+Single first observations after startup/readiness were 92.14 ms for a Java-to-Kotlin
+source jump, 170.78 ms for original Compose Text, and 2,087.12 ms for String
+completion. Cached indexes and startup delay make these unsuitable as cold-install
+or first-after-index claims. The earlier controlled 1,565.26 ms first-after-index
+protocol sample still fails the proposed 500 ms target.
+
+The final full restart got past adapter registration but still dropped the
+restored library tab when managed setup restarted Kotlin during import. The
+persistence error at 19:09:51 was `The library document's language server stopped
+during import`. Together with the preceding settings-fingerprint rejection, this
+leaves startup settings/setup coordination open. Project-file navigation recovers
+after analysis. No ownership, settings, or session guard was relaxed.
+
+Memory was measured separately for the complete scoped process set: editor,
+Kotlin, JDT, project Gradle daemon, preview and shell helpers. A 20-second idle
+baseline peaked at 4,744.9 MiB RSS. A 180-second run covering debug→release→debug
+twice, ten unsaved edit/Undo cycles, and Compose preview build/render/close peaked
+at 5,444.2 MiB RSS. End known physical footprint was approximately 5.0 GiB in both
+runs: editor 521 MiB, Kotlin about 1 GiB, JDT about 1 GiB, shared Gradle about
+2.5 GiB, and a small shell. The login helper's physical footprint was unavailable
+(8–10 MiB RSS, included in RSS totals). Rounded GiB readings prevent interpreting
+the small apparent difference as a growth measurement. Preview JVMs were transient;
+peak sampled preview RSS was 371.3 MiB. At idle there was one Kotlin JVM and one
+JDT JVM plus proxy. All 37 observed editor/child PIDs exited after app quit; the
+shared Gradle daemon remained.
+
+Use 6 GiB steady and 8 GiB transient total physical footprint as provisional
+budgets on this 16 GiB machine, including Gradle, JDT and preview. The short run
+provides a baseline and cleanup evidence, not a long-session leak or transient
+physical-peak pass. Longer repeated-session measurements remain required.
+
+**Decision:** Keep community as the default and the official backend opt-in.
+Completion/first-analysis performance, startup library restoration, longer-session
+memory, current-model archive ownership, broader import/generated-source coverage,
+and packaged-platform/distribution checks remain open. The requested caret popups,
+analysis wording, native resource/artifact fixes, Java interoperability and adapter
+registration fix are implemented and validated; no default-promotion claim is made.
+
+Detailed methodology, raw sample links, process limits and reproduction commands
+are in `target/kotlin-rollout-validation/VALIDATION.md`. Correctness counts remain
+117/117 required native checks, 7/7 larger-project and 7/7 release-model checks,
+100 scheduler runs for each of Java lifecycle and late-adapter library restoration,
+all 27 LSP-store tests, and passing focused Clippy. The seven baseline Git-parking
+failures in the wider suite remain excluded from this change.
