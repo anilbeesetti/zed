@@ -320,121 +320,216 @@ The first probe's pre-index empty results and an earlier substring-based `Greeti
 
 ## 6. Implementation ledger — 15 September 2026
 
-This task uses branch `codex/kotlin-official-editing`, based on the implemented
-Android IDE at `9d130733815ae0d60ecef21a96005597e251446f`. The original implementation
-and planning worktrees remain untouched. This is an initial set of implementation
-increments; milestone A is **not ready for default-backend promotion**.
+Implementation is on `codex/kotlin-official-editing`, based on Android IDE commit
+`9d130733815ae0d60ecef21a96005597e251446f`. The original implementation and planning
+worktrees are unchanged. Community remains the default: milestone A has open
+performance and lifecycle gates below.
 
-### Implemented in this increment
+### Implemented
 
-- **Step 1:** Added `script/test-kotlin-lsp` and sample reproduction instructions.
-  The probe negotiates incremental UTF-16 changes, waits for import and indexing,
-  records request/document versions and elapsed times, checks actual imported
-  app/library variants, and distinguishes empty results, cancellation, import
-  failures, server errors, and transport failures. Original-source checks can be
-  made required with `--require-original-sources`.
-- **Step 2:** Added explicit official/community installer and launcher selection,
-  a checksum-pinned official `263.4702.0` installation, and separate panel/actions
-  for either backend. Official setup selects only `kotlin-lsp`, preserves user
-  settings and inherited arguments/importer preferences, and retains workspace
-  indexes in `.zed/android-kotlin-official/system`. Project/import JDK 21 stays
-  separate from the server's bundled Java 25 runtime. Community remains default.
-- **Step 3, partial:** Official setup invokes only the selected application's
-  `process<Variant>Resources` task, without assembling or compiling Kotlin/Java.
-  Resource-generation errors still publish the Kotlin configuration and report
-  degraded generated-symbol support. Full model/variant refresh and the dependent
-  library variant bug below remain unresolved; the community/Java exporters have
-  not been migrated to the official model.
-- **Step 5, partial:** The shared opening path fetches `jar:`/`jrt:` content with
-  the advertised `decompile` command and retains the original URI, language,
-  owning server, model generation, and read-only capability. Shared LSP commands
-  now take URIs. Duplicate/in-flight opens reuse buffers per server/model/URI;
-  import invalidation closes old documents before reopening them. These buffers
-  do not create filesystem worktrees or start library-specific servers.
-  Shared buffers retain the server-supplied URI, language, and owning server;
-  read-only state survives collaborator role changes, and the host rejects text
-  edits from older guests. Shared request handling rechecks model ownership
-  before and after response conversion. Closed-tab/app-restart
-  restoration is deliberately not serialized as a fake filesystem path and
-  still needs URI-aware persistence.
-- **Step 6, partial:** Added the official empty-edit/command completion regression
-  through the Zed editor, including incremental unsaved text, resolve data,
-  import/call insertion, caret placement, and undo/redo. Fixed command-transaction
-  selection history and false success responses from failed workspace edits;
-  read-only workspace-edit targets are rejected.
+| Steps | Result |
+| --- | --- |
+| 1–2 | Reproducible incremental UTF-16 protocol probe, explicit backend selection, persistent workspace indexes, separately configured project JDK 21 and bundled server Java 25, checksum-verified installation and fallback preservation. |
+| 3–4 | Source-built patches to the pinned native Gradle importer select dependent variants from Gradle's resolved attributes, attach all source archives for exact components, and collect dynamic-feature variants. Native import remains the production model owner. |
+| 3 | Managed official setup refreshes after Gradle/dependency/resource/manifest changes and variant selection; stale publication is rejected. Removed variants pause the backend until a valid selection returns. Explicit fallback, disablement, and unmanaged binary arguments survive refresh. Root-scoped restarts preserve other workspaces. |
+| 3 | Resource setup checks the Gradle task graph before execution and rejects Kotlin/Java compilation. Generation failure still configures Kotlin with degraded generated-symbol support. The callback runs with configuration-cache reuse disabled. |
+| 5 | Server-owned `jar:`/`jrt:` buffers retain exact URI, owner, model generation, language, and read-only state across requests, sharing, nested navigation, and pull diagnostics. In-flight opens deduplicate. Local history/reopen and database restoration refetch through the current owner; stored text is never replayed. |
+| 6 | Official completion sessions track buffer/version, model, and the latest server request. Acceptance, resolve, edits, and final navigation reject expired sessions. Requests serialize around the server's global completion keys. Dropped client futures retain the server guard; uncertain timeouts fail closed for that server until restart. Errors are observable; typed cancellation stays quiet. |
+| 7 | A small semantic engine contributor fixes required trailing lambdas, prioritizes named arguments in composable functions/lambdas, and suppresses only Compose-inappropriate naming inspections. Ordinary uppercase functions, unrelated annotations, callable references, and real compiler errors remain covered. |
+| 9 | Live tests cover references, overloaded cross-module Kotlin rename, Kotlin-origin edits to Java usages, type/implementation navigation, diagnostics and clearing, refresh, quick fixes, organize imports, formatting, signature help, and protected targets. Java-origin references/rename remain an explicit failure boundary. |
 
-### Live protocol evidence
+The installed engine is **locally patched `263.4702.0+android-1`**, not an unmodified
+upstream release. `script/install-android-kotlin` verifies the official archive,
+public source archive, Gradle/compiler dependencies, patch source, and installed
+JAR hashes. It compiles the three changed native importer source files and
+`script/android-kotlin-compose.kt`, preserving the existing native importer and
+feature registration. `zed-native-importer.json`, the source license, and
+`SOURCE.txt` remain with the runtime. No Studio plugin bundle or client label/regex
+semantic substitute is used.
 
-The sample was copied without build caches and tested with official `263.4702.0`.
-The initial run failed the required `R.string.app_name` completion check.
-`:mobile:processDemoDebugResources --offline --rerun-tasks` then ran 24 resource
-and manifest tasks with `BrokenSource.kt` containing a Kotlin type error. No
-source compilation or assembly ran. The next probe passed **all 49 required
-protocol checks**. Actual import selected `mobile.demoDebug` and `greeting.debug`.
+### Native model and semantic evidence
 
-A separate `fullRelease` run failed the required library-variant assertion:
-`mobile.fullRelease` was selected, but the library remained `greeting.debug`
-instead of `greeting.release`. Resource-only generation succeeded and the other
-required protocol checks passed. This is an unresolved native-importer gate.
+- The unmodified importer selected `greeting.debug` for `mobile.fullRelease`, and
+  all 53 libraries lacked source roots. The patched importer passes all 59
+  required initial checks on `fullRelease`, including seven original Compose
+  source targets and nested `Typography.kt` → `TextStyle.kt` navigation.
+- A custom `fullStaging` application with `matchingFallbacks("release")` selects
+  `greeting.release`. Adding library flavors and
+  `missingDimensionStrategy("tier", "paid")` selects `greeting.paidRelease`.
+  Each run passes the same 59 required checks. App/library requests for two
+  versions of annotations resolve their own 23.0.0 and 13.0 source archives.
+- Multiple published documentation artifacts include both main sources and
+  samples. Keeping every declared source archive for the exact resolved
+  component fixes the source-root-present-but-binary-navigation failure.
+- The user-selected larger project was copied to `/private/tmp`; the original
+  `/Users/anil/Developer/personal/nav3-recipes` retained its pre-existing
+  `.idea/misc.xml` modification. It has 116 Kotlin files, approximately 10,373
+  Kotlin lines (commit `bfc1fc60c36be941cb6284743cccc5a787c6d977`), Gradle 9.4.0,
+  AGP 9.1.1, multiple applications, a library, and
+  install-time/on-demand dynamic features. Native import now exports 26 modules
+  instead of 20, adding both features' main and test source sets. `NavDisplay`
+  and `Text` navigate to their exact original source archives.
+- Sample resource generation succeeds despite a broken Kotlin source. On
+  `nav3-recipes`, `:app:processDebugResources` transitively requests common-library
+  Kotlin/Java compilation. The final guard rejects both tasks in one second,
+  before any task executes. It does not disable compiler tasks and pretend their
+  outputs exist. A resource/KSP-only Gradle fixture still succeeds.
+- Compose engine checks pass for Button, Row/Column and receiver lambdas, annotation
+  aliases, unrelated annotations, ordinary uppercase Kotlin functions, compiler
+  errors, and callable-reference insertion. Raw named-argument rank improves
+  from 217 to 1 in both a composable function and a typed composable lambda inside
+  an ordinary host function. Only Java-origin reference/rename checks fail in
+  the extended semantic run; Kotlin-origin rename updates Java usages.
 
-All 53 imported libraries still lack `SOURCES` roots. A cached restart with
-`--require-original-sources` correctly exits nonzero for missing original/nested
-sources. Compose trailing-lambda insertion remains a reported failure. The
-cached restart's first definition took about 1.88 seconds and its repeated
-lookup about 7.7 ms; these are individual protocol measurements, not editor
-latency or percentiles.
+Evidence: `target/kotlin-native-importer/summary.json`,
+`report-all-sources`, `report-staging`, `report-flavor`,
+`report-nav3-dynamic-fixed`, `nav3-resource-guard.log`, and
+`resource-guard-test/{allowed,rejected}.log`; extended protocol reports under
+`target/kotlin-lsp-probe/report-native-patched-extended`,
+`report-native-patched-restart`, and `report-compose-semantic`.
+The original failure reports remain under `target/kotlin-lsp-probe` for comparison.
 
-Local evidence lives under `target/kotlin-lsp-probe/`: `summary.json`,
-`report-native/results.json`, `report-resources/results.json`,
-`report-fullRelease/results.json`, `report-strict-restart/results.json`, and
-`resource-generation.log`. Reproduction commands are in
+### Client validation
+
+The final deterministic suite passes **26 test functions across 444 runs** (exact
+commands, counts and logs are in `target/kotlin-completion-validation/results.json`).
+They use actual Zed editor/project/workspace code and fake servers. A separate
+opt-in test uses `RealFs`, the actual Kotlin process, and a GPUI test window on
+the larger project.
+
+- Completion acceptance/import/caret/undo, expired sessions after typing and
+  competing requests, import/restart, cross-document sessions, late edits and
+  navigation, and timeout recovery pass scheduler seeds 0–19. Generic completion
+  reuse, resolution, command acceptance, and showDocument behavior also pass.
+- Virtual documents retain source/JRT identity, read-only sharing, deduplication,
+  owner/model validation and exact diagnostic URIs. Only `file:` diagnostics enter
+  filesystem buffers/caches; server-owned library diagnostics remain ignored.
+  Repeated library navigation reuses the same editor through underlying buffer
+  identity, avoiding duplicate tabs. History, closed-tab reopen,
+  database restore with a new store/server, settings mismatch and removed owners
+  are covered. Existing deserialization remains covered.
+- Automatic refresh, removed variants, user fallback/disablement, latest JSON
+  argument changes, root isolation, and stale restart IDs pass seeds 0–19.
+- Installer fixtures cover installation, offline cached reuse, importer/Compose
+  tampering, archive corruption, launcher selection and preservation. The real
+  combined install and cached reinstall pass; the protocol self-test passes.
+
+Logs live in `target/kotlin-completion-validation`,
+`target/kotlin-native-importer/install-combined.log`,
+`reinstall-combined.log`, and `installer-tests-combined.log`.
+Clippy passes all targets/features for `android_tools`, `android_ui`, `editor`,
+`project`, `language`, `proto`, `workspace`, and `remote_server`; workspace formatting
+and diff checks pass. The existing `block` future-compatibility warning remains.
+The opt-in live editor harness is
+`test_real_kotlin_editor_completion_and_navigation` in `editor_tests.rs`.
+
+### Performance and remaining gates
+
+The final packaged engine run passes **116 of 118 required checks**; the two
+failures are Java-origin references and rename. All 150 sampled protocol requests
+succeed. On this Apple M4 (10 logical cores, 16 GiB RAM, macOS 26.6.2), with no
+competing agent build/benchmark, fresh indexing takes 20.13 seconds and the first
+definition takes 1,107 ms. Start load averages were 2.38 / 4.87 / 8.78.
+
+| Packaged protocol scenario, 30 warm samples | p50 | p95 |
+| --- | ---: | ---: |
+| Unchanged definition | 0.49 ms | 1.17 ms |
+| Modifier completion | 82.84 ms | 92.90 ms |
+| String members, explicit | 244.45 ms | 286.62 ms |
+| String members, dot-triggered | 224.85 ms | 266.08 ms |
+| Named arguments | 178.60 ms | 216.08 ms |
+
+These are headless request/response timings, excluding editor layout/rendering.
+The report records the installed manifest and JAR hashes. Kotlin JVM RSS after
+readiness/final sampling was 1.85/2.39 GiB; these are instantaneous values, not peak
+or whole-IDE memory. Evidence is in
+`target/kotlin-lsp-probe/report-packaged-final/results.json` and `EVIDENCE.md`.
+
+JFR sampling points to semantic extension-scope enumeration and applicability
+checking as substantial String-completion CPU work. Explicit and dot-triggered
+requests both return 495 candidates, approximately 270 KB. No supported small
+filter/cache fix was established. One active-file diagnostic warmup cost 1.87
+seconds before a 268 ms definition; it moves the cost and does not make it free.
+No extra production warmup or arbitrary completion filtering was added.
+
+The first larger-project editor run replaced its probe function before each
+sample. It passes 124 navigation/completion samples and Compose acceptance, but
+those completion timings are post-replacement measurements. Its apparent 3.5 s
+warm navigation delay was traced to a real duplicate-tab bug: cached library
+buffers had no filesystem entry/path, so workspace lookup created another editor
+on each jump. Test-only wrapping invariants amplified that cost. The shared
+lookup now reuses singleton views by exact underlying model identity, with
+three repeated definition jumps and existing pane-selection behavior covered.
+
+The final separate larger-project run passes **155 samples plus Compose command
+acceptance**. All 62 library jumps reuse one editor and keep exactly two tabs open.
+Completion deletes/retypes only the prefix in the same function/context. All three
+expected candidates rank first. Button acceptance takes 190 ms and inserts one
+import, a required block, and the correct caret. Source files remain unchanged.
+
+| Larger project, 30 repetitions after each first sample | Debug editor p50 / p95 | Wire p50 / p95 |
+| --- | ---: | ---: |
+| Definition after replacing source | 458 / 539 ms | 82.9 / 263.7 ms |
+| Definition with unchanged source | 352 / 366 ms | 1.4 / 3.2 ms |
+| String prefix refinement | 211 / 244 ms | 172.5 / 195.0 ms |
+| Modifier prefix refinement | 242 / 261 ms | 197.1 / 218.0 ms |
+| Named-argument prefix refinement | 637 / 784 ms | 518.9 / 659.5 ms |
+
+Persisted-index startup reaches import/index readiness in 5.99 seconds. The first
+post-edit definition is 5.47 seconds in this debug harness (1.98 seconds on the
+wire). A separate bounded stack sample after the fix attributes the remaining
+approximately 350 ms client interval to
+`change_selections → DisplayMap::snapshot → WrapSnapshot::check_invariants` and its
+nested all-row validation guarded by `#[cfg(test)]`. The final draw is about
+1.8 ms. This explains test overhead; release-app cold/warm latency remains
+unproven. The clean final timing run had no concurrent builds or profiling.
+
+Final owned RSS (debug client + Kotlin JVM) is 779 MiB at readiness and 1,380 MiB
+after the session; client RSS is 62/102 MiB and Kotlin 717/1,277 MiB. Shared Gradle
+daemons are listed separately (1,045/171 MiB); JDT and preview are inactive.
+Two snapshots over 155 operations are not a peak-memory, leak, or repeated-variant
+session test. The larger full-IDE budget remains open.
+
+Evidence: `target/kotlin-live-client-nav3-reuse/REPORT.md`, `summary.json`,
+`results.json`, `protocol-timings.json`, and the separate
+`target/kotlin-live-client-nav3-reuse-diagnostic/client-sample.txt`.
+The earlier baseline and diagnostic runs remain in `target/kotlin-live-client-nav3`
+and `target/kotlin-live-client-nav3-navigation`. Those initial measurements
+included duplicate tabs and different edit preparation and are not substituted
+for the final table. All GPUI measurements exclude the display compositor.
+
+Remaining gates before default promotion:
+
+1. Meet the cold/warm interaction budgets with controlled final engine/client
+   measurements. Larger-project long-session memory and variant-switch growth,
+   including active JDT and preview, still need a validated total-memory budget.
+2. Restoration refetches the exact archive URI after process restart, but cannot
+   prove the old archive is still in the current dependency model. It does not
+   remap to a different version. Live guest tabs retain ownership/read-only state;
+   restoring a closed guest tab after its host buffer disappears is unsupported.
+   Filesystem recent-file pickers remain filesystem-only.
+   For forwarded remote navigation, the host validates the completion session
+   before forwarding and the recipient checks the buffer version before applying
+   it. A later host model change can still race the recipient's UI update;
+   cross-host model-epoch coordination is not implemented. Text edits remain
+   guarded on the host.
+3. Generated-symbol support beyond resource-only task graphs remains limited;
+   projects whose generators require source compilation report degraded support.
+   Broader included-build/convention-plugin and source-download invalidation cases
+   need additional coverage before general Android import claims.
+4. Java remains owned by JDT. Java-origin cross-language refactoring and shared
+   selected-model refresh remain step 10 work. Steps 11–16 and daily-Android
+   rollout have not been claimed complete.
+
+Reproduction instructions are in
 [`examples/android-ide/README.md`](examples/android-ide/README.md).
 
-### Client and installer validation
+### Local commits for this increment
 
-The final client run passed all 12 selected tests: six tests across scheduler
-seeds 0–19, plus six single-seed regressions, for 126 GPUI iterations.
+- `89fafc9ac2` — Native Android import/source/Compose fixes, verified installation,
+  resource graph guard, and extended protocol checks.
+- `dff2314a0f` — Completion freshness, library identity/restoration/diagnostics,
+  tab reuse, and deterministic/live client checks.
+- `49471fc0f2` — Automatic managed Android model refresh and settings preservation.
 
-- The incremental command-completion regression and workspace-edit rejection
-  regression passed scheduler seeds 0–19. Both reproduced failures before the
-  production fixes: incorrect undo caret position and `applied: true` after a
-  rejected workspace edit.
-- Virtual-document URI/language/range/lifecycle and concurrent per-server
-  deduplication regressions passed seeds 0–19. They cover encoded URI paths,
-  source and JRT targets, nested definition/hover, malformed/missing content,
-  reimport, and closing an old handle after a replacement document opens.
-- Guest-sharing and delayed-response regressions also passed seeds 0–19.
-  The guest test uses actual remote stores and RPC handlers over test channels:
-  Java `.class`/JRT documents stay associated with Kotlin's server, language and
-  dynamic URI selectors survive sharing, role promotion preserves read-only
-  state, and malformed metadata becomes a load error. The host rejects text/undo
-  updates while accepting selection updates. Delayed hover reproduced obsolete
-  documentation before the model-ownership checks were added.
-- Existing definition, rename, multi-server hover, command-completion, and
-  community archive-startup regressions passed. Official settings preservation
-  passed, including explicit fallback and inherited profile settings.
-- All five `android_tools` tests, both installer fixture tests, and the protocol
-  probe self-test passed. A real checksum-verified official install, offline
-  cached reinstall, bundled Java startup, and server `--help` succeeded on
-  Apple Silicon macOS. Other platforms are outside this launcher's support.
-- `./script/clippy` passed all targets/features for `android_tools`, `android_ui`,
-  `editor`, `project`, `language`, and `proto`. Formatting and `git diff --check`
-  passed. The existing `block` dependency future-compatibility warning remains.
-
-Client build commands and per-test logs are in
-`target/kotlin-client-validation/commands.txt` and `results.json`. These tests use
-Zed's real editor/project code with fake LSP servers; they establish client
-behavior, not the real Kotlin server's semantic quality or performance.
-
-### Remaining editing gates and next increments
-
-1. Fix/obtain native exact-coordinate source attachment and correct dependent
-   library variant selection (steps 3–4). Do not turn the earlier manual
-   export/JSON experiment into a second production import pipeline.
-2. Complete automatic model refresh, generated-source handling beyond resources,
-   and virtual-document restoration/lifecycle checks against the real client.
-3. Finish stale completion/session rejection, Compose contributor behavior,
-   refactoring/diagnostics coverage, and measured end-to-end latency/memory gates
-   (remaining steps 6–9).
-4. Promote the backend only after those gates pass; daily Android and Studio
-   tooling work in steps 10–17 remains on the plan.
+The README review notice remains for the human author's manual confirmation.

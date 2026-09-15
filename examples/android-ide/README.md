@@ -26,10 +26,23 @@ script/install-android-kotlin --backend official
 script/android-ide --release --kotlin-backend official examples/android-ide
 ```
 
-Use **Configure official Kotlin** in the Android tools panel. It generates the
-selected variant's resources without assembling the app, so Kotlin compilation
-errors do not block import. Resource-generation failures show degraded generated
-symbol support while keeping the backend configured.
+Use **Configure official Kotlin** in the Android tools panel. The pinned
+`263.4702.0+android-1` build includes a source-built native importer patch for
+selected dependency variants, exact library sources, and dynamic features, plus
+semantic Compose completion and naming fixes. The installer verifies the upstream
+archive, public source, build dependencies, and installed patch. Its manifest and
+source license remain with the runtime.
+
+Setup requests the selected variant's resources. A Gradle task-graph guard stops
+the request before execution if it would compile Kotlin or Java; some resource
+tasks pull in library compilation. Generation failures report degraded generated
+symbol support while still configuring Kotlin. Gradle, dependency, resource,
+manifest, and selected-variant changes refresh the managed backend automatically.
+An unavailable selected variant pauses it until a valid variant is selected.
+Explicit community fallback and disabled-server settings are preserved.
+
+Library source and decompiled `jar:`/`jrt:` tabs support navigation, but their
+diagnostics are currently ignored.
 
 The Run menu's Android unit tests and lint actions operate on the selected
 variant. To check the fixture directly:
@@ -86,22 +99,89 @@ Use a fresh output directory for cold-index measurements. Gradle can write to th
 project and its normal caches; the probe briefly exports and removes
 `workspace.json`, and refuses a fixture that already has that file.
 
-Required assertion failures exit nonzero. The known original Compose source,
-nested source navigation, and trailing-lambda gaps are reported separately;
-add `--require-original-sources` to make original/nested-source checks required.
+Required assertion failures exit nonzero. Use `--require-original-sources` and
+`--require-compose` to require the source, nested-navigation, and Compose fixes
+included in the patched installation.
 `--variant fullRelease` also checks that the dependent library selects `release`;
-the tested server currently falls back to `greeting.debug`, which fails this gate.
+the unmodified pinned server falls back to `greeting.debug`, which fails this gate.
+The patched native importer passes both variants and original Compose source
+navigation.
+For a custom build type, pass both `--variant fullStaging` and
+`--expected-library-variant release` to check the intended `matchingFallbacks`.
+
+For another isolated Gradle project, `--model-only --module :app --variant debug`
+checks import/index readiness and the exported model without editing documents.
+Repeat `--expected-module <exact-exported-name>` for each required module, including
+dynamic feature main/test variants. Module names are matched exactly against the
+`active_modules` array in the report. Document and performance checks require the
+sample fixture and cannot be combined with `--model-only`.
+
+Add `--extended` to exercise references and rename across application, library,
+Kotlin and Java files, overload preservation, diagnostic clearing, quick fixes,
+organize imports, formatting, signature help, type/implementation navigation,
+and Compose completion contexts. Refactoring edits remain in memory; the probe
+checks every touched source file is unchanged on disk. `--require-compose` makes
+the Compose naming, required-lambda, and semantic named-argument ordering checks
+required and implies `--extended`.
+Java-origin requests remain explicit checks: Kotlin-origin rename can update Java
+usages even when the official server returns no rename or references from Java.
+
+Add `--performance-samples 30` for 30 samples each of warm definition, immediate
+unsaved Modifier completion, explicit and dot-triggered String completion, and
+named arguments. Reports include every latency, p50, nearest-rank p95, failures,
+hardware and instantaneous
+process RSS. The first definition is a separate single observation. These are
+headless request/response timings; they exclude editor input, buffer creation and
+rendering. Matching Gradle/JDT/preview/editor processes can belong to another
+workspace, so their RSS is not a controlled total-memory measurement. Use the
+same output directory for persistent-index restart comparisons and preserve its
+previous report before rerunning.
+`--warmup diagnostics`, `--warmup document-symbols`, and `--warmup hover` each
+issue one bounded request for the active file before the first definition and
+report that warmup cost separately from indexing readiness. `--jfr` captures a
+bounded Java Flight Recorder profile in the report directory; its overhead is
+included in that run's timings.
+
 This is a headless protocol check. Separate Zed client regressions cover
 incremental completion acceptance, command edits, caret undo/redo, workspace-edit
 failure reporting, and virtual-document ownership/lifecycle in
 `crates/editor/src/editor_tests.rs` and `crates/project/tests/integration/lsp_store.rs`.
-Expired completion sessions, real server semantics, and visible navigation latency
-remain separate validation gates.
+The client suite separately tests expired sessions and late responses after timeout.
+
+## Real editor check
+
+The ignored `test_real_kotlin_editor_completion_and_navigation` test uses the
+actual server, a GPUI test window, and unsaved source edits in an isolated Gradle
+project copy. Set `ZED_KOTLIN_CLIENT_PROBE_CONFIG` to an absolute JSON file containing
+`root`, a root-relative Kotlin `source`, absolute report `output`, `warm_samples`
+(at least 30 for percentile measurements), `completion_refinement: true`,
+`require_compose: true`, and the normal Zed `binary` and `initialization_options`
+objects for `kotlin-lsp`. Keep the server's
+`--system-path`, `idea.config.path`, and `idea.log.path` under the report directory;
+set `LSP_ANDROID_MODULE`, `LSP_ANDROID_VARIANT`, and project JDK in `binary.env`.
+Use the same Gradle initialization options as **Configure official Kotlin**.
+Prefix refinement deletes/retypes the completion prefix in the existing function;
+without it, each sample replaces the probe function. Optional
+`completion_warm_samples` overrides `warm_samples` for completion scenarios.
+
+```sh
+ZED_KOTLIN_CLIENT_PROBE_CONFIG=/absolute/path/probe.json \
+  cargo test -p editor --features project/test-support,gpui/inspector \
+  test_real_kotlin_editor_completion_and_navigation -- --ignored --nocapture
+```
+
+The test records first and warm navigation, displayed completion rank, acceptance,
+imports, caret, and process RSS; it verifies source text remains unchanged on disk.
+It excludes release rendering/GPU latency. Shared Gradle daemons are reported
+separately, and JDT/preview are inactive; this is not a complete IDE memory budget.
+Do not run builds or other performance probes during timing collection.
+
+## Java, debugging, and preview
 
 Run `script/install-android-kotlin`, `script/install-android-debugger`, and
 `script/install-android-preview` once before launching the IDE. **Configure Java**
-imports the selected variant into JDT LS; repeat Java and Kotlin setup after
-changing variants or dependencies.
+imports the selected variant into JDT LS; repeat Java setup after changing variants
+or dependencies. Managed official Kotlin setup refreshes automatically.
 
 **Debug** builds and launches the selected app, then attaches the native debugger.
 Set breakpoints on the return in `Greeting.java` and `LibraryGreeting.kt`; inspect
