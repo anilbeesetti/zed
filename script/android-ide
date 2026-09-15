@@ -5,11 +5,17 @@ repository=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 build_profile=debug
 build=true
 profile="$repository/target/android-ide/profile"
+kotlin_backend=${ANDROID_IDE_KOTLIN_BACKEND:-community}
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --release) build_profile=release; shift ;;
         --skip-build) build=false; shift ;;
+        --kotlin-backend)
+            [[ $# -ge 2 && -n "$2" ]] || { echo "--kotlin-backend requires official or community" >&2; exit 2; }
+            kotlin_backend=$2
+            shift 2
+            ;;
         --profile)
             [[ $# -ge 2 && -n "$2" ]] || { echo "--profile requires a directory" >&2; exit 2; }
             profile=$2
@@ -17,7 +23,8 @@ while [[ $# -gt 0 ]]; do
             ;;
         --help|-h)
             cat <<'USAGE'
-Usage: script/android-ide [--release] [--skip-build] [--profile DIR] [--] [PATH ...]
+Usage: script/android-ide [--release] [--skip-build] [--profile DIR]
+                          [--kotlin-backend official|community] [--] [PATH ...]
 
 Build and run the Android IDE development app on macOS. Paths are resolved from
 your current directory. Settings and extensions use target/android-ide/profile
@@ -25,8 +32,13 @@ unless --profile is supplied. Existing profile settings are preserved.
 
 Prerequisites: the repository's Rust toolchain, Xcode with Metal tools, Android
 CLI, Android SDK, and a Gradle-compatible JDK. Kotlin setup additionally needs
-JDK 21. Run script/install-android-kotlin for the pinned Kotlin server and rename
-fixes, and script/install-android-debugger for Java/Kotlin breakpoints and stepping.
+JDK 21. Run script/install-android-kotlin for the community Kotlin server, or add
+--backend official for the pinned JetBrains server with its bundled Java 25 runtime.
+Select it here with --kotlin-backend official (or ANDROID_IDE_KOTLIN_BACKEND).
+The default remains community. Run Android: Configure Kotlin in the project to
+apply the selected backend to existing settings. Custom server paths use
+ANDROID_IDE_OFFICIAL_KOTLIN_SERVER or ANDROID_IDE_KOTLIN_SERVER respectively.
+Run script/install-android-debugger for Java/Kotlin breakpoints and stepping.
 Run script/install-android-preview for standalone Compose previews.
 The Android Studio runtime is used for Gradle when JAVA_HOME is unset.
 
@@ -40,6 +52,21 @@ USAGE
         *) break ;;
     esac
 done
+
+case "$kotlin_backend" in
+    community) kotlin_server_id=kotlin-language-server ;;
+    official) kotlin_server_id=kotlin-lsp ;;
+    *) echo "Unknown Kotlin backend: $kotlin_backend; choose official or community." >&2; exit 2 ;;
+esac
+export ANDROID_IDE_KOTLIN_BACKEND="$kotlin_backend"
+kotlin_official_server="$repository/target/android-ide/dependencies/kotlin-lsp-263.4702.0/kotlin-server-263.4702.0/bin/intellij-server"
+if [[ -z ${ANDROID_IDE_OFFICIAL_KOTLIN_SERVER:-} && -x "$kotlin_official_server" ]]; then
+    export ANDROID_IDE_OFFICIAL_KOTLIN_SERVER="$kotlin_official_server"
+fi
+if [[ $kotlin_backend == official && ( ! -f ${ANDROID_IDE_OFFICIAL_KOTLIN_SERVER:-} || ! -x ${ANDROID_IDE_OFFICIAL_KOTLIN_SERVER:-} ) ]]; then
+    echo "Missing official Kotlin LSP; run script/install-android-kotlin --backend official or set ANDROID_IDE_OFFICIAL_KOTLIN_SERVER." >&2
+    exit 1
+fi
 
 [[ $(uname -s) == Darwin ]] || { echo "This development launcher currently supports macOS." >&2; exit 1; }
 case "$profile" in /*) ;; *) profile="$PWD/$profile" ;; esac
@@ -79,13 +106,23 @@ PLIST
 cp -c "$binary" "$executable" || cp "$binary" "$executable"
 
 if [[ ! -e "$profile/config/settings.json" ]]; then
-    cat > "$profile/config/settings.json" <<'SETTINGS'
-{
-  "auto_update": false,
-  "telemetry": { "diagnostics": false, "metrics": false },
-  "auto_install_extensions": { "kotlin": true, "java": true },
-  "languages": { "Kotlin": { "language_servers": ["kotlin-language-server"] } }
+    python3 - "$profile/config/settings.json" "$kotlin_server_id" "${ANDROID_IDE_OFFICIAL_KOTLIN_SERVER:-}" <<'SETTINGS'
+import json
+from pathlib import Path
+import sys
+
+settings = {
+    "auto_update": False,
+    "telemetry": {"diagnostics": False, "metrics": False},
+    "auto_install_extensions": {"kotlin": True, "java": True},
+    "languages": {"Kotlin": {"language_servers": [sys.argv[2]]}},
 }
+if sys.argv[2] == "kotlin-lsp":
+    settings["lsp"] = {"kotlin-lsp": {"binary": {
+        "path": str(Path(sys.argv[3]).resolve()),
+        "arguments": ["--stdio", "--data-sharing=none"],
+    }}}
+Path(sys.argv[1]).write_text(json.dumps(settings, indent=2) + "\n")
 SETTINGS
 fi
 
@@ -114,4 +151,5 @@ fi
 
 echo "App: $bundle"
 echo "Profile: $profile"
+echo "Kotlin backend: $kotlin_backend ($kotlin_server_id)"
 exec "$executable" --user-data-dir "$profile" "$@"

@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""Offline installer and launcher checks using a tiny local distribution."""
+
+import hashlib
+import json
+import os
+from pathlib import Path
+import runpy
+import shutil
+import subprocess
+import tempfile
+import unittest
+from unittest.mock import patch
+import zipfile
+
+
+class KotlinBootstrapTests(unittest.TestCase):
+    def test_official_install_restart_and_integrity(self):
+        bootstrap = runpy.run_path(str(Path(__file__).with_name("install-android-kotlin")))
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary = Path(temporary)
+            dependencies = temporary / "dependencies"
+            installation = dependencies / "official"
+            distribution = temporary / f"kotlin-server-{bootstrap['OFFICIAL_VERSION']}"
+            distribution.mkdir()
+            (distribution / "product-info.json").write_text(json.dumps({
+                "buildNumber": bootstrap["OFFICIAL_VERSION"], "minRequiredJavaVersion": 25,
+            }))
+            for name in ("bin/intellij-server", "jbr/Contents/Home/bin/java"):
+                executable = distribution / name
+                executable.parent.mkdir(parents=True, exist_ok=True)
+                executable.write_text("#!/bin/sh\nexit 0\n")
+                executable.chmod(0o755)
+            source = temporary / "source.zip"
+            with zipfile.ZipFile(source, "w") as archive:
+                for path in distribution.rglob("*"):
+                    archive.write(path, path.relative_to(temporary))
+            checksum = hashlib.sha256(source.read_bytes()).hexdigest()
+            with patch.dict(bootstrap["main"].__globals__, {
+                "DEPENDENCIES": dependencies, "OFFICIAL_INSTALLATION": installation,
+                "OFFICIAL_URL": source.as_uri(), "OFFICIAL_SHA256": checksum,
+            }):
+                bootstrap["main"]("official")
+                self.assertEqual((installation / ".sha256").read_text().strip(), checksum)
+                self.assertFalse((dependencies / "kotlin-language-server").exists())
+                with patch("urllib.request.urlopen", side_effect=AssertionError("Unexpected network request")):
+                    bootstrap["main"]("official")
+                    (installation / ".sha256").write_text("unrecognized installation")
+                    with self.assertRaisesRegex(RuntimeError, "Preserving"):
+                        bootstrap["main"]("official")
+                    (installation / ".sha256").write_text(checksum)
+                    (installation / distribution.name / "jbr/Contents/Home/bin/java").unlink()
+                    with self.assertRaisesRegex(RuntimeError, "incomplete"):
+                        bootstrap["main"]("official")
+                cached = dependencies / bootstrap["OFFICIAL_ARCHIVE"]
+                cached.write_bytes(b"corrupted archive")
+                with self.assertRaisesRegex(RuntimeError, "Checksum mismatch"):
+                    bootstrap["download"](cached.name, source.as_uri(), checksum)
+
+    def test_backend_selection_preserves_settings_and_project_java(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = Path(temporary)
+            launcher = repository / "script/android-ide"
+            launcher.parent.mkdir()
+            shutil.copy2(Path(__file__).with_name("android-ide"), launcher)
+            executable = repository / "target/debug/zed"
+            executable.parent.mkdir(parents=True)
+            executable.write_text(
+                "#!/usr/bin/env python3\nimport json, os\n"
+                "print(json.dumps({key: os.environ.get(key) for key in "
+                "['ANDROID_IDE_KOTLIN_BACKEND', 'ANDROID_IDE_KOTLIN_SERVER', "
+                "'ANDROID_IDE_OFFICIAL_KOTLIN_SERVER', 'JAVA_HOME']}))\n"
+            )
+            executable.chmod(0o755)
+            official = repository / "target/android-ide/dependencies/kotlin-lsp-263.4702.0/kotlin-server-263.4702.0/bin/intellij-server"
+            official.parent.mkdir(parents=True)
+            shutil.copy2(executable, official)
+            community = repository / "target/android-ide/dependencies/kotlin-language-server/bin/kotlin-language-server"
+            community.parent.mkdir(parents=True)
+            shutil.copy2(executable, community)
+            profile = repository / "profile with spaces"
+            environment = {key: value for key, value in os.environ.items()
+                           if not key.startswith("ANDROID_IDE_") and key != "CARGO_TARGET_DIR"}
+            environment["JAVA_HOME"] = "/project/jdk21"
+
+            def launch(*arguments):
+                return subprocess.run(
+                    [str(launcher), "--skip-build", "--profile", str(profile), *arguments],
+                    env=environment, text=True, capture_output=True,
+                )
+
+            result = launch("--kotlin-backend", "official")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            launched = json.loads(result.stdout.splitlines()[-1])
+            self.assertEqual(launched["ANDROID_IDE_KOTLIN_BACKEND"], "official")
+            self.assertEqual(launched["ANDROID_IDE_OFFICIAL_KOTLIN_SERVER"], str(official))
+            self.assertEqual(launched["JAVA_HOME"], "/project/jdk21")
+            settings = profile / "config/settings.json"
+            configured = json.loads(settings.read_text())
+            self.assertEqual(configured["languages"]["Kotlin"]["language_servers"], ["kotlin-lsp"])
+            self.assertEqual(configured["lsp"]["kotlin-lsp"]["binary"], {
+                "path": str(official.resolve()), "arguments": ["--stdio", "--data-sharing=none"],
+            })
+            existing_settings = '{"custom": "preserve exactly"}\n'
+            settings.write_text(existing_settings)
+            result = launch()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            launched = json.loads(result.stdout.splitlines()[-1])
+            self.assertEqual(launched["ANDROID_IDE_KOTLIN_BACKEND"], "community")
+            self.assertEqual(launched["ANDROID_IDE_KOTLIN_SERVER"], str(community))
+            self.assertEqual(settings.read_text(), existing_settings)
+            environment["ANDROID_IDE_KOTLIN_BACKEND"] = "official"
+            self.assertEqual(json.loads(launch().stdout.splitlines()[-1])["ANDROID_IDE_KOTLIN_BACKEND"], "official")
+            self.assertEqual(json.loads(launch("--kotlin-backend", "community").stdout.splitlines()[-1])["ANDROID_IDE_KOTLIN_BACKEND"], "community")
+            self.assertEqual(launch("--kotlin-backend", "unknown").returncode, 2)
+            self.assertEqual(launch("--kotlin-backend").returncode, 2)
+            official.unlink()
+            self.assertIn("Missing official Kotlin LSP", launch().stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()

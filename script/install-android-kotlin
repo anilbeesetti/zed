@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""Build the pinned community Kotlin server for the macOS Android IDE launcher."""
+"""Install a pinned Kotlin server for the macOS Android IDE launcher."""
 
+import argparse
 import hashlib
+import json
 import os
 from pathlib import Path
 import platform
@@ -18,6 +20,11 @@ JDK_SHA256 = "c487a1c3a56588b3a32d0d07cdd526bf3d401c4b8422be772ca178bfcd647f3f"
 REPOSITORY = Path(__file__).resolve().parent.parent
 DEPENDENCIES = REPOSITORY / "target/android-ide/dependencies"
 INSTALLATION = DEPENDENCIES / "kotlin-language-server"
+OFFICIAL_VERSION = "263.4702.0"
+OFFICIAL_SHA256 = "95da3fc6d3b9092c7616345044a05edb85e5408dc648d081e4e433595c892bec"
+OFFICIAL_ARCHIVE = f"kotlin-server-{OFFICIAL_VERSION}-aarch64.sit"
+OFFICIAL_URL = f"https://download.jetbrains.com/language-server/kotlin-server/{OFFICIAL_VERSION}/{OFFICIAL_ARCHIVE}"
+OFFICIAL_INSTALLATION = DEPENDENCIES / f"kotlin-lsp-{OFFICIAL_VERSION}"
 
 
 def download(name, url, expected):
@@ -42,10 +49,47 @@ def download(name, url, expected):
     return archive
 
 
-def main():
+def validate_official(installation):
+    distribution = installation / f"kotlin-server-{OFFICIAL_VERSION}"
+    product = json.loads((distribution / "product-info.json").read_text())
+    if product["buildNumber"] != OFFICIAL_VERSION or product["minRequiredJavaVersion"] != 25:
+        raise RuntimeError(f"Unexpected Kotlin LSP distribution in {installation}")
+    for executable in ("bin/intellij-server", "jbr/Contents/Home/bin/java"):
+        if not (distribution / executable).is_file() or not os.access(distribution / executable, os.X_OK):
+            raise RuntimeError(f"The Kotlin LSP installation is incomplete: {distribution / executable}")
+
+
+def install_official():
+    if OFFICIAL_INSTALLATION.exists() or OFFICIAL_INSTALLATION.is_symlink():
+        marker = OFFICIAL_INSTALLATION / ".sha256"
+        if OFFICIAL_INSTALLATION.is_symlink() or not marker.is_file() or marker.read_text().strip() != OFFICIAL_SHA256:
+            raise RuntimeError(f"Preserving the existing installation at {OFFICIAL_INSTALLATION}; move it aside first")
+        validate_official(OFFICIAL_INSTALLATION)
+        print(f"Already installed: {OFFICIAL_INSTALLATION}")
+        return
+    archive = download(OFFICIAL_ARCHIVE, OFFICIAL_URL, OFFICIAL_SHA256)
+    with tempfile.TemporaryDirectory(prefix="kotlin-official-", dir=DEPENDENCIES) as temporary:
+        distribution = Path(temporary) / "distribution"
+        # JetBrains' macOS .sit is a ZIP; ditto preserves its executable modes and runtime links.
+        subprocess.run(["/usr/bin/ditto", "-x", "-k", str(archive), str(distribution)], check=True)
+        validate_official(distribution)
+        (distribution / ".sha256").write_text(OFFICIAL_SHA256 + "\n")
+        (distribution / "SOURCE.txt").write_text(OFFICIAL_URL + "\nSHA-256: " + OFFICIAL_SHA256 + "\n")
+        distribution.rename(OFFICIAL_INSTALLATION)
+    print(f"Installed official Kotlin LSP {OFFICIAL_VERSION}: {OFFICIAL_INSTALLATION}")
+    print("Relaunch script/android-ide --kotlin-backend official, then run Android: Configure Kotlin.")
+    print("The server uses its bundled Java 25 runtime; Android Gradle setup still uses project JDK 21.")
+
+
+def main(backend="community"):
     if platform.system() != "Darwin" or platform.machine() != "arm64":
         raise RuntimeError("This bootstrap currently supports Apple Silicon macOS")
     DEPENDENCIES.mkdir(parents=True, exist_ok=True)
+    if backend == "official":
+        install_official()
+        return
+    if backend != "community":
+        raise RuntimeError(f"Unknown Kotlin backend: {backend}")
     if INSTALLATION.exists():
         if INSTALLATION.is_symlink() or not (INSTALLATION / ".revision").is_file() or (INSTALLATION / ".revision").read_text().strip() not in (REVISION, REVISION + "+android-sources-1", REVISION + "+android-sources-2", REVISION + "+android-sources-3", REVISION + "+android-sources-4", REVISION + "+android-sources-5", REVISION + "+android-sources-6", REVISION + "+android-sources-7", VERSION):
             raise RuntimeError(f"Preserving the existing installation at {INSTALLATION}; move it aside first")
@@ -108,4 +152,6 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--backend", choices=("community", "official"), default="community")
+    main(parser.parse_args().backend)
