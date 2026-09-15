@@ -203,6 +203,11 @@ impl ProjectEnvironment {
             return Task::ready(Some(cli_environment)).shared();
         }
 
+        // Archive entries have no shell working directory. Their server uses the project environment.
+        if fs::is_archive_path(&abs_path) {
+            return Task::ready(None).shared();
+        }
+
         self.local_environments
             .entry((shell.clone(), abs_path.clone()))
             .or_insert_with(|| {

@@ -149,13 +149,31 @@ async fn test_diagnostic_batches_skip_paths_without_worktrees(cx: &mut TestAppCo
 }
 
 #[gpui::test]
-async fn test_removing_invisible_worktree_cleans_reused_lsp_bookkeeping(cx: &mut TestAppContext) {
+async fn test_invisible_worktree_reuses_project_lsp_and_cleans_bookkeeping(
+    cx: &mut TestAppContext,
+) {
     init_test(cx);
     cx.executor().allow_parking();
 
+    cx.update_global::<settings::SettingsStore, _>(|store, cx| {
+        store
+            .set_user_settings(
+                &json!({"languages": {"Rust": {"language_servers": ["default-rust"]}}}).to_string(),
+                cx,
+            )
+            .unwrap();
+    });
     let fs = FakeFs::new(cx.executor());
-    fs.insert_tree(path!("/the-root"), json!({ "main.rs": "fn main() {}" }))
-        .await;
+    fs.insert_tree(
+        path!("/the-root"),
+        json!({
+            "main.rs": "fn main() {}",
+            ".zed": {"settings.json": json!({
+                "languages": {"Rust": {"language_servers": ["the-fake-language-server"]}}
+            }).to_string()}
+        }),
+    )
+    .await;
     fs.insert_tree(
         path!("/the-registry"),
         json!({ "dep": { "src": { "dep.rs": "pub fn dep() {}" } } }),
@@ -173,7 +191,7 @@ async fn test_removing_invisible_worktree_cleans_reused_lsp_bookkeeping(cx: &mut
         })
         .await
         .unwrap();
-    fake_servers.next().await.unwrap();
+    let fake_server = fake_servers.next().await.unwrap();
     cx.run_until_parked();
 
     let server_id = project.read_with(cx, |project, cx| {
@@ -197,6 +215,11 @@ async fn test_removing_invisible_worktree_cleans_reused_lsp_bookkeeping(cx: &mut
         .unwrap();
     cx.run_until_parked();
 
+    let _external_handle = project.update(cx, |project, cx| {
+        project.register_buffer_with_language_servers(&external_buffer, cx)
+    });
+    cx.run_until_parked();
+
     let invisible_worktree_id =
         external_buffer.read_with(cx, |buffer, cx| buffer.file().unwrap().worktree_id(cx));
     project.read_with(cx, |project, cx| {
@@ -209,6 +232,29 @@ async fn test_removing_invisible_worktree_cleans_reused_lsp_bookkeeping(cx: &mut
                 .has_language_server_seed_for_worktree(invisible_worktree_id)
         );
     });
+
+    fake_server.set_request_handler::<lsp::request::GotoDefinition, _, _>(|params, _| async move {
+        let uri = params.text_document_position_params.text_document.uri;
+        assert_eq!(
+            uri,
+            Uri::from_file_path(path!("/the-registry/dep/src/dep.rs")).unwrap()
+        );
+        Ok(Some(lsp::GotoDefinitionResponse::Scalar(
+            lsp::Location::new(
+                uri,
+                lsp::Range::new(lsp::Position::new(0, 7), lsp::Position::new(0, 10)),
+            ),
+        )))
+    });
+    let definitions = project
+        .update(cx, |project, cx| {
+            project.definitions(&external_buffer, 8, cx)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(definitions.len(), 1);
+    assert!(fake_servers.try_recv().is_err());
 
     project.update(cx, |project, cx| {
         project.remove_worktree(invisible_worktree_id, cx);

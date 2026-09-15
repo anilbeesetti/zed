@@ -143,9 +143,27 @@ impl LanguageServerTree {
         delegate: &Arc<dyn ManifestDelegate>,
         cx: &mut App,
     ) -> impl Iterator<Item = LanguageServerId> + 'a {
+        // External buffers inherit the project's server, including its local settings.
+        let reused = self
+            .instances
+            .get(&path.worktree_id)
+            .and_then(|servers| servers.roots.get(RelPath::empty()))
+            .into_iter()
+            .flat_map(|servers| servers.values())
+            .filter(|(node, languages)| {
+                node.disposition.path.worktree_id != path.worktree_id
+                    && languages.contains(&language_name)
+            })
+            .filter_map(|(node, _)| node.id.get().copied())
+            .collect::<Vec<_>>();
+        if !reused.is_empty() {
+            return reused.into_iter();
+        }
         let manifest_location = self.manifest_location_for_path(&path, manifest_name, delegate, cx);
         let adapters = self.adapters_for_language(&manifest_location, &language_name, cx);
         self.get_with_adapters(manifest_location, adapters)
+            .collect::<Vec<_>>()
+            .into_iter()
     }
 
     /// Get all language server root points for a given path and language; the language servers might already be initialized at a given path.

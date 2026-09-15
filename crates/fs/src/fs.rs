@@ -72,6 +72,10 @@ use smol::io::AsyncReadExt;
 #[cfg(feature = "test-support")]
 use std::ffi::OsStr;
 
+pub fn is_archive_path(path: &Path) -> bool {
+    ArchivePath::parse(path).is_some()
+}
+
 pub trait Watcher: Send + Sync {
     fn add(&self, path: &Path) -> Result<()>;
     fn remove(&self, path: &Path) -> Result<()>;
