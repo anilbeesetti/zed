@@ -754,3 +754,60 @@ are in `target/kotlin-rollout-validation/VALIDATION.md`. Correctness counts rema
 100 scheduler runs for each of Java lifecycle and late-adapter library restoration,
 all 27 LSP-store tests, and passing focused Clippy. The seven baseline Git-parking
 failures in the wider suite remain excluded from this change.
+
+
+### Persisted Kotlin library restoration coordination — 2026-09-15
+
+The restoration path now waits for the owning workspace's initial scan and local
+settings publication before comparing its saved settings fingerprint. Settings
+reads publish in scan order, and pending reads cannot republish a removed
+worktree's settings. Android startup waits for this same readiness before deciding
+whether the workspace uses managed official Kotlin.
+
+Managed Android sync, resource setup, and queued model refreshes publish their
+existing tasks to the LSP store. Persisted restoration waits for the current task;
+a newer managed setup cancels the old restoration attempt before it can use the
+superseded server. Setup waits for the written settings to reach the settings
+observer and for the existing restart task to finish shutdown and re-registration.
+Superseded setup results cannot defeat a newer setup, and removing the owning
+workspace ends the wait. Ordinary server failures still fail restoration; live
+history retains its original session, server, and model identity. The settings
+fingerprint, ownership checks, import-success requirement, request timeouts, and
+current-model URI resolution remain enforced.
+
+The expanded editor regression uses SQLite serialization and fresh projects and
+language registries for restart, an already registered adapter with still-loading
+local settings for workspace reopen, and setup-driven replacement during import.
+It also covers superseded setup, changed variant settings, reimported models,
+foreign sessions, failed/empty import, import timeout, and removal during pending
+setup. The Android panel regression checks startup sync and late setup around an
+already successful import and its replacement. Removing the coordination makes
+the reopen case fail; retaining settings readiness but removing setup coordination
+reproduces exactly `The library document's language server stopped during import`.
+
+The opt-in native editor probe now accepts `restore_library_tabs: true`. It
+serializes the actual original Compose `Typography.kt` location, shuts down its
+owner, then restores through fresh projects and real Kotlin processes, including
+an injected managed restart during import. It checks read-only ownership and exact
+source text. The probe uses `263.4702.0+android-2`, an isolated larger-project copy,
+RealFs, and a GPUI test window. It also retains the five navigation/completion
+smoke scenarios and Compose command acceptance. This is source-level restart and
+workspace lifecycle validation; a packaged application relaunch UI smoke was not
+rerun, and no new latency or memory claim comes from this run.
+
+Validation passes 100 scheduler seeds for editor persistence/restoration and 100
+seeds for each of the four Android Kotlin tests (500 runs total), all ten focused
+Kotlin tests, all 27 LSP-store integration tests, the native probe, protocol
+self-tests, focused `./script/clippy` for `project`, `editor`, and `android_ui`,
+formatting, and diff checks. Six settings integration tests pass; the seventh,
+`test_project_settings_disable_parking`, fails identically in the untouched earlier
+test binary and remains part of the previously recorded Git-parking baseline.
+
+Detailed commands, results, and remaining validation limits are recorded in this
+checkout's `target/kotlin-restoration-validation/VALIDATION.md`. No engine or
+default-backend change is included. Community remains the default and official
+remains opt-in. The earlier 117 required protocol checks, warm Compose navigation
+p95 of 26.06 ms, and String completion p95 of 961.40 ms remain the recorded backend
+baseline. Completion/first-analysis performance, longer-session memory,
+current-dependency-model archive ownership, broader import/generated-source
+coverage, and packaged-platform/distribution validation remain open promotion gates.

@@ -1362,6 +1362,7 @@ impl Project {
 
             let lsp_store = cx.new(|cx| {
                 LspStore::new_local(
+                    settings_observer.clone(),
                     buffer_store.clone(),
                     worktree_store.clone(),
                     prettier_store.clone(),
