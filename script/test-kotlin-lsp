@@ -453,6 +453,21 @@ def language_features(probe, source):
 
 
 def compose_features(probe, source):
+    for index, (value, expected, absent) in enumerate([
+        ('"hello"', "length", "inc"), ("42", "inc", "length"), ('"changed"', "length", "inc"),
+    ]):
+        response, items = completion(probe, source + f"\nprivate fun receiverFreshness() {{ val value = {value}; value.| }}\n")
+        labels = {item["label"].strip() for item in items}
+        probe.check(f"completion_receiver_freshness_{index}", expected in labels and absent not in labels,
+                    {"outcome": outcome(response), "expected": expected, "absent": absent, "labels": sorted(labels)})
+    for index, (declared, absent) in enumerate([
+        ("cacheFirst", "cacheSecond"), ("cacheSecond", "cacheFirst"), ("cacheFirst", "cacheSecond"),
+    ]):
+        marked = source + f'\nprivate fun String.{declared}() = this\nprivate fun nameFreshness() {{ "hello".cache| }}\n'
+        response, items = completion(probe, marked)
+        labels = {item["label"].strip() for item in items}
+        probe.check(f"completion_declaration_freshness_{index}", declared in labels and absent not in labels,
+                    {"outcome": outcome(response), "declared": declared, "absent": absent, "labels": sorted(labels)})
     cases = [
         ("button", "@Composable", "Button|", "Button", True),
         ("row", "@Composable", "Row|", "Row", True),

@@ -47,7 +47,7 @@ class KotlinBootstrapTests(unittest.TestCase):
                 feature = module.with_name("language-server.api.features.impl.kotlin.jar")
                 feature.write_bytes(b"patched Compose feature")
                 additional_modules = {}
-                for name in (bootstrap["OFFICIAL_MODEL_MODULE"], bootstrap["OFFICIAL_JAVA_MODULE"], bootstrap["OFFICIAL_COMMON_MODULE"]):
+                for name in (bootstrap["OFFICIAL_MODEL_MODULE"], bootstrap["OFFICIAL_JAVA_MODULE"], bootstrap["OFFICIAL_COMMON_MODULE"], bootstrap["OFFICIAL_FIR_MODULE"], bootstrap["OFFICIAL_FIR_PROVIDERS_MODULE"]):
                     additional_module = server / name
                     additional_module.parent.mkdir(parents=True, exist_ok=True)
                     additional_module.write_bytes(b"patched model and Java feature")
@@ -83,7 +83,7 @@ class KotlinBootstrapTests(unittest.TestCase):
                     with self.assertRaisesRegex(RuntimeError, "patch has changed"):
                         bootstrap["main"]("official")
                     feature.write_bytes(original_feature)
-                    for name in (bootstrap["OFFICIAL_MODEL_MODULE"], bootstrap["OFFICIAL_JAVA_MODULE"], bootstrap["OFFICIAL_COMMON_MODULE"]):
+                    for name in (bootstrap["OFFICIAL_MODEL_MODULE"], bootstrap["OFFICIAL_JAVA_MODULE"], bootstrap["OFFICIAL_COMMON_MODULE"], bootstrap["OFFICIAL_FIR_MODULE"], bootstrap["OFFICIAL_FIR_PROVIDERS_MODULE"]):
                         additional_module = installation / distribution.name / name
                         original_module = additional_module.read_bytes()
                         additional_module.write_bytes(b"changed model or Java feature")

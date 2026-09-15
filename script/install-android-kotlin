@@ -22,7 +22,7 @@ REPOSITORY = Path(__file__).resolve().parent.parent
 DEPENDENCIES = REPOSITORY / "target/android-ide/dependencies"
 INSTALLATION = DEPENDENCIES / "kotlin-language-server"
 OFFICIAL_VERSION = "263.4702.0"
-OFFICIAL_REVISION = OFFICIAL_VERSION + "+android-2"
+OFFICIAL_REVISION = OFFICIAL_VERSION + "+android-3"
 OFFICIAL_SHA256 = "95da3fc6d3b9092c7616345044a05edb85e5408dc648d081e4e433595c892bec"
 OFFICIAL_ARCHIVE = f"kotlin-server-{OFFICIAL_VERSION}-aarch64.sit"
 OFFICIAL_URL = f"https://download.jetbrains.com/language-server/kotlin-server/{OFFICIAL_VERSION}/{OFFICIAL_ARCHIVE}"
@@ -30,6 +30,8 @@ OFFICIAL_INSTALLATION = DEPENDENCIES / f"kotlin-lsp-{OFFICIAL_REVISION}"
 OFFICIAL_MODEL_MODULE = "plugins/kotlin.lsp/lib/modules/language-server.workspace-import.jar"
 OFFICIAL_JAVA_MODULE = "plugins/java-base.lsp/lib/modules/language-server.api.features.impl.java-base.jar"
 OFFICIAL_COMMON_MODULE = "lib/language-server.api.features.impl.common.jar"
+OFFICIAL_FIR_MODULE = "plugins/kotlin/lib/intellij.libraries.kotlinc.low.level.api.fir.jar"
+OFFICIAL_FIR_PROVIDERS_MODULE = "plugins/kotlin/lib/intellij.libraries.kotlinc.kotlin.compiler.fir.jar"
 
 
 def download(name, url, expected):
@@ -78,7 +80,8 @@ def validate_official_patch(installation):
             or manifest.get("feature_sha256") != hashlib.sha256(feature.read_bytes()).hexdigest()):
         raise RuntimeError(f"The native Kotlin importer or Compose patch has changed in {server}; preserve it and reinstall")
     expected_modules = {name: hashlib.sha256((server / name).read_bytes()).hexdigest()
-                        for name in (OFFICIAL_MODEL_MODULE, OFFICIAL_JAVA_MODULE, OFFICIAL_COMMON_MODULE)}
+                        for name in (OFFICIAL_MODEL_MODULE, OFFICIAL_JAVA_MODULE, OFFICIAL_COMMON_MODULE,
+                                     OFFICIAL_FIR_MODULE, OFFICIAL_FIR_PROVIDERS_MODULE)}
     if manifest.get("additional_modules") != expected_modules:
         raise RuntimeError(f"The Kotlin project model or Java refactoring patch has changed in {server}; preserve it and reinstall")
 
@@ -153,6 +156,8 @@ def patch_official(distribution, temporary):
                                  "workspace-import/src/com/jetbrains/ls/imports/gradle/GradleWorkspaceImporter.kt"]),
         (OFFICIAL_JAVA_MODULE, ["features-impl/java-base/src/com/jetbrains/ls/api/features/impl/javaBase/LSJavaBaseLanguageConfiguration.kt"]),
         (OFFICIAL_COMMON_MODULE, ["features-impl/common/src/com/jetbrains/ls/api/features/impl/common/processors/LSRenameProcessor.kt"]),
+        (OFFICIAL_FIR_MODULE, ["zed-completion/LLFirSoftLazyValue.kt"]),
+        (OFFICIAL_FIR_PROVIDERS_MODULE, ["zed-completion/FirCompositeSymbolProvider.kt"]),
     ):
         patched_module = server / module_name
         module_classes = temporary / (patched_module.stem + "-classes")

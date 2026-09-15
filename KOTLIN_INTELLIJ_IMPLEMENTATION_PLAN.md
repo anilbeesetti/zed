@@ -811,3 +811,83 @@ p95 of 26.06 ms, and String completion p95 of 961.40 ms remain the recorded back
 baseline. Completion/first-analysis performance, longer-session memory,
 current-dependency-model archive ownership, broader import/generated-source
 coverage, and packaged-platform/distribution validation remain open promotion gates.
+
+
+### Kotlin completion cache lifetime and cancellation — 2026-09-15
+
+The official runtime is now `263.4702.0+android-3`. FIR soft lazy values use
+IntelliJ's native `CachedValueImpl`: the server's `CachedValuesManager` wrapper
+otherwise puts even `NEVER_CHANGED` values in its per-snapshot cache, rebuilding
+shared library name sets after document edits. FIR sessions retain responsibility
+for invalidation, and the values remain soft references. The composite symbol
+provider indexes provider names by package, preserving provider order and the
+fallback for unknown names, special names, and synthetic function types. It does
+not cache completion results or reuse completion session IDs. Both patched JARs
+are covered by the installer integrity manifest.
+
+Completion menus now own their documentation-resolution task. Closing or replacing
+a menu cancels its remaining batch; visible documentation still resolves normally.
+Previously, detached batches continued resolving hidden entries while the next
+completion request was running. The server's serialized completion-session guard,
+acceptance ownership, cancellation checks, and stale edit/caret rejection remain.
+
+The real editor probe also has a release integration-test entry point, so the
+editor dependency runs without `cfg(test)` wrapping invariants. It loads the Kotlin
+extension's real grammar and measures input through menu rendering in a GPUI test
+window, using RealFs and the actual server process. The IO recorder now buffers JSON
+output: its old per-fragment disk writes inflated apparent client latency. Earlier
+unbuffered measurements are superseded and are not evidence of a production client
+rendering bottleneck.
+
+A controlled larger-project run uses an isolated copy of nav3-recipes (six Android
+modules, 116 Kotlin files, about 10,000 lines), app `debug`, project JDK 21 and the
+server's bundled JBR 25. It edits a short unsaved Kotlin function within that
+project. Each scenario records its first request separately and then all 30
+immediate repeats, with no additional warm-up or excluded slow repeats. Completion
+preparation deletes and retypes the prefix through editor actions. Explicit and
+automatic dot requests are separate scenarios. These measurements include the
+editor's input, LSP, menu and GPUI draw path; they do not measure OS presentation or
+a packaged application's input pipeline.
+
+| Scenario | android-2 warm p95 | android-3 warm p95 |
+| --- | ---: | ---: |
+| String members, explicit dot | 724.95 ms | 300.38 ms |
+| String members, automatic dot | 586.95 ms | 159.30 ms |
+| String prefixes `l` / `le` / `len` | 367.10 ms | 89.05 ms |
+| Modifier prefixes `p` / `pa` | 352.62 ms | 95.19 ms |
+| Named-argument prefixes `t` / `te` | 1,138.36 ms | 556.31 ms |
+| Original Compose definition after edit | 200.25 ms | 56.33 ms |
+| Original Compose definition unchanged | 4.84 ms | 5.97 ms |
+
+The first definition after import/index readiness is still 1,301.97 ms, exceeding
+500 ms; the first explicit String completion is 1,506.63 ms. Explicit completion's
+first several repeats also remain above 200 ms, so its 30-repeat p95 gate is **not
+met**. Automatic completion and warm navigation meet their respective 200/150 ms
+targets in this run. A verified sequential-runner experiment, earlier JVM
+compilation, additional compiler threads, and a shared Compose analysis session
+did not satisfy the explicit gate and are not included. Profiles locate the
+remaining work in local extension enumeration, applicability checking, lookup
+creation and analysis-context setup; no additional semantic cache was added.
+
+The 155 baseline/candidate completion responses contain identical candidate
+multisets. String, prefix and modifier ordering matches exactly. Named-argument
+ordering varies among ties across runs; the named-argument expectation remains
+first. The full native contract passes 123 required checks, including new
+String-to-Int-to-String receiver changes and unsaved extension renames. The three
+optional `prepareRename` probes still report the server's unsupported method.
+Original source navigation, Compose trailing-lambda insertion, import handling,
+and unchanged on-disk fixtures pass. Native memory samples are editor/server RSS
+snapshots only, not peak physical-footprint or long-session leak evidence.
+
+Reproduce the release probe with `cargo test -p editor --test kotlin_latency
+--features test-support,gpui/inspector --release --no-run`, then run the resulting
+binary with `ZED_HEADLESS=1`, `ZED_KOTLIN_CLIENT_PROBE_CONFIG` pointing to an isolated
+fixture/server configuration, and `real_kotlin_latency --ignored --nocapture`.
+Editor validation passes all 57 completion tests and 100 scheduler seeds each for
+the new cancellation regression and three Kotlin stale-session guards (400 runs).
+All 27 LSP-store integration tests, focused `./script/clippy` for editor and
+android_tools, all four Android Kotlin bootstrap tests, installer checks, and
+protocol self-test pass. Detailed commands, raw samples,
+wire logs, profile summaries, and integrity fingerprints are retained in `target/kotlin-completion-latency` in the validation
+checkout. Community remains the default and official remains opt-in. Explicit
+completion and first-analysis latency remain open promotion gates.

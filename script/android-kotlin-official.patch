@@ -306,3 +306,133 @@
                  throwLspError(RenameRequestType, "This element cannot be renamed", Unit, ErrorCodes.InvalidParams)
              }
              return LSRenameProcessor(target.project, target, context.newName, false, false)
+--- /dev/null
++++ b/zed-completion/LLFirSoftLazyValue.kt
+@@ -0,0 +1,24 @@
++/*
++ * Copyright 2010-2024 JetBrains s.r.o. and Kotlin Programming Language contributors.
++ * Use of this source code is governed by the Apache 2.0 license that can be found in the license/LICENSE.txt file.
++ */
++
++// Adapted from JetBrains/kotlin@7835533005e2359b3a9d5bb767337082e6f6bcbc for the pinned 2.5.0-dev-5674 ABI.
++package org.jetbrains.kotlin.analysis.low.level.api.fir.caches
++
++import com.intellij.openapi.project.Project
++import com.intellij.openapi.util.ModificationTracker
++import com.intellij.psi.util.CachedValue
++import com.intellij.psi.util.CachedValueProvider
++import com.intellij.util.CachedValueImpl
++import org.jetbrains.kotlin.fir.caches.FirLazyValue
++
++internal class LLFirSoftLazyValue<V>(@Suppress("UNUSED_PARAMETER") project: Project, createValue: () -> V) : FirLazyValue<V>() {
++    // The server wraps CachedValuesManager values per snapshot, even with NEVER_CHANGED.
++    // FIR sessions already own invalidation; retain their soft values across document edits.
++    private val cachedValue: CachedValue<V> = CachedValueImpl {
++        CachedValueProvider.Result(createValue(), ModificationTracker.NEVER_CHANGED)
++    }
++
++    override fun getValue(): V = cachedValue.getValue()
++}
+--- /dev/null
++++ b/zed-completion/FirCompositeSymbolProvider.kt
+@@ -0,0 +1,100 @@
++/*
++ * Copyright 2010-2023 JetBrains s.r.o. and Kotlin Programming Language contributors.
++ * Use of this source code is governed by the Apache 2.0 license that can be found in the license/LICENSE.txt file.
++ */
++
++// Adapted from JetBrains/kotlin@7835533005e2359b3a9d5bb767337082e6f6bcbc for the pinned 2.5.0-dev-5674 ABI.
++package org.jetbrains.kotlin.fir.resolve.providers.impl
++
++import org.jetbrains.kotlin.fir.caches.createCache
++import org.jetbrains.kotlin.fir.caches.firCachesFactory
++import org.jetbrains.kotlin.fir.caches.getValue
++import org.jetbrains.kotlin.fir.FirSession
++import org.jetbrains.kotlin.fir.NoMutableState
++import org.jetbrains.kotlin.fir.resolve.providers.FirCompositeCachedSymbolNamesProvider
++import org.jetbrains.kotlin.fir.resolve.providers.FirSymbolNamesProvider
++import org.jetbrains.kotlin.fir.resolve.providers.FirSymbolProvider
++import org.jetbrains.kotlin.fir.resolve.providers.FirSymbolProviderInternals
++import org.jetbrains.kotlin.fir.symbols.impl.FirCallableSymbol
++import org.jetbrains.kotlin.fir.symbols.impl.FirClassLikeSymbol
++import org.jetbrains.kotlin.fir.symbols.impl.FirNamedFunctionSymbol
++import org.jetbrains.kotlin.fir.symbols.impl.FirPropertySymbol
++import org.jetbrains.kotlin.name.ClassId
++import org.jetbrains.kotlin.name.FqName
++import org.jetbrains.kotlin.name.Name
++
++@NoMutableState
++class FirCompositeSymbolProvider(session: FirSession, val providers: List<FirSymbolProvider>) : FirSymbolProvider(session) {
++    private fun indexProviders(namesForProvider: (FirSymbolProvider) -> Set<Name>?): Pair<Map<Name, List<FirSymbolProvider>>, List<FirSymbolProvider>> {
++        val providersByName = mutableMapOf<Name, MutableList<FirSymbolProvider>>()
++        val unknownProviders = mutableListOf<FirSymbolProvider>()
++        // Unknown name sets participate in every lookup, in the original provider order.
++        for (provider in providers) {
++            val names = namesForProvider(provider)
++            if (names == null) {
++                unknownProviders.add(provider)
++                providersByName.values.forEach { it.add(provider) }
++            } else {
++                names.forEach { name -> providersByName.getOrPut(name) { unknownProviders.toMutableList() }.add(provider) }
++            }
++        }
++        return providersByName to unknownProviders
++    }
++
++    private val callableNamesByPackage by session.firCachesFactory.createPossiblySoftLazyValue {
++        session.firCachesFactory.createCache { packageName: FqName ->
++            indexProviders { it.symbolNamesProvider.getTopLevelCallableNamesInPackage(packageName) }
++        }
++    }
++
++    private val classifierNamesByPackage by session.firCachesFactory.createPossiblySoftLazyValue {
++        session.firCachesFactory.createCache { packageName: FqName ->
++            indexProviders { if (it.symbolNamesProvider.mayHaveSyntheticFunctionTypes) null else it.symbolNamesProvider.getTopLevelClassifierNamesInPackage(packageName) }
++        }
++    }
++
++    private fun callableProviders(packageName: FqName, name: Name): List<FirSymbolProvider> {
++        if (name.isSpecial) return providers
++        val (providersByName, unknownProviders) = callableNamesByPackage.getValue(packageName)
++        return providersByName[name] ?: unknownProviders
++    }
++
++    override val symbolNamesProvider: FirSymbolNamesProvider = FirCompositeCachedSymbolNamesProvider.fromSymbolProviders(session, providers)
++
++    override fun getTopLevelCallableSymbols(packageFqName: FqName, name: Name): List<FirCallableSymbol<*>> {
++        return callableProviders(packageFqName, name).flatMap { it.getTopLevelCallableSymbols(packageFqName, name) }
++    }
++
++    @FirSymbolProviderInternals
++    override fun getTopLevelCallableSymbolsTo(destination: MutableList<FirCallableSymbol<*>>, packageFqName: FqName, name: Name) {
++        destination += getTopLevelCallableSymbols(packageFqName, name)
++    }
++
++    @FirSymbolProviderInternals
++    override fun getTopLevelFunctionSymbolsTo(destination: MutableList<FirNamedFunctionSymbol>, packageFqName: FqName, name: Name) {
++        callableProviders(packageFqName, name).forEach {
++            it.getTopLevelFunctionSymbolsTo(destination, packageFqName, name)
++        }
++    }
++
++    @FirSymbolProviderInternals
++    override fun getTopLevelPropertySymbolsTo(destination: MutableList<FirPropertySymbol>, packageFqName: FqName, name: Name) {
++        callableProviders(packageFqName, name).forEach {
++            it.getTopLevelPropertySymbolsTo(destination, packageFqName, name)
++        }
++    }
++
++    override fun hasPackage(fqName: FqName): Boolean {
++        return providers.any { it.hasPackage(fqName) }
++    }
++
++    override fun getClassLikeSymbolByClassId(classId: ClassId): FirClassLikeSymbol<*>? {
++        val name = classId.outermostClassId.shortClassName
++        val candidates = if (name.isSpecial) providers else {
++            val (providersByName, unknownProviders) = classifierNamesByPackage.getValue(classId.packageFqName)
++            providersByName[name] ?: unknownProviders
++        }
++        return candidates.firstNotNullOfOrNull { it.getClassLikeSymbolByClassId(classId) }
++    }
++
++}
