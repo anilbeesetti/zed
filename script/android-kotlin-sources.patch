@@ -11,6 +11,40 @@
  )
 
  data class InlayHintsConfiguration(
+--- a/server/src/main/kotlin/org/javacs/kt/KotlinTextDocumentService.kt
++++ b/server/src/main/kotlin/org/javacs/kt/KotlinTextDocumentService.kt
+@@ -50,6 +50,7 @@
+     var debounceLint = Debouncer(Duration.ofMillis(config.diagnostics.debounceTime))
+     val lintTodo = mutableSetOf<URI>()
+     var lintCount = 0
++    private var workspaceIndexPending = false
+
+     var lintRecompilationCallback: () -> Unit
+         get() = sp.beforeCompileCallback
+@@ -276,7 +277,14 @@
+     }
+
+     fun lintAll() {
+-        debounceLint.submitImmediately {
++        workspaceIndexPending = true
++        // Give the initial didOpen a chance to prioritize the file the user is reading.
++        debounceLint.schedule { indexWorkspaceIfPending() }
++    }
++
++    private fun indexWorkspaceIfPending() {
++        if (workspaceIndexPending) {
++            workspaceIndexPending = false
+             sp.compileAllFiles()
+             sp.saveAllFiles()
+             sp.refreshDependencyIndexes()
+@@ -307,6 +315,7 @@
+             reportDiagnostics(files, context.diagnostics)
+         }
+         lintCount++
++        if (!cancelCallback()) indexWorkspaceIfPending()
+     }
+
+     private fun reportDiagnostics(compiled: Collection<URI>, kotlinDiagnostics: Diagnostics) {
 --- a/server/src/main/kotlin/org/javacs/kt/KotlinWorkspaceService.kt
 +++ b/server/src/main/kotlin/org/javacs/kt/KotlinWorkspaceService.kt
 @@ -186,7 +186,9 @@
@@ -23,6 +57,64 @@
              }
          }
 
+--- a/server/src/main/kotlin/org/javacs/kt/SourceFiles.kt
++++ b/server/src/main/kotlin/org/javacs/kt/SourceFiles.kt
+@@ -75,7 +75,7 @@
+
+     fun open(uri: URI, content: String, version: Int) {
+         if (isIncluded(uri)) {
+-            files[uri] = SourceVersion(content, version, languageOf(uri), isTemporary = false)
++            files[uri] = SourceVersion(content, version, languageOf(uri), isTemporary = uri.scheme == "kls" || uri.path?.contains("!/") == true)
+             open.add(uri)
+         }
+     }
+--- a/server/src/main/kotlin/org/javacs/kt/SourcePath.kt
++++ b/server/src/main/kotlin/org/javacs/kt/SourcePath.kt
+@@ -28,6 +28,8 @@
+ ) {
+     private val files = mutableMapOf<URI, SourceFile>()
+     private val parseDataWriteLock = ReentrantLock()
++    // Navigation must get a turn between background indexing batches.
++    private val compilationLock = ReentrantLock(true)
+
+     private val indexAsync = AsyncExecutor()
+     var indexEnabled: Boolean by indexingConfig::enabled
+@@ -98,6 +100,7 @@
+
+             val oldFile = clone()
+
++            beforeCompileCallback.invoke()
+             val (context, module) = cp.compiler.compileKtFile(parsed!!, allIncludingThis(), kind)
+             parseDataWriteLock.withLock {
+                 compiledContext = context
+@@ -108,7 +111,8 @@
+             refreshWorkspaceIndexes(listOfNotNull(oldFile), listOfNotNull(this))
+         }
+
+-        private fun doCompileIfChanged() {
++        // Diagnostics and first navigation must share the result of an in-flight compilation.
++        private fun doCompileIfChanged() = compilationLock.withLock {
+             if (parsed?.text != compiledFile?.text) {
+                 doCompile()
+             }
+@@ -193,7 +197,7 @@
+     /**
+      * Compile changed files
+      */
+-    fun compileFiles(all: Collection<URI>): BindingContext {
++    fun compileFiles(all: Collection<URI>): BindingContext = compilationLock.withLock {
+         // Figure out what has changed
+         val sources = all.map { files[it]!! }
+         val allChanged = sources.filter { it.content != it.compiledFile?.text }
+@@ -338,7 +342,7 @@
+     /**
+      * Recompiles all source files that are initialized.
+      */
+-    fun refresh() {
++    fun refresh() = compilationLock.withLock {
+         val initialized = files.values.any { it.parsed != null }
+         if (initialized) {
+             LOG.info("Refreshing source path")
 --- a/server/src/main/kotlin/org/javacs/kt/URIContentProvider.kt
 +++ b/server/src/main/kotlin/org/javacs/kt/URIContentProvider.kt
 @@ -13,7 +13,10 @@
@@ -293,7 +385,7 @@
 +}
 --- a/server/src/test/kotlin/org/javacs/kt/DefinitionTest.kt
 +++ b/server/src/test/kotlin/org/javacs/kt/DefinitionTest.kt
-@@ -75,3 +75,89 @@
+@@ -75,3 +75,141 @@
          assertThat(ranges, hasItem(equalTo(expect)))
      }
  }
@@ -377,9 +469,61 @@
 +                org.junit.Assert.assertTrue("$reference should resolve to $declaration at $targetOffset", targetOffset in library.indexOf(declaration) until library.indexOf(declaration) + declaration.length)
 +                org.junit.Assert.assertTrue(destination.range.end.character > destination.range.start.character)
 +            }
++            val archiveUri = java.net.URI(archive.toUri().toString() + "!/commonMain/external/Symbols.android.kt")
++            server.sourceFiles.open(archiveUri, library, 1)
++            org.junit.Assert.assertFalse(server.sourcePath.all().any { it.text == library })
++            org.junit.Assert.assertEquals(library, server.sourcePath.content(archiveUri))
++            server.sourceFiles.close(archiveUri)
 +        } finally {
 +            server.close()
 +            directory.toFile().deleteRecursively()
++        }
++    }
++}
++
++
++class ConcurrentDefinitionTest {
++    @Test fun `first navigation reuses in flight diagnostics compilation`() {
++        val server = KotlinLanguageServer()
++        val workers = java.util.concurrent.Executors.newFixedThreadPool(2)
++        val compiling = java.util.concurrent.CountDownLatch(1)
++        val releaseCompilation = java.util.concurrent.CountDownLatch(1)
++        val duplicateCompilation = java.util.concurrent.CountDownLatch(1)
++        val navigationStarted = java.util.concurrent.CountDownLatch(1)
++        val compilationCount = java.util.concurrent.atomic.AtomicInteger()
++        try {
++            val sourcePath = server.sourcePath
++            sourcePath.indexEnabled = false
++            val uri = java.net.URI("file:///cold-navigation.kt")
++            sourcePath.put(uri, "val answer = 42", null)
++            val declaration = sourcePath.parsedFile(uri).declarations.single()
++            sourcePath.beforeCompileCallback = {
++                if (compilationCount.incrementAndGet() == 1) {
++                    compiling.countDown()
++                    check(releaseCompilation.await(10, java.util.concurrent.TimeUnit.SECONDS))
++                } else duplicateCompilation.countDown()
++            }
++            val diagnostics = workers.submit<org.jetbrains.kotlin.resolve.BindingContext> { sourcePath.compileFiles(listOf(uri)) }
++            org.junit.Assert.assertTrue(compiling.await(10, java.util.concurrent.TimeUnit.SECONDS))
++            val navigation = workers.submit<CompiledFile> {
++                navigationStarted.countDown()
++                sourcePath.latestCompiledVersion(uri)
++            }
++            org.junit.Assert.assertTrue(navigationStarted.await(10, java.util.concurrent.TimeUnit.SECONDS))
++            org.junit.Assert.assertFalse("Navigation started a duplicate compilation", duplicateCompilation.await(200, java.util.concurrent.TimeUnit.MILLISECONDS))
++            releaseCompilation.countDown()
++            val diagnosticsContext = diagnostics.get(10, java.util.concurrent.TimeUnit.SECONDS)
++            val navigationContext = navigation.get(10, java.util.concurrent.TimeUnit.SECONDS).compile
++            org.junit.Assert.assertEquals(1, compilationCount.get())
++            org.junit.Assert.assertNotNull(diagnosticsContext[org.jetbrains.kotlin.resolve.BindingContext.DECLARATION_TO_DESCRIPTOR, declaration])
++            org.junit.Assert.assertSame(
++                diagnosticsContext[org.jetbrains.kotlin.resolve.BindingContext.DECLARATION_TO_DESCRIPTOR, declaration],
++                navigationContext[org.jetbrains.kotlin.resolve.BindingContext.DECLARATION_TO_DESCRIPTOR, declaration])
++        } finally {
++            releaseCompilation.countDown()
++            workers.shutdown()
++            check(workers.awaitTermination(20, java.util.concurrent.TimeUnit.SECONDS))
++            server.close()
 +        }
 +    }
 +}
