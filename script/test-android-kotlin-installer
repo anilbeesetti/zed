@@ -46,12 +46,19 @@ class KotlinBootstrapTests(unittest.TestCase):
                 compose_path = Path(__file__).with_name("android-kotlin-compose.kt")
                 feature = module.with_name("language-server.api.features.impl.kotlin.jar")
                 feature.write_bytes(b"patched Compose feature")
+                additional_modules = {}
+                for name in (bootstrap["OFFICIAL_MODEL_MODULE"], bootstrap["OFFICIAL_JAVA_MODULE"], bootstrap["OFFICIAL_COMMON_MODULE"]):
+                    additional_module = server / name
+                    additional_module.parent.mkdir(parents=True, exist_ok=True)
+                    additional_module.write_bytes(b"patched model and Java feature")
+                    additional_modules[name] = hashlib.sha256(additional_module.read_bytes()).hexdigest()
                 (server / "zed-native-importer.json").write_text(json.dumps({
                     "revision": bootstrap["OFFICIAL_REVISION"], "base_sha256": checksum,
                     "patch_sha256": hashlib.sha256(patch_path.read_bytes()).hexdigest(),
                     "module": module_path, "module_sha256": hashlib.sha256(module.read_bytes()).hexdigest(),
                     "compose_sha256": hashlib.sha256(compose_path.read_bytes()).hexdigest(),
                     "feature_sha256": hashlib.sha256(feature.read_bytes()).hexdigest(),
+                    "additional_modules": additional_modules,
                 }))
 
             with patch.dict(bootstrap["main"].__globals__, {
@@ -76,6 +83,13 @@ class KotlinBootstrapTests(unittest.TestCase):
                     with self.assertRaisesRegex(RuntimeError, "patch has changed"):
                         bootstrap["main"]("official")
                     feature.write_bytes(original_feature)
+                    for name in (bootstrap["OFFICIAL_MODEL_MODULE"], bootstrap["OFFICIAL_JAVA_MODULE"], bootstrap["OFFICIAL_COMMON_MODULE"]):
+                        additional_module = installation / distribution.name / name
+                        original_module = additional_module.read_bytes()
+                        additional_module.write_bytes(b"changed model or Java feature")
+                        with self.assertRaisesRegex(RuntimeError, "patch has changed"):
+                            bootstrap["main"]("official")
+                        additional_module.write_bytes(original_module)
                     (installation / ".sha256").write_text("unrecognized installation")
                     with self.assertRaisesRegex(RuntimeError, "Preserving"):
                         bootstrap["main"]("official")
@@ -89,6 +103,7 @@ class KotlinBootstrapTests(unittest.TestCase):
                     bootstrap["download"](cached.name, source.as_uri(), checksum)
 
     def test_backend_selection_preserves_settings_and_project_java(self):
+        bootstrap = runpy.run_path(str(Path(__file__).with_name("install-android-kotlin")))
         with tempfile.TemporaryDirectory() as temporary:
             repository = Path(temporary)
             launcher = repository / "script/android-ide"
@@ -103,7 +118,7 @@ class KotlinBootstrapTests(unittest.TestCase):
                 "'ANDROID_IDE_OFFICIAL_KOTLIN_SERVER', 'JAVA_HOME']}))\n"
             )
             executable.chmod(0o755)
-            official = repository / "target/android-ide/dependencies/kotlin-lsp-263.4702.0+android-1/kotlin-server-263.4702.0/bin/intellij-server"
+            official = repository / f"target/android-ide/dependencies/kotlin-lsp-{bootstrap['OFFICIAL_REVISION']}/kotlin-server-{bootstrap['OFFICIAL_VERSION']}/bin/intellij-server"
             official.parent.mkdir(parents=True)
             shutil.copy2(executable, official)
             community = repository / "target/android-ide/dependencies/kotlin-language-server/bin/kotlin-language-server"

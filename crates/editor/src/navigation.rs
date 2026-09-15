@@ -1042,11 +1042,15 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<Navigated>> {
+        let started = Instant::now();
         let definition =
             self.go_to_definition_of_kind(GotoDefinitionKind::Symbol, false, window, cx);
         let fallback_strategy = EditorSettings::get_global(cx).go_to_definition_fallback;
         cx.spawn_in(window, async move |editor, cx| {
             if definition.await? == Navigated::Yes {
+                cx.update(|window, _| {
+                    Editor::trace_interaction_latency("definition", started, window)
+                })?;
                 return Ok(Navigated::Yes);
             }
             match fallback_strategy {

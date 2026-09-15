@@ -1059,7 +1059,7 @@ impl AndroidPanel {
         android_tools::kotlin::finish_official(root, previous, updated)
     }
 
-    fn restart_official_kotlin(&self, root: &Path, cx: &mut App) {
+    fn restart_language_server(&self, root: &Path, name: &str, cx: &mut App) {
         let project = self.project.read(cx);
         let Some(worktree_id) = project
             .visible_worktrees(cx)
@@ -1073,7 +1073,7 @@ impl AndroidPanel {
             .read(cx)
             .language_server_statuses()
             .filter(|(_, status)| {
-                status.name.0.as_ref() == "kotlin-lsp" && status.worktree == Some(worktree_id)
+                status.name.0.as_ref() == name && status.worktree == Some(worktree_id)
             })
             .map(|(id, _)| lsp::LanguageServerSelector::Id(id))
             .collect::<collections::HashSet<_>>();
@@ -1133,15 +1133,18 @@ impl AndroidPanel {
                     let root = root.clone();
                     let target = target.clone();
                     let java_home = java_home.clone();
+                    let server_binary = server_binary.clone();
                     async move {
                         let program = if cfg!(windows) { root.join("gradlew.bat") } else { PathBuf::from("/bin/sh") };
                         let mut arguments = if cfg!(windows) { Vec::new() } else { vec!["./gradlew".into()] };
-                        arguments.extend(["--init-script".into(), resource_guard.to_string_lossy().into_owned(), target.gradle_task("process", "Resources"), "--no-configuration-cache".into(), "--console=plain".into()]);
+                        let server = server_binary.parent().and_then(Path::parent).context("The Kotlin server has no distribution directory")?;
+                        arguments.extend(["--init-script".into(), resource_guard.to_string_lossy().into_owned(), format!("-Dzed.android.kotlinServer={}", server.display()), kotlin::RESOURCE_GENERATION_TASK.into(), "--no-configuration-cache".into(), "--console=plain".into()]);
                         let mut command = new_command(program);
-                        command.args(arguments).current_dir(&root).env("JAVA_HOME", &java_home);
-                        command_output(command, &executor, Duration::from_secs(300)).await.err()
+                        command.args(arguments).current_dir(&root).env("JAVA_HOME", &java_home)
+                            .env("LSP_ANDROID_MODULE", &target.module).env("LSP_ANDROID_VARIANT", &target.variant);
+                        command_output(command, &executor, Duration::from_secs(300)).await
                     }
-                }).await;
+                }).await.err();
                 panel.update_in(cx, |panel, _, cx| {
                     panel.validate_official_kotlin_target(&root, &target, cx)?;
                     let updated = official_kotlin_settings(previous.clone(), &root, &target, &java_home, &server_binary, cx)?;
@@ -1156,7 +1159,10 @@ impl AndroidPanel {
                     Ok(generation_error) => {
                         panel.status = format!("Official Kotlin {} configured. Open a Kotlin file and wait for import and indexing. Variant and Gradle input changes refresh automatically.", kotlin::OFFICIAL_REVISION).into();
                         panel.error = generation_error.map(|error| format!("Android resource generation failed; generated symbols may be unavailable. Kotlin import can still proceed.\n{error:#}"));
-                        panel.restart_official_kotlin(&root, cx);
+                        panel.restart_language_server(&root, "kotlin-lsp", cx);
+                        if android_tools::java::is_configured(&root) {
+                            panel.configure_java(target, window, cx);
+                        }
                     }
                     Err(error) => panel.fail(error, window, cx),
                 }
@@ -1187,6 +1193,7 @@ impl AndroidPanel {
             let result = async {
                 let (models, previous) = cx.background_spawn({
                     let root = root.clone();
+                    let target = target.clone();
                     async move {
                         let init = java::prepare(&root)?;
                         let program = if cfg!(windows) { root.join("gradlew.bat") } else { PathBuf::from("/bin/sh") };
@@ -1200,6 +1207,8 @@ impl AndroidPanel {
                 }).await?;
                 let updated = panel.update_in(cx, |panel, _, cx| {
                     ensure!(panel.trusted_root(cx)? == root, "The Android project changed during Java setup");
+                    ensure!(panel.selected_target.as_ref() == Some(&target) && panel.targets.contains(&target),
+                        "The selected Android variant changed during Java setup. Retry to refresh the current variant.");
                     java_settings(previous.clone(), &root, cx)
                 })??;
                 // JDT LS refreshes persisted Gradle arguments only when the root project is updated.
@@ -1217,9 +1226,10 @@ impl AndroidPanel {
                 panel.running = false;
                 match result {
                     Ok(refresh) => {
+                        let root = refresh.0.clone();
                         panel.java_refresh = Some(refresh);
-                        panel.status = "Java configured. Open a Java file to import the selected variant; run setup again after variant or dependency changes.".into();
-                        panel.project.read(cx).lsp_store().update(cx, |store, cx| store.restart_all_language_servers(cx));
+                        panel.status = "Java model configured. Official Kotlin setup also refreshes this model after variant and Gradle input changes.".into();
+                        panel.restart_language_server(&root, "jdtls", cx);
                     }
                     Err(error) => panel.fail(error, window, cx),
                 }
@@ -2117,6 +2127,14 @@ fn paused_official_kotlin_settings(previous: String, root: &Path, cx: &App) -> R
     );
     cx.global::<settings::SettingsStore>()
         .new_text_for_update(previous, |content| {
+            if let Some(java) = content.project.all_languages.languages.0.get_mut("Java")
+                && java
+                    .language_servers
+                    .as_ref()
+                    .is_some_and(|servers| *servers == vec!["kotlin-lsp".into(), "jdtls".into()])
+            {
+                java.language_servers = Some(vec!["jdtls".into()]);
+            }
             content
                 .project
                 .all_languages
@@ -2199,8 +2217,23 @@ fn official_kotlin_settings(
         serde_json::json!({"defaultSdk": java_home, "projects": projects}),
         &mut options,
     );
+    let inherited_java = language::language_settings::AllLanguageSettings::get_global(cx)
+        .language(None, Some(&language::LanguageName::from("Java")), cx)
+        .language_servers
+        .clone();
     cx.global::<settings::SettingsStore>()
         .new_text_for_update(previous, |content| {
+            let java = content
+                .project
+                .all_languages
+                .languages
+                .0
+                .entry("Java".into())
+                .or_default();
+            let servers = java.language_servers.as_ref().unwrap_or(&inherited_java);
+            if *servers == vec!["...".into()] || *servers == vec!["jdtls".into()] {
+                java.language_servers = Some(vec!["kotlin-lsp".into(), "jdtls".into()]);
+            }
             content
                 .project
                 .all_languages
@@ -2259,6 +2292,11 @@ fn kotlin_settings(
 ) -> Result<String> {
     cx.global::<settings::SettingsStore>()
         .new_text_for_update(previous, |content| {
+            if let Some(java) = content.project.all_languages.languages.0.get_mut("Java")
+                && java.language_servers.as_ref().is_some_and(|servers| *servers == vec!["kotlin-lsp".into(), "jdtls".into()])
+            {
+                java.language_servers = Some(vec!["jdtls".into()]);
+            }
             content
                 .project
                 .all_languages
@@ -2631,7 +2669,7 @@ mod tests {
             cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
         let panel = cx.new(|cx| AndroidPanel::new(workspace.downgrade(), project.clone(), cx));
         panel.update(cx, |panel, cx| {
-            panel.restart_official_kotlin(Path::new("/first"), cx)
+            panel.restart_language_server(Path::new("/first"), "kotlin-lsp", cx)
         });
         cx.run_until_parked();
         let mut restarted = official_servers
@@ -2809,6 +2847,14 @@ mod tests {
             assert_eq!(parsed["tab_size"], 2);
             assert_eq!(parsed["languages"]["Kotlin"]["format_on_save"], "off");
             assert_eq!(parsed["languages"]["Kotlin"]["language_servers"], json!(["kotlin-lsp"]));
+            assert_eq!(parsed["languages"]["Java"]["language_servers"], json!(["kotlin-lsp", "jdtls"]));
+            for java_servers in [json!([]), json!(["!kotlin-lsp", "..."]), json!(["custom-java"])] {
+                let mut custom = parsed.clone();
+                custom["languages"]["Java"]["language_servers"] = java_servers.clone();
+                let updated = official_kotlin_settings(custom.to_string(), root, &target, Path::new("/jdk 21"), server, cx).expect("Custom Java settings preserved");
+                let custom: serde_json::Value = settings::parse_json_with_comments(&updated).unwrap();
+                assert_eq!(custom["languages"]["Java"]["language_servers"], java_servers);
+            }
             assert_eq!(parsed["lsp"]["kotlin-language-server"]["settings"]["externalSources"]["useArchiveUris"], true);
             let official = &parsed["lsp"]["kotlin-lsp"];
             assert_eq!(official["binary"]["path"], "/official/bin/intellij-server");
@@ -2826,15 +2872,18 @@ mod tests {
             let fallback = kotlin_settings(updated.clone(), Path::new("/jdk 21"), &[], None, cx).expect("Fallback settings should update");
             let fallback_parsed: serde_json::Value = settings::parse_json_with_comments(&fallback).expect("Valid fallback settings");
             assert_eq!(fallback_parsed["languages"]["Kotlin"]["language_servers"], json!(["kotlin-language-server"]));
+            assert_eq!(fallback_parsed["languages"]["Java"]["language_servers"], json!(["jdtls"]));
             assert_eq!(fallback_parsed["lsp"]["kotlin-lsp"], *official);
             let paused = paused_official_kotlin_settings(updated, root, cx).expect("Pause the obsolete variant");
             let parsed_paused: serde_json::Value = settings::parse_json_with_comments(&paused).unwrap();
             assert_eq!(parsed_paused["languages"]["Kotlin"]["language_servers"], json!([]));
+            assert_eq!(parsed_paused["languages"]["Java"]["language_servers"], json!(["jdtls"]));
             assert_eq!(parsed_paused["lsp"]["kotlin-lsp"]["binary"]["env"][UNAVAILABLE_ANDROID_VARIANT], "true");
             assert_eq!(parsed_paused["lsp"]["kotlin-lsp"]["initialization_options"], official["initialization_options"]);
             let resumed = official_kotlin_settings(paused, root, &target, Path::new("/jdk 21"), server, cx).unwrap();
             let resumed: serde_json::Value = settings::parse_json_with_comments(&resumed).unwrap();
             assert_eq!(resumed["lsp"]["kotlin-lsp"], *official);
+            assert_eq!(resumed["languages"]["Java"]["language_servers"], json!(["kotlin-lsp", "jdtls"]));
             assert!(paused_official_kotlin_settings(fallback.clone(), root, cx).is_err());
             let mut disabled = parsed.clone();
             disabled["languages"]["Kotlin"]["enable_language_server"] = json!(false);

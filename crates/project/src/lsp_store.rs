@@ -549,9 +549,7 @@ impl LocalLspStore {
         } else {
             let adapter = self
                 .languages
-                .lsp_adapters(language_name)
-                .into_iter()
-                .find(|adapter| adapter.name() == disposition.server_name)
+                .adapter_for_name(&disposition.server_name)
                 .expect("To find LSP adapter");
             let new_language_server_id = self.start_language_server(
                 worktree_handle,
@@ -7685,6 +7683,35 @@ impl LspStore {
                 ))
             })
         } else {
+            let prefer_official_java = buffer.update(cx, |buffer, cx| {
+                buffer
+                    .language()
+                    .is_some_and(|language| language.name().as_ref() == "Java")
+                    && self.as_local().is_some_and(|local| {
+                        local
+                            .language_servers_for_buffer(buffer, cx)
+                            .find(|(adapter, server)| {
+                                lsp_command_allowed_for_buffer(
+                                    local,
+                                    &GetDefinitions { position },
+                                    buffer,
+                                    adapter,
+                                    server,
+                                )
+                            })
+                            .is_some_and(|(adapter, _)| adapter.name().0.as_ref() == "kotlin-lsp")
+                    })
+            });
+            if prefer_official_java {
+                // JDT resolves Kotlin through compiled classes and would add a duplicate decompiled target.
+                let definitions = self.request_lsp(
+                    buffer.clone(),
+                    LanguageServerToQuery::FirstCapable,
+                    GetDefinitions { position },
+                    cx,
+                );
+                return cx.background_spawn(async move { definitions.await.map(Some) });
+            }
             let definitions_task = self.request_multiple_lsp_locally(
                 buffer,
                 Some(position),
@@ -14645,49 +14672,27 @@ impl LspStore {
         self.lsp_server_capabilities
             .insert(server_id, server_capabilities);
 
-        // Tell the language server about every open buffer in the worktree that matches the language.
-        // Also check for buffers in worktrees that reused this server
-        let mut worktrees_using_server = vec![key.worktree_id];
-        if let Some(local) = self.as_local() {
-            // Find all worktrees that have this server in their language server tree
-            for (worktree_id, servers) in &local.lsp_tree.instances {
-                if *worktree_id != key.worktree_id {
-                    for server_map in servers.roots.values() {
-                        if server_map
-                            .values()
-                            .any(|(node, _)| node.id() == Some(server_id))
-                        {
-                            worktrees_using_server.push(*worktree_id);
-                        }
-                    }
-                }
-            }
-        }
-
         let mut buffer_paths_registered = Vec::new();
         self.buffer_store.clone().update(cx, |buffer_store, cx| {
-            let mut lsp_adapters = HashMap::default();
             for buffer_handle in buffer_store.buffers() {
+                if !buffer_handle.update(cx, |buffer, cx| {
+                    self.as_local().is_some_and(|local| {
+                        local
+                            .language_server_ids_for_buffer(buffer, cx)
+                            .contains(&server_id)
+                    })
+                }) {
+                    continue;
+                }
                 let buffer = buffer_handle.read(cx);
                 let file = match File::from_dyn(buffer.file()) {
                     Some(file) => file,
                     None => continue,
                 };
-                let language = match buffer.language() {
-                    Some(language) => language,
-                    None => continue,
+                let Some(language) = buffer.language() else {
+                    continue;
                 };
                 if LocalLspStore::language_server_line_length_limit_exceeded(buffer, cx).is_some() {
-                    continue;
-                }
-
-                if !worktrees_using_server.contains(&file.worktree.read(cx).id())
-                    || !lsp_adapters
-                        .entry(language.name())
-                        .or_insert_with(|| self.languages.lsp_adapters(&language.name()))
-                        .iter()
-                        .any(|a| a.name == key.name)
-                {
                     continue;
                 }
                 // didOpen

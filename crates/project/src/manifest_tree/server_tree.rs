@@ -114,10 +114,6 @@ impl InnerTreeNode {
             }),
         }
     }
-
-    pub(crate) fn id(&self) -> Option<LanguageServerId> {
-        self.id.get().copied()
-    }
 }
 
 impl LanguageServerTree {
@@ -291,7 +287,7 @@ impl LanguageServerTree {
                         .register_lsp_adapter(language_name.clone(), adapter.adapter.clone());
                     Some(adapter)
                 } else {
-                    None
+                    self.languages.adapter_for_name(&desired_adapter)
                 }?;
                 let adapter_settings = crate::lsp_store::language_server_settings_for(
                     settings_location,
@@ -309,11 +305,17 @@ impl LanguageServerTree {
         // This is done, in part, to ensure that language servers loaded at different points
         // (e.g., native vs extension) still end up in the right order at the end, rather than
         // it being based on which language server happened to be loaded in first.
+        let registered_adapters = self.languages.lsp_adapters(language_name);
         self.languages.reorder_language_servers(
             language_name,
             adapters_with_settings
                 .values()
                 .map(|(_, adapter)| adapter.clone())
+                .filter(|adapter| {
+                    registered_adapters
+                        .iter()
+                        .any(|registered| registered.name == adapter.name)
+                })
                 .collect(),
         );
 

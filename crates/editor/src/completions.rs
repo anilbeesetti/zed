@@ -326,6 +326,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let started = Instant::now();
         if self.pending_rename.is_some() {
             return;
         }
@@ -796,6 +797,7 @@ impl Editor {
                         }
 
                         cx.notify();
+                        Editor::trace_interaction_latency("completion", started, window);
                         return;
                     }
 

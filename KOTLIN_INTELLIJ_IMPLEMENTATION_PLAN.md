@@ -590,3 +590,82 @@ results, Cmd-click fallback, caret-movement dismissal, successful navigation,
 import completion, and subsequent indexing. Focused Clippy for `project`,
 `editor`, and `lsp_locations`, workspace formatting, and diff whitespace checks
 pass. The release executable built at `dc8ce22888` predates this UI follow-up.
+
+### Rollout validation follow-up — `263.4702.0+android-2`
+
+The candidate fixes the reported dependency warnings at their source. AGP's
+compile R generation supplies a distinct R library for each selected Android
+module. A resolved project artifact is recorded as a module dependency once,
+instead of also registering its absent compiled JAR as an external library.
+The clean `nav3-recipes` copy imports 26 modules and six separate R libraries
+without missing project-library artifacts.
+
+Resource setup uses the native importer's resolved variant selection, including
+dependent modules and test components. It requests AGP's R and BuildConfig tasks.
+For dynamic features, AGP's packaged-dependency writer uses artifact identities,
+but its explicit dependency also requests the artifacts' class contents. Setup
+removes that unnecessary explicit dependency while retaining the writer's real
+metadata input dependencies and packaging checks. The existing graph guard still
+rejects source compilation before execution. Both isolated fixtures generate
+their selected resources without compiling Kotlin or Java; other generators
+that genuinely require compilation still report degraded support.
+
+Java-origin references and rename now use the official engine's common semantic
+providers. Explicit Java settings can attach the already registered Kotlin
+extension adapter, sharing one process with Kotlin. Managed setup selects this
+server for Java navigation/refactoring while retaining JDT for Java completion
+and diagnostics; custom server lists are preserved. Existing managed JDT models
+refresh after official setup, including selected-variant changes. That separate
+Java refresh can compile sources, and failure leaves Kotlin editing configured.
+Only JDT restarts after publishing its model. Native imported generated roots
+are marked generated, and rename rejects generated declarations such as
+BuildConfig as well as compiled library declarations.
+
+The final engine passes 117/117 required sample correctness checks, including
+Compose insertion, Java-origin method/class navigation, cross-language refactoring, generated-target protection,
+module-scoped R roots, and existing project artifacts. The larger project passes
+7/7 model checks. Three optional `prepareRename` probes remain unsupported and
+are not advertised by the engine. These final correctness runs overlap the
+release build and are not timing evidence. Installer integrity checks, seven
+Android tool tests, three Android UI tests, the empty-navigation regression,
+and 100 scheduler runs of shared Kotlin/Java server attachment pass. Focused
+Clippy, protocol self-tests, formatting, and diff checks pass.
+
+A separate controlled sample run before the Java declaration follow-up passed 118/118
+required checks and all 150 protocol requests. With 30 samples per scenario,
+p95 was 1.16 ms for warm definition, 126.83 ms for unsaved Modifier completion,
+365.99 ms for explicit String completion, 312.50 ms for dot-triggered String
+completion, and 296.87 ms for named arguments. First navigation after indexing
+took 1,565.26 ms. These measurements exclude editor input and rendering and do
+not meet all proposed budgets. A separate bounded JFR recording attributes most
+String completion work to extension resolution and applicability. Moving Compose
+analysis to insertion was tested and rejected because it violates Kotlin's
+insertion-thread analysis rules; the proven implementation is retained.
+
+The release UI smoke confirms both caret messages, original read-only Compose
+sources, JDT completion, and one Java error that clears after undo. It also found
+that Java declaration navigation still used a declaration-only provider intended
+for inlay links. A protocol regression reproduced empty results for Java references
+to both a Kotlin method and a Kotlin class. The provider now resolves reference
+positions too; both checks pass in the final 117-check suite.
+
+Explicit cross-language adapter selection initially changed Java's global default
+adapter list. A failing regression reproduced the leak. It now reuses the named
+adapter only in the configured project; default adapter order remains scoped to
+those registered for that language. Startup/restart consults the existing project
+server-assignment lookup when reopening buffers. The regression passes 100
+scheduler runs, including reopening both languages after restart. All 27 LSP-store
+integration tests and focused Clippy pass. The wider 407-test suite has seven Git
+repository-parking failures that also reproduce in the earlier test binary;
+four native filesystem tests pass outside the sandbox after stalling inside it.
+The combined runs pass 397 tests, with three ignored and the seven baseline
+failures above. No Git-parking changes are included.
+
+The first release build succeeded. A later rebuild and one Java probe ran out of
+disk space while writing intermediate files/indexes. Disposable validation indexes,
+rejected runtimes, and the debug incremental cache were removed while retaining
+reports. The Java probe then completed successfully. No performance claim uses
+these build-overlapping checks.
+
+Community remains the default. Final release UI timings and complete-process
+memory results will be recorded separately from these protocol checks.

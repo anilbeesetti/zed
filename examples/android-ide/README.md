@@ -27,15 +27,16 @@ script/android-ide --release --kotlin-backend official examples/android-ide
 ```
 
 Use **Configure official Kotlin** in the Android tools panel. The pinned
-`263.4702.0+android-1` build includes a source-built native importer patch for
+`263.4702.0+android-2` build includes a source-built native importer patch for
 selected dependency variants, exact library sources, and dynamic features, plus
 semantic Compose completion and naming fixes. The installer verifies the upstream
 archive, public source, build dependencies, and installed patch. Its manifest and
 source license remain with the runtime.
 
-Setup requests the selected variant's resources. A Gradle task-graph guard stops
-the request before execution if it would compile Kotlin or Java; some resource
-tasks pull in library compilation. Generation failures report degraded generated
+Setup generates R and BuildConfig for the imported variants, using AGP's generation
+tasks. Dynamic-feature dependency metadata is generated from artifact identities
+without building their classes. A Gradle task-graph guard stops the request before
+execution if another generator would compile Kotlin or Java. Generation failures report degraded generated
 symbol support while still configuring Kotlin. Gradle, dependency, resource,
 manifest, and selected-variant changes refresh the managed backend automatically.
 An unavailable selected variant pauses it until a valid variant is selected.
@@ -85,14 +86,14 @@ indexing completion. It immediately requests completion after each unsaved
 incremental change, without sleeps or retries. It executes the returned completion
 command, applies edits to its in-memory buffer, and checks the import, call and
 caret response. It never saves its source edits or assembles the application.
-Generated-resource checks can fail when the fixture has not generated resources.
-For the default variant, generate just resources with
-`"$fixture/project/gradlew" -p "$fixture/project" :mobile:processDemoDebugResources`,
-then repeat the probe.
+Add `--generate-resources` to run the app's exact resource-only setup before the
+probe, including on a clean copy. It records the generation log and script hash.
 
 `results.json` records the negotiated capabilities, actual imported app/library
 variants, source-attachment presence, document versions, request times, target
-URIs/ranges, virtual content, and completion edits. `wire.jsonl` preserves both
+URIs/ranges, virtual content, and completion edits. `workspace-model.json` preserves
+the exported model, including module-scoped R libraries and project dependency
+edges. `wire.jsonl` preserves both
 protocol directions; import and indexing events and server errors are retained.
 The output directory also holds server indexes for repeat-run comparisons.
 Use a fresh output directory for cold-index measurements. Gradle can write to the
@@ -123,8 +124,9 @@ and Compose completion contexts. Refactoring edits remain in memory; the probe
 checks every touched source file is unchanged on disk. `--require-compose` makes
 the Compose naming, required-lambda, and semantic named-argument ordering checks
 required and implies `--extended`.
-Java-origin requests remain explicit checks: Kotlin-origin rename can update Java
-usages even when the official server returns no rename or references from Java.
+Java-origin references and rename use the same semantic providers as Kotlin.
+The probe checks both directions and rejects renaming generated BuildConfig or
+read-only library declarations.
 
 Add `--performance-samples 30` for 30 samples each of warm definition, immediate
 unsaved Modifier completion, explicit and dot-triggered String completion, and
@@ -149,6 +151,13 @@ failure reporting, and virtual-document ownership/lifecycle in
 The client suite separately tests expired sessions and late responses after timeout.
 
 ## Real editor check
+
+For release-app timings, launch with `ZED_LOG=editor.interaction_latency=debug`.
+The log records successful definition/Cmd-click and visible completion interactions
+through a rendered editor frame. It excludes the OS compositor. Record at least
+30 samples per scenario and run without concurrent builds or other benchmarks.
+The test-support harness below provides correctness coverage; it is not a release
+performance benchmark.
 
 The ignored `test_real_kotlin_editor_completion_and_navigation` test uses the
 actual server, a GPUI test window, and unsaved source edits in an isolated Gradle
@@ -180,8 +189,12 @@ Do not run builds or other performance probes during timing collection.
 
 Run `script/install-android-kotlin`, `script/install-android-debugger`, and
 `script/install-android-preview` once before launching the IDE. **Configure Java**
-imports the selected variant into JDT LS; repeat Java setup after changing variants
-or dependencies. Managed official Kotlin setup refreshes automatically.
+imports the selected variant into JDT LS. Once configured, managed official Kotlin
+setup refreshes that Java model after variant or Gradle input changes. Java model
+refresh can compile sources; failure leaves Kotlin editing available. Only JDT is
+restarted for Java refresh. Default Java settings use official Kotlin for semantic
+navigation/refactoring and JDT for Java completion and diagnostics; custom or
+disabled Java server lists are preserved.
 
 **Debug** builds and launches the selected app, then attaches the native debugger.
 Set breakpoints on the return in `Greeting.java` and `LibraryGreeting.kt`; inspect

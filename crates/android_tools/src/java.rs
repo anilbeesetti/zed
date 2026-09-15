@@ -89,6 +89,12 @@ pub struct JavaModule {
     pub libraries: Vec<PathBuf>,
 }
 
+pub fn is_configured(root: &Path) -> bool {
+    let cache = root.join(".zed/android-java");
+    fs::read_to_string(cache.join(".gitignore")).is_ok_and(|marker| marker == CACHE_MARKER)
+        && cache.join("model.json").is_file()
+}
+
 pub fn prepare(root: &Path) -> Result<PathBuf> {
     let settings = root.join(".zed");
     ensure_directory(&settings)?;
@@ -239,6 +245,7 @@ mod tests {
             .is_err()
         );
         let cache = root.join(".zed/android-java");
+        assert!(!is_configured(&root));
         fs::create_dir_all(&cache)?;
         fs::write(cache.join(".gitignore"), "user files")?;
         assert!(prepare(&root).is_err());
@@ -247,6 +254,7 @@ mod tests {
         assert!(prepare(&root)?.is_file());
         let parsed = parse_model(&output, &root, &target)?;
         assert!(install_model(&root, &parsed)?.is_file());
+        assert!(is_configured(&root));
         assert!(prepare(&root)?.is_file());
         finish(&root, &parsed, "{}\n", "{\"tab_size\":2}")?;
         assert!(finish(&root, &parsed, "{}\n", "{\"tab_size\":4}").is_err());

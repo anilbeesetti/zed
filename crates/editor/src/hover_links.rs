@@ -207,10 +207,15 @@ impl Editor {
         cx: &mut Context<Editor>,
     ) {
         let focus_handle = self.focus_handle(cx);
+        let started = std::time::Instant::now();
         let reveal_task = self.cmd_click_reveal_task(point, modifiers, window, cx);
         cx.spawn_in(window, async move |editor, cx| {
             let definition_revealed = reveal_task.await.log_err().unwrap_or(Navigated::No);
             if definition_revealed == Navigated::Yes {
+                cx.update(|window, _| {
+                    Editor::trace_interaction_latency("cmd_click", started, window)
+                })
+                .log_err();
                 return;
             }
             cx.update(|window, cx| {

@@ -22,11 +22,14 @@ REPOSITORY = Path(__file__).resolve().parent.parent
 DEPENDENCIES = REPOSITORY / "target/android-ide/dependencies"
 INSTALLATION = DEPENDENCIES / "kotlin-language-server"
 OFFICIAL_VERSION = "263.4702.0"
-OFFICIAL_REVISION = OFFICIAL_VERSION + "+android-1"
+OFFICIAL_REVISION = OFFICIAL_VERSION + "+android-2"
 OFFICIAL_SHA256 = "95da3fc6d3b9092c7616345044a05edb85e5408dc648d081e4e433595c892bec"
 OFFICIAL_ARCHIVE = f"kotlin-server-{OFFICIAL_VERSION}-aarch64.sit"
 OFFICIAL_URL = f"https://download.jetbrains.com/language-server/kotlin-server/{OFFICIAL_VERSION}/{OFFICIAL_ARCHIVE}"
 OFFICIAL_INSTALLATION = DEPENDENCIES / f"kotlin-lsp-{OFFICIAL_REVISION}"
+OFFICIAL_MODEL_MODULE = "plugins/kotlin.lsp/lib/modules/language-server.workspace-import.jar"
+OFFICIAL_JAVA_MODULE = "plugins/java-base.lsp/lib/modules/language-server.api.features.impl.java-base.jar"
+OFFICIAL_COMMON_MODULE = "lib/language-server.api.features.impl.common.jar"
 
 
 def download(name, url, expected):
@@ -74,6 +77,10 @@ def validate_official_patch(installation):
             or manifest.get("compose_sha256") != hashlib.sha256(compose.read_bytes()).hexdigest()
             or manifest.get("feature_sha256") != hashlib.sha256(feature.read_bytes()).hexdigest()):
         raise RuntimeError(f"The native Kotlin importer or Compose patch has changed in {server}; preserve it and reinstall")
+    expected_modules = {name: hashlib.sha256((server / name).read_bytes()).hexdigest()
+                        for name in (OFFICIAL_MODEL_MODULE, OFFICIAL_JAVA_MODULE, OFFICIAL_COMMON_MODULE)}
+    if manifest.get("additional_modules") != expected_modules:
+        raise RuntimeError(f"The Kotlin project model or Java refactoring patch has changed in {server}; preserve it and reinstall")
 
 
 def replace_jar_entries(module, replacements):
@@ -133,13 +140,33 @@ def patch_official(distribution, temporary):
         "org.jetbrains.kotlin.cli.jvm.K2JVMCompiler", "-no-stdlib", "-no-reflect", "-jvm-target", "1.8",
         "-module-name", "language-server.workspace-import.gradle-plugin", f"-Xfriend-paths={module}",
         "-classpath", classpath, "-d", str(classes), str(builder / "android/androidUtils.kt"),
-        str(builder / "android/collectAndroidVariants.kt"),
+        str(builder / "android/collectAndroidVariants.kt"), str(builder / "android/resolveRJar.kt"),
     ], check=True)
     subprocess.run([str(java_home / "bin/javac"), "--release", "8", "-classpath", classpath,
                     "-d", str(classes), str(builder / "ExternalModuleDependencySetModuleBuilder.java")], check=True)
     replacements = {path.relative_to(classes).as_posix(): path.read_bytes() for path in classes.rglob("*.class")}
     # Keep the original Kotlin module metadata; the patch replaces only selected source files.
     replace_jar_entries(module, replacements)
+    additional_modules = {}
+    for module_name, source_names in (
+        (OFFICIAL_MODEL_MODULE, ["workspace-import/src/com/jetbrains/ls/imports/gradle/SourceSetDependencyResolver.kt",
+                                 "workspace-import/src/com/jetbrains/ls/imports/gradle/GradleWorkspaceImporter.kt"]),
+        (OFFICIAL_JAVA_MODULE, ["features-impl/java-base/src/com/jetbrains/ls/api/features/impl/javaBase/LSJavaBaseLanguageConfiguration.kt"]),
+        (OFFICIAL_COMMON_MODULE, ["features-impl/common/src/com/jetbrains/ls/api/features/impl/common/processors/LSRenameProcessor.kt"]),
+    ):
+        patched_module = server / module_name
+        module_classes = temporary / (patched_module.stem + "-classes")
+        module_classes.mkdir()
+        subprocess.run([
+            str(java_home / "bin/java"), "-Xmx768m", "-cp", os.pathsep.join(map(str, compiler)),
+            "org.jetbrains.kotlin.cli.jvm.K2JVMCompiler", "-no-stdlib", "-no-reflect", "-jvm-target", "21",
+            "-Xcontext-parameters", f"-Xfriend-paths={patched_module}",
+            "-classpath", os.pathsep.join(map(str, sorted(server.rglob("*.jar")))),
+            "-d", str(module_classes), *(str(source / name) for name in source_names),
+        ], check=True)
+        replace_jar_entries(patched_module, {path.relative_to(module_classes).as_posix(): path.read_bytes()
+                                             for path in module_classes.rglob("*.class")})
+        additional_modules[module_name] = hashlib.sha256(patched_module.read_bytes()).hexdigest()
     compose = Path(__file__).with_name("android-kotlin-compose.kt")
     compose_classes = temporary / "compose-classes"
     compose_classes.mkdir()
@@ -171,6 +198,7 @@ def patch_official(distribution, temporary):
         "module": module_path, "module_sha256": hashlib.sha256(module.read_bytes()).hexdigest(),
         "compose_sha256": hashlib.sha256(compose.read_bytes()).hexdigest(),
         "feature": feature_path, "feature_sha256": hashlib.sha256(feature.read_bytes()).hexdigest(),
+        "additional_modules": additional_modules,
     }, indent=2) + "\n")
     shutil.copy2(source / "LICENSE.txt", server / "zed-native-importer-LICENSE.txt")
 

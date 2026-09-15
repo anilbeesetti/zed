@@ -29,6 +29,171 @@ use util::{path, rel_path::rel_path};
 use crate::init_test;
 
 #[gpui::test]
+async fn test_explicit_server_can_share_an_extension_adapter_across_languages(
+    cx: &mut TestAppContext,
+) {
+    use language::{Language, LanguageConfig, LanguageMatcher};
+
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/project"),
+        json!({
+            "main.rs": "fn main() {}",
+            "Greeting.java": "class Greeting {}",
+            ".zed": {"settings.json": json!({"languages": {
+                "Rust": {"language_servers": ["kotlin-lsp"]},
+                "Java": {"language_servers": ["kotlin-lsp", "jdtls"]}
+            }}).to_string()}
+        }),
+    )
+    .await;
+    let project = Project::test(fs.clone(), [Path::new(path!("/project"))], cx).await;
+    let languages = project.read_with(cx, |project, _| project.languages().clone());
+    languages.add(rust_lang());
+    languages.add(Arc::new(Language::new(
+        LanguageConfig {
+            name: "Java".into(),
+            matcher: LanguageMatcher {
+                path_suffixes: vec!["java".into()],
+                ..Default::default()
+            }
+            .into(),
+            ..Default::default()
+        },
+        None,
+    )));
+    let mut java_servers = languages.register_fake_lsp(
+        "Java",
+        FakeLspAdapter {
+            name: "jdtls",
+            ..Default::default()
+        },
+    );
+    let mut servers = languages.register_fake_lsp(
+        "Rust",
+        FakeLspAdapter {
+            name: "kotlin-lsp",
+            ..Default::default()
+        },
+    );
+    let (_rust, _rust_handle) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/project/main.rs"), cx)
+        })
+        .await
+        .expect("Rust opens");
+    let mut server = servers.next().await.expect("Shared server starts");
+    server
+        .receive_notification::<lsp::notification::DidOpenTextDocument>()
+        .await;
+    let (java, _java_handle) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/project/Greeting.java"), cx)
+        })
+        .await
+        .expect("Java opens");
+    cx.run_until_parked();
+    assert_eq!(
+        project.read_with(cx, |project, cx| project
+            .lsp_store()
+            .read(cx)
+            .language_server_statuses()
+            .count()),
+        2
+    );
+    let opened = server
+        .receive_notification::<lsp::notification::DidOpenTextDocument>()
+        .await;
+    assert_eq!(opened.text_document.language_id, "java");
+    assert!(opened.text_document.uri.as_str().ends_with("Greeting.java"));
+    assert_eq!(
+        languages
+            .lsp_adapters(&"Java".into())
+            .iter()
+            .map(|adapter| adapter.name().to_string())
+            .collect::<Vec<_>>(),
+        vec!["jdtls"],
+        "Explicit attachment must not add a default server for other Java projects"
+    );
+    let jdt = java_servers.next().await.expect("JDT starts for Java");
+    let jdt_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    server.set_request_handler::<lsp::request::GotoDefinition, _, _>(|_, _| async move {
+        Ok(Some(lsp::GotoDefinitionResponse::Scalar(
+            lsp::Location::new(
+                Uri::from_file_path(path!("/project/main.rs")).expect("Source URI"),
+                lsp::Range::default(),
+            ),
+        )))
+    });
+    jdt.set_request_handler::<lsp::request::GotoDefinition, _, _>({
+        let jdt_requests = jdt_requests.clone();
+        move |_, _| {
+            jdt_requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                Ok(Some(lsp::GotoDefinitionResponse::Scalar(
+                    lsp::Location::new(
+                        Uri::from_file_path(path!("/project/Greeting.java")).expect("JDT URI"),
+                        lsp::Range::default(),
+                    ),
+                )))
+            }
+        }
+    });
+    let definitions = project
+        .update(cx, |project, cx| project.definitions(&java, 6, cx))
+        .await
+        .expect("Java definitions")
+        .expect("Java definition response");
+    assert_eq!(definitions.len(), 1);
+    assert_eq!(jdt_requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    fs.save(
+        Path::new(path!("/project/.zed/settings.json")),
+        &json!({"languages": {
+            "Rust": {"language_servers": ["kotlin-lsp"]},
+            "Java": {"language_servers": ["jdtls", "kotlin-lsp"]}
+        }})
+        .to_string()
+        .into(),
+        language::LineEnding::Unix,
+    )
+    .await
+    .expect("Change Java priority");
+    cx.run_until_parked();
+    let definitions = project
+        .update(cx, |project, cx| project.definitions(&java, 6, cx))
+        .await
+        .expect("Custom Java definitions")
+        .expect("Custom Java definition response");
+    assert_eq!(
+        definitions.len(),
+        2,
+        "Custom JDT priority retains normal aggregation"
+    );
+    assert_eq!(jdt_requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    project.update(cx, |project, cx| {
+        project.lsp_store().update(cx, |store, cx| {
+            store.restart_all_language_servers(cx);
+        });
+    });
+    let mut restarted = servers.next().await.expect("Shared server restarts");
+    let mut reopened = Vec::new();
+    for _ in 0..2 {
+        reopened.push(
+            restarted
+                .receive_notification::<lsp::notification::DidOpenTextDocument>()
+                .await
+                .text_document
+                .language_id,
+        );
+    }
+    reopened.sort();
+    assert_eq!(reopened, vec!["java", "rust"]);
+}
+
+#[gpui::test]
 async fn test_kotlin_completion_sessions_expire_on_import_restart_and_other_documents(
     cx: &mut TestAppContext,
 ) {

@@ -319,11 +319,16 @@ def language_features(probe, source):
         probe.check("module_scoped_source_version_" + name, any(f"annotations-{dependency_version}-sources.jar" in uri and uri.endswith("/NotNull.java") for uri in target_uris), {"expected_dependency_version": dependency_version, "response": response}, required=probe.results["require_original_sources"])
         probe.change(original, uri)
     library = probe.document_text(library_uri).replace("\n}", '\n    fun message(count: Int): String = count.toString()\n}')
-    java = probe.document_text(java_uri).replace("\n}", '\n    public static String kotlinMessage() { return dev.zed.greeting.LibraryGreeting.INSTANCE.message(); }\n}')
+    java = probe.document_text(java_uri).replace("\n}", '\n    public static String kotlinMessage() { return dev.zed.greeting.LibraryGreeting.INSTANCE.message(); }\n    public static Class<?> kotlinActivity() { return MainActivity.class; }\n}')
     main = source + "\nprivate val overloadProbe = LibraryGreeting.message(3)\n"
     probe.change(library, library_uri)
     probe.change(java, java_uri)
     probe.change(main)
+    for name, needle, declaration_uri in [("method", "INSTANCE.message()", library_uri), ("class", "MainActivity.class", probe.uri)]:
+        location = java.index(needle) + (len("INSTANCE.") if name == "method" else 0) + 1
+        definition = probe.request("textDocument/definition", {"textDocument": {"uri": java_uri}, "position": position(java, location)})
+        targets = definition.get("result") or []
+        probe.check("java_origin_definition_" + name, any(target.get("uri", target.get("targetUri")) == declaration_uri for target in targets), definition)
     for name, source_uri, needle, new_name, declaration_uri in [
         ("library_overload", probe.uri, "LibraryGreeting.message()", "renamedGreeting", library_uri),
         ("kotlin_to_java", probe.uri, "Greeting.message(BuildConfig", "renamedJavaGreeting", java_uri),
@@ -607,11 +612,18 @@ def run(probe, args, source):
         if exported.get("error") or not model_path.exists():
             raise ProbeError("server_error", "Could not export the imported model: " + json.dumps(exported))
         model = json.loads(model_path.read_text())
+        (args.output / "workspace-model.json").write_text(json.dumps(model, indent=2) + "\n")
         modules = [module["name"] for module in model["modules"]]
         probe.results["model_schema"] = {"top_level_keys": sorted(model), "module_keys": sorted({key for module in model["modules"] for key in module}), "library_keys": sorted({key for library in model["libraries"] for key in library})}
         probe.results["selected_module_roots"] = [{key: value for key, value in module.items() if key == "name" or "root" in key.lower()} for module in model["modules"]]
         probe.results["active_modules"] = modules
         probe.results["libraries"] = [{"name": library["name"], "has_sources": any(root.get("type") == "SOURCES" for root in library.get("roots", []))} for library in model["libraries"]]
+        resource_libraries = [library for library in model["libraries"] if library["name"].startswith("Gradle: android:r:")]
+        probe.check("resource_libraries_scoped_to_modules", bool(resource_libraries) and all(len([root for root in library["roots"] if root.get("type", "CLASSES") == "CLASSES"]) == 1 for library in resource_libraries), resource_libraries)
+        missing_project_libraries = [root["path"] for library in model["libraries"] for root in library.get("roots", [])
+            if root.get("type", "CLASSES") == "CLASSES" and root["path"].startswith("<WORKSPACE>/")
+            and not (probe.root / root["path"].removeprefix("<WORKSPACE>/")).exists()]
+        probe.check("project_library_artifacts_exist", not missing_project_libraries, missing_project_libraries)
         application_suffix = args.module.replace(":", ".") + "." + args.variant
         probe.check("selected_application_variant", any(name.endswith(application_suffix) for name in modules), modules)
         for expected in args.expected_module:
@@ -788,6 +800,7 @@ def main():
     parser.add_argument("--plugins", type=Path, help="Isolated IntelliJ plugin directory for engine compatibility experiments")
     parser.add_argument("--warmup", choices=("none", "diagnostics", "document-symbols", "hover"), default="none", help="One bounded active-file request after indexing, before navigation; measured separately")
     parser.add_argument("--jfr", action="store_true", help="Capture a bounded server Java Flight Recorder profile; adds profiling overhead")
+    parser.add_argument("--generate-resources", action="store_true", help="Run the app's exact resource-only setup on the isolated fixture before starting the server")
     args = parser.parse_args()
     args.extended = args.extended or args.require_compose
     if args.self_test:
@@ -820,12 +833,27 @@ def main():
     if manifest.is_file():
         results["runtime_patch_manifest"] = json.loads(manifest.read_text())
     results["runtime_module_sha256"] = {name: hashlib.sha256(path.read_bytes()).hexdigest() for name in ("language-server.workspace-import.gradle-plugin.jar", "language-server.api.features.impl.kotlin.jar") if (path := distribution / "plugins/kotlin.lsp/lib/modules" / name).is_file()}
+    results["runtime_additional_module_sha256"] = {name: hashlib.sha256((distribution / name).read_bytes()).hexdigest() for name in results.get("runtime_patch_manifest", {}).get("additional_modules", {})}
     results["requested_module"] = args.module
     results["expected_modules"] = args.expected_module
     results["model_only"] = args.model_only
     results["require_compose"] = args.require_compose
     results["require_original_sources"] = args.require_original_sources
     environment = dict(os.environ, JAVA_HOME=str(args.java_home), LSP_ANDROID_MODULE=args.module, LSP_ANDROID_VARIANT=args.variant, IJ_JAVA_OPTIONS=f"-Didea.config.path={output / 'config'} -Didea.log.path={output / 'logs'} -Dintellij.server.eula.persistence=false")
+    if args.generate_resources:
+        setup = (Path(__file__).resolve().parent.parent / "crates/android_tools/src/kotlin.rs").read_text()
+        guard = setup.split('const RESOURCE_GENERATION_GUARD: &str = r#"', 1)[1].split('"#;', 1)[0]
+        init = output / "resource-generation.gradle"
+        init.write_text(guard)
+        with (output / "resource-generation.log").open("w") as log:
+            generation = subprocess.run(["/bin/sh", "./gradlew", "--init-script", str(init),
+                f"-Dzed.android.kotlinServer={distribution}", "zedAndroidKotlinGenerateSources",
+                "--no-configuration-cache", "--console=plain"], cwd=root, env=environment,
+                stdout=log, stderr=subprocess.STDOUT, timeout=120)
+        results["resource_generation"] = {"exit_code": generation.returncode, "script_sha256": hashlib.sha256(guard.encode()).hexdigest()}
+        if generation.returncode:
+            (output / "results.json").write_text(json.dumps(results, indent=2) + "\n")
+            raise ProbeError("resource_generation_failed", f"See {output / 'resource-generation.log'}")
     if args.plugins:
         environment["IJ_JAVA_OPTIONS"] += f" -Didea.plugins.path={args.plugins.resolve()}"
         results["plugins"] = str(args.plugins.resolve())
