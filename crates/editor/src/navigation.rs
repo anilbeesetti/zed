@@ -2332,7 +2332,20 @@ impl Editor {
         let scroll_top_row = scroll_anchor.top_row(&buffer);
         drop(buffer);
 
+        let language_server_document = self.buffer.read(cx).as_singleton().and_then(|buffer| {
+            buffer.read(cx).language_server_document()?;
+            let project = self.project.as_ref()?.read(cx);
+            Some(
+                project
+                    .lsp_store()
+                    .read(cx)
+                    .language_server_document_location(buffer.read(cx), cx)
+                    .and_then(|location| location.context("Library document owner is unavailable"))
+                    .map_err(|error| error.to_string()),
+            )
+        });
         NavigationData {
+            language_server_document,
             cursor_anchor,
             cursor_position,
             scroll_anchor,

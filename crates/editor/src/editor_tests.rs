@@ -1324,6 +1324,7 @@ async fn test_navigation_history(cx: &mut TestAppContext) {
             let invalid_point = Point::new(9999, 0);
             editor.navigate(
                 Arc::new(NavigationData {
+                    language_server_document: None,
                     cursor_anchor: invalid_anchor,
                     cursor_position: invalid_point,
                     scroll_anchor: ScrollAnchor {
@@ -21997,6 +21998,1006 @@ async fn test_completion_can_run_commands(cx: &mut TestAppContext) {
         1,
         "For completion with an unregistered command, Zed should not send a command execution request",
     );
+}
+
+#[gpui::test]
+async fn test_kotlin_command_completions_refresh_after_typing_and_backspace(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx, |settings| {
+        settings.defaults.show_completions_on_input = Some(false);
+    });
+    let mut cx = kotlin_command_completion_context(false, cx).await;
+    cx.set_state("Buˇ");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let (release_first, first_released) = futures::channel::oneshot::channel();
+    cx.set_request_handler::<lsp::request::Completion, _, _>({
+        let requests = requests.clone();
+        let mut first_released = Some(first_released);
+        move |_, params, _| {
+            let position = params.text_document_position.position;
+            let key = {
+                let mut requests = requests.lock();
+                requests.push(position);
+                requests.len()
+            };
+            let release = first_released.take();
+            async move {
+                if let Some(release) = release {
+                    release.await.expect("first request released");
+                }
+                Ok(Some(lsp::CompletionResponse::Array(vec![
+                    kotlin_command_item(position, key),
+                ])))
+            }
+        }
+    });
+    let executed = Arc::new(Mutex::new(Vec::new()));
+    cx.set_request_handler::<lsp::request::ExecuteCommand, _, _>({
+        let server = cx.lsp.server.clone();
+        let executed = executed.clone();
+        let requests = requests.clone();
+        move |uri, params, _| {
+            let key = params
+                .arguments
+                .first()
+                .and_then(|key| key.as_u64())
+                .expect("completion key") as usize;
+            let position = *requests.lock().get(key - 1).expect("request position");
+            executed.lock().push(key);
+            let server = server.clone();
+            async move {
+                let response = server
+                    .request::<lsp::request::ApplyWorkspaceEdit>(
+                        lsp::ApplyWorkspaceEditParams {
+                            label: None,
+                            edit: lsp::WorkspaceEdit::new(
+                                [(
+                                    uri,
+                                    vec![lsp::TextEdit::new(
+                                        lsp::Range::new(lsp::Position::default(), position),
+                                        "Button()".into(),
+                                    )],
+                                )]
+                                .into_iter()
+                                .collect(),
+                            ),
+                        },
+                        DEFAULT_LSP_REQUEST_TIMEOUT,
+                    )
+                    .await
+                    .into_response()?;
+                assert!(response.applied);
+                Ok(None)
+            }
+        }
+    });
+    cx.update_editor(|editor, window, cx| editor.show_completions(&ShowCompletions, window, cx));
+    cx.run_until_parked();
+    assert_eq!(requests.lock().len(), 1);
+    cx.update_editor(|editor, window, cx| {
+        editor.handle_input("t", window, cx);
+        editor.show_completions(&ShowCompletions, window, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        requests.lock().len(),
+        1,
+        "the superseding request waits for the server's old session to finish"
+    );
+    release_first.send(()).expect("first request still pending");
+    cx.run_until_parked();
+    assert_eq!(requests.lock().len(), 2);
+    cx.update_editor(|editor, window, cx| {
+        editor.backspace(&Backspace, window, cx);
+        editor
+            .confirm_completion(&ConfirmCompletion::default(), window, cx)
+            .expect("stale menu should defer acceptance")
+    })
+    .await
+    .expect("stale acceptance is quiet");
+    assert!(executed.lock().is_empty());
+    cx.run_until_parked();
+    assert_eq!(
+        requests
+            .lock()
+            .iter()
+            .map(|position| position.character)
+            .collect::<Vec<_>>(),
+        vec![2, 3, 2]
+    );
+    cx.update_editor(|editor, window, cx| {
+        editor
+            .confirm_completion(&ConfirmCompletion::default(), window, cx)
+            .expect("refreshed menu")
+    })
+    .await
+    .expect("fresh completion applies");
+    cx.run_until_parked();
+    assert_eq!(*executed.lock(), vec![3]);
+    cx.assert_editor_state("Button()ˇ");
+}
+
+#[gpui::test]
+async fn test_kotlin_completion_resolve_cannot_accept_a_replaced_session(cx: &mut TestAppContext) {
+    init_test(cx, |settings| {
+        settings.defaults.show_completions_on_input = Some(false);
+    });
+    let mut cx = kotlin_command_completion_context(true, cx).await;
+    cx.set_state("Butˇ");
+    let keys = Arc::new(Mutex::new(0));
+    cx.set_request_handler::<lsp::request::Completion, _, _>({
+        let keys = keys.clone();
+        move |_, params, _| {
+            let key = {
+                let mut keys = keys.lock();
+                *keys += 1;
+                *keys
+            };
+            async move {
+                Ok(Some(lsp::CompletionResponse::Array(vec![
+                    kotlin_command_item(params.text_document_position.position, key),
+                ])))
+            }
+        }
+    });
+    let (release_resolve, resolve_released) = futures::channel::oneshot::channel();
+    let resolve_released = resolve_released.shared();
+    let resolves = Arc::new(Mutex::new(0));
+    cx.set_request_handler::<lsp::request::ResolveCompletionItem, _, _>({
+        let resolves = resolves.clone();
+        move |_, item, _| {
+            *resolves.lock() += 1;
+            let released = resolve_released.clone();
+            async move {
+                released.await.expect("resolve released");
+                Ok(lsp::CompletionItem {
+                    label: item.label,
+                    documentation: Some(lsp::Documentation::String(
+                        "resolved documentation".into(),
+                    )),
+                    ..Default::default()
+                })
+            }
+        }
+    });
+    let executed = Arc::new(Mutex::new(Vec::new()));
+    cx.set_request_handler::<lsp::request::ExecuteCommand, _, _>({
+        let executed = executed.clone();
+        move |_, params, _| {
+            executed.lock().push(params.arguments);
+            async { Ok(None) }
+        }
+    });
+    cx.update_editor(|editor, window, cx| editor.show_completions(&ShowCompletions, window, cx));
+    cx.run_until_parked();
+    let acceptance = cx.update_editor(|editor, window, cx| {
+        editor
+            .confirm_completion(&ConfirmCompletion::default(), window, cx)
+            .expect("completion menu")
+    });
+    cx.run_until_parked();
+    assert!(*resolves.lock() > 0);
+    cx.update_editor(|editor, window, cx| editor.show_completions(&ShowCompletions, window, cx));
+    cx.run_until_parked();
+    assert_eq!(*keys.lock(), 2);
+    release_resolve.send(()).expect("resolution pending");
+    acceptance
+        .await
+        .expect("replaced session quietly stops acceptance");
+    cx.run_until_parked();
+    assert!(executed.lock().is_empty());
+    cx.assert_editor_state("Butˇ");
+    cx.update_editor(|editor, _, _| {
+        let completions = editor.current_completions().expect("current completion menu");
+        let item = completions.first().expect("current item").source.lsp_completion(false).expect("LSP item");
+        assert_eq!(item.data, Some(json!({"KotlinCompletionItemKey": 2, "configurationEntryId": "KotlinCompletionProvider"})));
+    });
+    cx.update_editor(|editor, window, cx| {
+        editor
+            .confirm_completion(&ConfirmCompletion::default(), window, cx)
+            .expect("replacement menu")
+    })
+    .await
+    .expect("current command remains available after partial resolve");
+    assert_eq!(*executed.lock(), vec![vec![json!(2)]]);
+}
+
+#[gpui::test]
+async fn test_kotlin_completion_command_rejects_late_edits_and_caret(cx: &mut TestAppContext) {
+    init_test(cx, |settings| {
+        settings.defaults.show_completions_on_input = Some(false);
+    });
+    let mut cx = kotlin_command_completion_context(false, cx).await;
+    cx.set_request_handler::<lsp::request::Completion, _, _>(|_, params, _| async move {
+        Ok(Some(lsp::CompletionResponse::Array(vec![
+            kotlin_command_item(params.text_document_position.position, 1),
+        ])))
+    });
+    for replace_session in [false, true] {
+        cx.set_state("Butˇ");
+        let (release_command, command_released) = futures::channel::oneshot::channel();
+        let (command_started, started) = futures::channel::oneshot::channel();
+        cx.set_request_handler::<lsp::request::ExecuteCommand, _, _>({
+            let server = cx.lsp.server.clone();
+            let mut command_released = Some(command_released);
+            let mut command_started = Some(command_started);
+            move |uri, _, _| {
+                command_started
+                    .take()
+                    .expect("one command")
+                    .send(())
+                    .expect("observe command");
+                let command_released = command_released.take().expect("one command response");
+                let server = server.clone();
+                async move {
+                    command_released.await.expect("release command");
+                    let response = server
+                        .request::<lsp::request::ApplyWorkspaceEdit>(
+                            lsp::ApplyWorkspaceEditParams {
+                                label: None,
+                                edit: lsp::WorkspaceEdit::new(
+                                    [(
+                                        uri.clone(),
+                                        vec![lsp::TextEdit::new(
+                                            lsp::Range::new(
+                                                lsp::Position::default(),
+                                                lsp::Position::new(0, 3),
+                                            ),
+                                            "Button()".into(),
+                                        )],
+                                    )]
+                                    .into_iter()
+                                    .collect(),
+                                ),
+                            },
+                            DEFAULT_LSP_REQUEST_TIMEOUT,
+                        )
+                        .await
+                        .into_response()?;
+                    assert!(!response.applied);
+                    assert!(
+                        response
+                            .failure_reason
+                            .is_some_and(|reason| reason.contains("Completion expired"))
+                    );
+                    let response = server
+                        .request::<lsp::request::ShowDocument>(
+                            lsp::ShowDocumentParams {
+                                uri,
+                                external: None,
+                                take_focus: Some(true),
+                                selection: Some(lsp::Range::default()),
+                            },
+                            DEFAULT_LSP_REQUEST_TIMEOUT,
+                        )
+                        .await
+                        .into_response()?;
+                    assert!(
+                        !response.success,
+                        "a rejected insertion must not move the caret"
+                    );
+                    Ok(None)
+                }
+            }
+        });
+        cx.update_editor(|editor, window, cx| {
+            editor.show_completions(&ShowCompletions, window, cx)
+        });
+        cx.run_until_parked();
+        let acceptance = cx.update_editor(|editor, window, cx| {
+            editor
+                .confirm_completion(&ConfirmCompletion::default(), window, cx)
+                .expect("completion menu")
+        });
+        cx.run_until_parked();
+        started
+            .now_or_never()
+            .expect("command is in flight")
+            .expect("command started");
+        cx.update_editor(|editor, window, cx| {
+            if replace_session {
+                editor.show_completions(&ShowCompletions, window, cx);
+            } else {
+                editor.handle_input("t", window, cx);
+            }
+        });
+        cx.run_until_parked();
+        release_command.send(()).expect("command pending");
+        acceptance
+            .await
+            .expect("rejected edit does not fail transport");
+        cx.run_until_parked();
+        cx.assert_editor_state(if replace_session { "Butˇ" } else { "Buttˇ" });
+    }
+}
+
+#[gpui::test]
+async fn test_kotlin_completion_cannot_navigate_after_opening_document(cx: &mut TestAppContext) {
+    init_test(cx, |settings| {
+        settings.defaults.show_completions_on_input = Some(false);
+    });
+    let mut cx = kotlin_command_completion_context(false, cx).await;
+    cx.set_state("Butˇ");
+    let target_path = EditorLspTestContext::root_path().join("target.kt");
+    let project = cx.update_workspace(|workspace, _, _| workspace.project().clone());
+    let fs = cx.update_workspace(|workspace, _, cx| workspace.project().read(cx).fs().clone());
+    fs.as_fake()
+        .insert_file(&target_path, b"target".to_vec())
+        .await;
+    let source = cx.update_editor(|editor, _, cx| {
+        editor
+            .buffer()
+            .read(cx)
+            .as_singleton()
+            .expect("source buffer")
+    });
+    let navigated = Arc::new(AtomicBool::new(false));
+    let _subscription = cx.update_workspace(|_, _, cx| {
+        cx.subscribe(&project, {
+            let source = source.clone();
+            let navigated = navigated.clone();
+            move |_, project, event, cx| {
+                if let project::Event::LanguageServerShowDocument(request) = event {
+                    assert!(request.is_current(project.read(cx).lsp_store().read(cx), cx));
+                    // The workspace's earlier subscriber has started loading the target, but
+                    // its task cannot navigate until this event finishes dispatching.
+                    source.update(cx, |buffer, cx| buffer.edit([(0..0, "//")], None, cx));
+                    navigated.store(true, atomic::Ordering::SeqCst);
+                }
+            }
+        })
+    });
+    cx.set_request_handler::<lsp::request::Completion, _, _>(|_, params, _| async move {
+        Ok(Some(lsp::CompletionResponse::Array(vec![
+            kotlin_command_item(params.text_document_position.position, 1),
+        ])))
+    });
+    cx.set_request_handler::<lsp::request::ExecuteCommand, _, _>({
+        let server = cx.lsp.server.clone();
+        move |_, _, _| {
+            let server = server.clone();
+            let uri = lsp::Uri::from_file_path(&target_path).expect("target URI");
+            async move {
+                let response = server
+                    .request::<lsp::request::ShowDocument>(
+                        lsp::ShowDocumentParams {
+                            uri,
+                            external: None,
+                            take_focus: Some(true),
+                            selection: Some(lsp::Range::default()),
+                        },
+                        DEFAULT_LSP_REQUEST_TIMEOUT,
+                    )
+                    .await
+                    .into_response()?;
+                assert!(
+                    !response.success,
+                    "typing during target loading cancels navigation"
+                );
+                Ok(None)
+            }
+        }
+    });
+    cx.update_editor(|editor, window, cx| editor.show_completions(&ShowCompletions, window, cx));
+    cx.run_until_parked();
+    cx.update_editor(|editor, window, cx| {
+        editor
+            .confirm_completion(&ConfirmCompletion::default(), window, cx)
+            .expect("completion")
+    })
+    .await
+    .expect("command response");
+    cx.run_until_parked();
+    assert!(navigated.load(atomic::Ordering::SeqCst));
+    cx.assert_editor_state("//Butˇ");
+    cx.update_workspace(|workspace, _, cx| {
+        let active = workspace
+            .active_item_as::<Editor>(cx)
+            .expect("active editor");
+        assert_eq!(
+            active.read(cx).buffer().read(cx).as_singleton(),
+            Some(source)
+        );
+    });
+}
+
+fn kotlin_command_item(position: lsp::Position, key: usize) -> lsp::CompletionItem {
+    let range = lsp::Range::new(position, position);
+    lsp::CompletionItem {
+        label: "Button".into(),
+        text_edit: Some(lsp::CompletionTextEdit::InsertAndReplace(
+            lsp::InsertReplaceEdit {
+                new_text: String::new(),
+                insert: range,
+                replace: range,
+            },
+        )),
+        command: Some(lsp::Command {
+            title: "Apply Completion".into(),
+            command: "jetbrains.kotlin.completion.apply".into(),
+            arguments: Some(vec![json!(key)]),
+        }),
+        data: Some(
+            json!({"KotlinCompletionItemKey": key, "configurationEntryId": "KotlinCompletionProvider"}),
+        ),
+        ..Default::default()
+    }
+}
+
+#[gpui::test]
+#[ignore = "Requires ZED_KOTLIN_CLIENT_PROBE_CONFIG and a real Kotlin LSP installation"]
+async fn test_real_kotlin_editor_completion_and_navigation(cx: &mut TestAppContext) {
+    use std::io::Write as _;
+
+    let config_path = std::env::var("ZED_KOTLIN_CLIENT_PROBE_CONFIG").expect("probe config path");
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(config_path).expect("read probe config"))
+            .expect("parse probe config");
+    let root = std::path::PathBuf::from(config["root"].as_str().expect("fixture root"));
+    let source_path = root.join(config["source"].as_str().expect("relative source path"));
+    let output = std::path::PathBuf::from(config["output"].as_str().expect("output directory"));
+    std::fs::create_dir_all(&output).expect("create probe output");
+    let original_disk_text = std::fs::read_to_string(&source_path).expect("read fixture source");
+    let warm_samples = config["warm_samples"].as_u64().unwrap_or(30);
+    let completion_warm_samples = config["completion_warm_samples"]
+        .as_u64()
+        .unwrap_or(warm_samples);
+    let completion_refinement = config["completion_refinement"] == true;
+    let started = Instant::now();
+    let mut report = json!({
+        "harness": "real Kotlin subprocess, RealFs, GPUI test window, debug client",
+        "root": root, "source": source_path, "client_pid": std::process::id(),
+        "samples": [], "memory": [], "phase": "starting",
+        "completion_preparation": if completion_refinement { "delete and retype only the prefix using Editor actions" } else { "replace whole function before typing each prefix" },
+        "warm_samples": warm_samples, "completion_warm_samples": completion_warm_samples,
+        "request_order": ["definition_after_edit", "definition_unchanged", "string", "modifier", "named_argument", "acceptance"],
+    });
+    let write_report = |report: &serde_json::Value| {
+        std::fs::write(
+            output.join("results.json"),
+            serde_json::to_vec_pretty(report).expect("serialize report"),
+        )
+        .expect("write report");
+    };
+    write_report(&report);
+
+    init_test(cx, |settings| {
+        settings.defaults.show_completions_on_input = Some(false);
+    });
+    // External subprocess IO must park in real time; advancing the deterministic
+    // scheduler to its next timer would make LSP requests expire immediately.
+    cx.executor().allow_parking();
+    cx.update_global::<SettingsStore, _>(|store, cx| {
+        store
+            .set_user_settings(
+                &json!({
+                    "show_completions_on_input": false,
+                    "languages": {"Kotlin": {"language_servers": ["kotlin-lsp"]}},
+                    "lsp": {"kotlin-lsp": {
+                        "binary": config["binary"],
+                        "initialization_options": config["initialization_options"],
+                    }},
+                })
+                .to_string(),
+                cx,
+            )
+            .expect("explicit real server settings");
+    });
+    let fs = fs::RealFs::new(None, cx.executor());
+    let app_state = cx.update(|cx| {
+        let mut state = workspace::AppState::test(cx);
+        Arc::get_mut(&mut state)
+            .expect("unshared test app state")
+            .fs = fs.clone();
+        <dyn fs::Fs>::set_global(fs.clone(), cx);
+        workspace::init(state.clone(), cx);
+        state
+    });
+    let project = Project::test(fs, [root.as_path()], cx).await;
+    let registry = project.read_with(cx, |project, _| project.languages().clone());
+    registry.add(Arc::new(language::Language::new(
+        LanguageConfig {
+            name: "Kotlin".into(),
+            matcher: LanguageMatcher {
+                path_suffixes: vec!["kt".into()],
+                ..Default::default()
+            }
+            .into(),
+            ..Default::default()
+        },
+        None,
+    )));
+    registry.register_fake_lsp_adapter(
+        "Kotlin",
+        FakeLspAdapter {
+            name: "kotlin-lsp",
+            language_server_binary: lsp::LanguageServerBinary {
+                path: config["binary"]["path"]
+                    .as_str()
+                    .expect("server path")
+                    .into(),
+                arguments: config["binary"]["arguments"]
+                    .as_array()
+                    .expect("server arguments")
+                    .iter()
+                    .map(|argument| argument.as_str().expect("argument string").into())
+                    .collect(),
+                env: Some(
+                    serde_json::from_value(config["binary"]["env"].clone())
+                        .expect("server environment"),
+                ),
+            },
+            initialization_options: Some(config["initialization_options"].clone()),
+            ..Default::default()
+        },
+    );
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(&source_path, cx)
+        })
+        .await
+        .expect("open real source buffer");
+    let _buffer_registration = project.update(cx, |project, cx| {
+        project.register_buffer_with_language_servers(&buffer, cx)
+    });
+    let lsp_store = project.read_with(cx, |project, _| project.lsp_store());
+    kotlin_live_wait(&lsp_store, cx, |store, _| {
+        store
+            .language_server_statuses()
+            .any(|(id, _)| store.language_server_for_id(id).is_some())
+    })
+    .await;
+    let server = lsp_store
+        .read_with(cx, |store, _| {
+            store
+                .language_server_statuses()
+                .find_map(|(id, _)| store.language_server_for_id(id))
+        })
+        .expect("running real language server");
+    report["server_pid"] = json!(server.process_id());
+    report["initialize_milliseconds"] = json!(started.elapsed().as_secs_f64() * 1000.0);
+    report["phase"] = json!("importing");
+    write_report(&report);
+    let (ready, readiness) = oneshot::channel();
+    let mut ready = Some(ready);
+    let mut import_finished = false;
+    let mut saw_indexing = false;
+    let mut indexing = HashSet::default();
+    let mut wire_log = std::fs::File::create(output.join("wire.jsonl")).expect("wire log");
+    let _io = server.on_io(move |kind, message| {
+        writeln!(wire_log, "{}", json!({"seconds": started.elapsed().as_secs_f64(), "kind": format!("{kind:?}"), "message": message}))
+            .expect("write wire log");
+        let Ok(message) = serde_json::from_str::<serde_json::Value>(message) else { return; };
+        if !matches!(kind, lsp::IoKind::StdOut) { return; }
+        let params = &message["params"];
+        match message["method"].as_str() {
+            Some("intellij/importLog") => {
+                if params["failed"] == true {
+                    if let Some(ready) = ready.take() {
+                        ready.send(Err(format!("project import failed: {params}"))).expect("readiness receiver");
+                    }
+                }
+                if params["succeeded"] == true { import_finished = true; }
+            }
+            Some("$/progress") => {
+                if params["value"]["kind"] == "begin" && params["value"]["title"] == "Indexing" {
+                    indexing.insert(params["token"].to_string());
+                    saw_indexing = true;
+                } else if params["value"]["kind"] == "end" {
+                    indexing.remove(&params["token"].to_string());
+                }
+            }
+            _ => {}
+        }
+        if import_finished && saw_indexing && indexing.is_empty() {
+            if let Some(ready) = ready.take() { ready.send(Ok(())).expect("readiness receiver"); }
+        }
+    });
+    let mut readiness = readiness.fuse();
+    let readiness_started = Instant::now();
+    loop {
+        let heartbeat = cx.executor().timer(Duration::from_secs(1)).fuse();
+        futures::pin_mut!(heartbeat);
+        futures::select_biased! {
+            result = readiness => {
+                result.expect("readiness notification").expect("import and indexing succeeded");
+                break;
+            },
+            _ = heartbeat => assert!(readiness_started.elapsed() < Duration::from_secs(180), "real Kotlin import timed out"),
+        }
+    }
+    report["ready_milliseconds"] = json!(started.elapsed().as_secs_f64() * 1000.0);
+    report["memory"]
+        .as_array_mut()
+        .expect("memory samples")
+        .push(kotlin_live_memory("ready", server.process_id().expect("server PID")).await);
+    report["phase"] = json!("editor");
+    write_report(&report);
+    eprintln!(
+        "real Kotlin import/index ready in {} ms",
+        report["ready_milliseconds"]
+    );
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let workspace = multi_workspace.read_with(cx, |multi, _| multi.workspace().clone());
+    let editor = workspace.update_in(cx, |workspace, window, cx| {
+        workspace.open_project_item::<Editor>(
+            None,
+            buffer.clone(),
+            true,
+            true,
+            true,
+            false,
+            window,
+            cx,
+        )
+    });
+    editor.update_in(cx, |editor, window, cx| {
+        editor.disable_word_completions();
+        window.focus(&editor.focus_handle(cx), cx);
+    });
+    let source = "package liveclientprobe\nimport androidx.compose.runtime.Composable\nimport androidx.compose.ui.Modifier\nimport androidx.compose.material3.Text\nimport androidx.compose.material3.MaterialTheme\n\n";
+    let mut definition_editor_id = None;
+    for (scenario, replace_text) in [
+        ("definition_after_edit", true),
+        ("definition_unchanged", false),
+    ] {
+        for sample in 0..=warm_samples {
+            let text = format!(
+                "{source}@Composable\nprivate fun clientDefinition() {{ MaterialTheme.typography.headlineSmall }}\n"
+            );
+            let position =
+                MultiBufferOffset(text.find("headlineSmall").expect("definition symbol") + 1);
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.activate_item(&editor, true, true, window, cx);
+            });
+            editor.update_in(cx, |editor, window, cx| {
+                editor.hide_context_menu(window, cx);
+                if replace_text {
+                    editor.set_text(text, window, cx);
+                }
+                editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                    selections.select_ranges([position..position])
+                });
+            });
+            let sample_started = Instant::now();
+            let sample_start_seconds = started.elapsed().as_secs_f64();
+            let navigated = editor
+                .update_in(cx, |editor, window, cx| {
+                    editor.go_to_definition(&GoToDefinition::default(), window, cx)
+                })
+                .await
+                .expect("real definition navigation");
+            assert_eq!(navigated, Navigated::Yes);
+            let navigation_milliseconds = sample_started.elapsed().as_secs_f64() * 1000.0;
+            let drawing_started = Instant::now();
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            let drawing_milliseconds = drawing_started.elapsed().as_secs_f64() * 1000.0;
+            let (target, target_editor_id, editor_count) =
+                workspace.read_with(cx, |workspace, cx| {
+                    let target = workspace
+                        .active_item_as::<Editor>(cx)
+                        .expect("definition editor");
+                    let buffer = target
+                        .read(cx)
+                        .buffer()
+                        .read(cx)
+                        .as_singleton()
+                        .expect("definition buffer");
+                    assert!(buffer.read(cx).read_only());
+                    let uri = buffer
+                        .read(cx)
+                        .language_server_document()
+                        .expect("virtual definition metadata")
+                        .uri
+                        .clone();
+                    (
+                        uri,
+                        target.entity_id().as_u64(),
+                        workspace.items_of_type::<Editor>(cx).count(),
+                    )
+                });
+            assert_eq!(
+                editor_count, 2,
+                "library navigation must reuse the existing tab"
+            );
+            if let Some(previous_editor_id) = definition_editor_id {
+                assert_eq!(target_editor_id, previous_editor_id);
+            } else {
+                definition_editor_id = Some(target_editor_id);
+            }
+            report["samples"]
+            .as_array_mut()
+            .expect("samples")
+            .push(json!({
+                "scenario": scenario, "sample": sample,
+                "start_seconds": sample_start_seconds,
+                "navigation_milliseconds": navigation_milliseconds, "drawing_milliseconds": drawing_milliseconds,
+                "target_editor_id": target_editor_id, "editor_count": editor_count,
+                "milliseconds": sample_started.elapsed().as_secs_f64() * 1000.0, "target": target,
+            }));
+            write_report(&report);
+        }
+    }
+    workspace.update_in(cx, |workspace, window, cx| {
+        workspace.activate_item(&editor, true, true, window, cx);
+    });
+    for (scenario, before, input, expected) in [
+        (
+            "string",
+            "val greeting = \"hello\"\n greeting.",
+            "len",
+            "length",
+        ),
+        ("modifier", "Modifier.", "pa", "padding"),
+        ("named_argument", "Text(", "te", "text ="),
+    ] {
+        for sample in 0..=completion_warm_samples {
+            let function_name = if completion_refinement {
+                "clientProbe".to_string()
+            } else {
+                format!("clientProbe{sample}")
+            };
+            let text = format!("{source}@Composable\nprivate fun {function_name}() {{\n {before}");
+            editor.update_in(cx, |editor, window, cx| {
+                editor.hide_context_menu(window, cx);
+                if sample == 0 || !completion_refinement {
+                    editor.set_text(text, window, cx);
+                    let end = editor.buffer().read(cx).len(cx);
+                    editor.change_selections(
+                        SelectionEffects::no_scroll(),
+                        window,
+                        cx,
+                        |selections| selections.select_ranges([end..end]),
+                    );
+                } else {
+                    let end = editor.buffer().read(cx).len(cx);
+                    let start = MultiBufferOffset(
+                        end.0
+                            .checked_sub(input.len())
+                            .expect("previous completion prefix"),
+                    );
+                    editor.change_selections(
+                        SelectionEffects::no_scroll(),
+                        window,
+                        cx,
+                        |selections| selections.select_ranges([start..end]),
+                    );
+                    editor.backspace(&Backspace, window, cx);
+                }
+            });
+            let sample_started = Instant::now();
+            editor.update_in(cx, |editor, window, cx| {
+                editor.handle_input(input, window, cx);
+                editor.show_completions(&ShowCompletions, window, cx);
+            });
+            kotlin_live_wait(&editor, cx, |editor, _| {
+                kotlin_live_completion_index(editor, expected).is_some()
+            })
+            .await;
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            let elapsed = sample_started.elapsed().as_secs_f64() * 1000.0;
+            report["samples"].as_array_mut().expect("samples").push(json!({
+                "scenario": scenario, "sample": sample, "milliseconds": elapsed,
+                "rank": editor.read_with(cx, |editor, _| kotlin_live_completion_index(editor, expected)),
+            }));
+            write_report(&report);
+        }
+        eprintln!(
+            "real editor completed {scenario}: first + {completion_warm_samples} warm samples"
+        );
+    }
+
+    editor.update_in(cx, |editor, window, cx| {
+        editor.hide_context_menu(window, cx);
+        editor.set_text(
+            format!("{source}@Composable\nprivate fun clientAccept() {{\n But"),
+            window,
+            cx,
+        );
+        let end = editor.buffer().read(cx).len(cx);
+        editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+            selections.select_ranges([end..end])
+        });
+        editor.show_completions(&ShowCompletions, window, cx);
+    });
+    kotlin_live_wait(&editor, cx, |editor, _| {
+        kotlin_live_completion_index(editor, "Button").is_some()
+    })
+    .await;
+    let accepted = Instant::now();
+    editor
+        .update_in(cx, |editor, window, cx| {
+            let index = kotlin_live_completion_index(editor, "Button").expect("Button completion");
+            editor
+                .confirm_completion(
+                    &ConfirmCompletion {
+                        item_ix: Some(index),
+                    },
+                    window,
+                    cx,
+                )
+                .expect("completion acceptance")
+        })
+        .await
+        .expect("real command completion acceptance");
+    let (accepted_text, caret) = editor.read_with(cx, |editor, cx| {
+        (
+            editor.text(cx),
+            editor
+                .selections
+                .newest_anchor()
+                .head()
+                .to_offset(&editor.buffer().read(cx).snapshot(cx))
+                .0,
+        )
+    });
+    assert_eq!(
+        accepted_text
+            .matches("import androidx.compose.material3.Button\n")
+            .count(),
+        1
+    );
+    assert!(accepted_text.contains("Button("));
+    assert!(
+        caret
+            > accepted_text
+                .find("private fun clientAccept")
+                .expect("probe function")
+    );
+    if config["require_compose"] == true {
+        assert!(accepted_text.contains("Button() {"), "{accepted_text}");
+    }
+    report["acceptance"] = json!({"milliseconds": accepted.elapsed().as_secs_f64() * 1000.0, "text": accepted_text, "caret": caret});
+    write_report(&report);
+
+    assert_eq!(
+        std::fs::read_to_string(&source_path).expect("source after probe"),
+        original_disk_text
+    );
+    report["memory"]
+        .as_array_mut()
+        .expect("memory samples")
+        .push(kotlin_live_memory("after_samples", server.process_id().expect("server PID")).await);
+    report["phase"] = json!("complete");
+    write_report(&report);
+    lsp_store
+        .update(cx, |store, cx| {
+            store.stop_language_servers_for_buffers(vec![buffer], HashSet::default(), cx)
+        })
+        .await
+        .expect("stop real language server");
+    drop(app_state);
+}
+
+async fn kotlin_live_wait<T: 'static>(
+    entity: &Entity<T>,
+    cx: &mut TestAppContext,
+    mut ready: impl FnMut(&T, &App) -> bool,
+) {
+    let mut notifications = cx.notifications(entity);
+    let started = Instant::now();
+    loop {
+        if entity.read_with(cx, &mut ready) {
+            return;
+        }
+        let heartbeat = cx.executor().timer(Duration::from_secs(1)).fuse();
+        futures::pin_mut!(heartbeat);
+        futures::select_biased! {
+            notification = notifications.next().fuse() => assert!(notification.is_some(), "probe entity dropped"),
+            _ = heartbeat => assert!(started.elapsed() < Duration::from_secs(180), "real Kotlin editor probe timed out"),
+        }
+    }
+}
+
+fn kotlin_live_completion_index(editor: &Editor, expected: &str) -> Option<usize> {
+    let menu = editor.context_menu.borrow();
+    let CodeContextMenu::Completions(menu) = menu.as_ref()? else {
+        return None;
+    };
+    let completions = menu.completions.borrow();
+    menu.entries.borrow().iter().position(|entry| {
+        entry
+            .as_match()
+            .and_then(|entry| completions.get(entry.candidate_id))
+            .and_then(|completion| completion.source.lsp_completion(false))
+            .is_some_and(|completion| completion.label.trim() == expected)
+    })
+}
+
+async fn kotlin_live_memory(phase: &str, server_pid: u32) -> serde_json::Value {
+    let output = util::command::new_command("ps")
+        .args(["-axo", "pid=,ppid=,rss=,command="])
+        .output()
+        .await
+        .expect("read process memory");
+    assert!(output.status.success());
+    let processes = String::from_utf8(output.stdout)
+        .expect("process output")
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            Some((
+                fields.next()?.parse::<u32>().ok()?,
+                fields.next()?.parse::<u32>().ok()?,
+                fields.next()?.parse::<u64>().ok()?,
+                fields.collect::<Vec<_>>().join(" "),
+            ))
+        })
+        .collect::<Vec<_>>();
+    let client_pid = std::process::id();
+    let mut owned = HashSet::from_iter([client_pid, server_pid]);
+    loop {
+        let previous = owned.len();
+        for (pid, parent, _, command) in &processes {
+            if owned.contains(parent) && !command.starts_with("ps ") {
+                owned.insert(*pid);
+            }
+        }
+        if owned.len() == previous {
+            break;
+        }
+    }
+    let selected = processes.into_iter().filter(|(pid, _, _, command)| {
+        owned.contains(pid) || command.contains("org.gradle.launcher.daemon.bootstrap.GradleDaemon")
+    }).map(|(pid, parent, rss, command)| json!({
+        "pid": pid, "parent_pid": parent, "rss_kib": rss,
+        "role": if pid == client_pid { "debug_editor_client" } else if pid == server_pid { "kotlin_lsp_jvm" } else if command.contains("GradleDaemon") { "gradle_daemon" } else { "owned_child" },
+        "owned_by_probe": owned.contains(&pid), "command": command,
+    })).collect::<Vec<_>>();
+    let total = selected
+        .iter()
+        .map(|process| process["rss_kib"].as_u64().expect("RSS"))
+        .sum::<u64>();
+    let owned_total = selected
+        .iter()
+        .filter(|process| process["owned_by_probe"] == true)
+        .map(|process| process["rss_kib"].as_u64().expect("RSS"))
+        .sum::<u64>();
+    json!({"phase": phase, "processes": selected, "owned_rss_kib": owned_total,
+        "including_shared_gradle_rss_kib": total,
+        "gradle_note": "All machine Gradle daemons are listed separately; reused daemons can be shared with other runs.",
+        "jdt_active_in_probe": false, "compose_preview_active_in_probe": false})
+}
+
+async fn kotlin_command_completion_context(
+    resolve: bool,
+    cx: &mut TestAppContext,
+) -> EditorLspTestContext {
+    let mut context = EditorLspTestContext::new(
+        language::Language::new(
+            LanguageConfig {
+                name: "Kotlin".into(),
+                matcher: LanguageMatcher {
+                    path_suffixes: vec!["kt".into()],
+                    ..Default::default()
+                }
+                .into(),
+                ..Default::default()
+            },
+            None,
+        ),
+        lsp::ServerCapabilities {
+            text_document_sync: Some(lsp::TextDocumentSyncCapability::Kind(
+                lsp::TextDocumentSyncKind::INCREMENTAL,
+            )),
+            completion_provider: Some(lsp::CompletionOptions {
+                resolve_provider: Some(resolve),
+                ..Default::default()
+            }),
+            execute_command_provider: Some(lsp::ExecuteCommandOptions {
+                commands: vec!["jetbrains.kotlin.completion.apply".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        cx,
+    )
+    .await;
+    context.update_editor(|editor, _, _| editor.disable_word_completions());
+    context
 }
 
 #[gpui::test]

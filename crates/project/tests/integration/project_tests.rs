@@ -5135,28 +5135,54 @@ async fn test_workspace_diagnostics_long_poll_is_kept_open(cx: &mut gpui::TestAp
         .lock()
         .clone()
         .expect("the workspace diagnostics pull should carry a partial result token");
+    let nonfile_uri = Uri::from_file_path(path!("/dir/a.rs"))
+        .unwrap()
+        .as_str()
+        .replacen("file:", "jar:", 1)
+        .parse::<Uri>()
+        .unwrap();
     fake_server.notify::<lsp::notification::Progress>(lsp::ProgressParams {
         token,
         value: lsp::ProgressParamsValue::WorkspaceDiagnostic(
             lsp::WorkspaceDiagnosticReportResult::Report(lsp::WorkspaceDiagnosticReport {
-                items: vec![lsp::WorkspaceDocumentDiagnosticReport::Full(
-                    lsp::WorkspaceFullDocumentDiagnosticReport {
-                        uri: lsp::Uri::from_file_path(path!("/dir/b.rs")).unwrap(),
-                        version: None,
-                        full_document_diagnostic_report: lsp::FullDocumentDiagnosticReport {
-                            result_id: Some("ws-1".to_string()),
-                            items: vec![lsp::Diagnostic {
-                                range: lsp::Range::new(
-                                    lsp::Position::new(0, 0),
-                                    lsp::Position::new(0, 3),
-                                ),
-                                severity: Some(lsp::DiagnosticSeverity::ERROR),
-                                message: lsp::DiagnosticMessage::from("streamed error"),
-                                ..lsp::Diagnostic::default()
-                            }],
+                items: vec![
+                    lsp::WorkspaceDocumentDiagnosticReport::Full(
+                        lsp::WorkspaceFullDocumentDiagnosticReport {
+                            uri: lsp::Uri::from_file_path(path!("/dir/b.rs")).unwrap(),
+                            version: None,
+                            full_document_diagnostic_report: lsp::FullDocumentDiagnosticReport {
+                                result_id: Some("ws-1".to_string()),
+                                items: vec![lsp::Diagnostic {
+                                    range: lsp::Range::new(
+                                        lsp::Position::new(0, 0),
+                                        lsp::Position::new(0, 3),
+                                    ),
+                                    severity: Some(lsp::DiagnosticSeverity::ERROR),
+                                    message: lsp::DiagnosticMessage::from("streamed error"),
+                                    ..lsp::Diagnostic::default()
+                                }],
+                            },
                         },
-                    },
-                )],
+                    ),
+                    lsp::WorkspaceDocumentDiagnosticReport::Full(
+                        lsp::WorkspaceFullDocumentDiagnosticReport {
+                            uri: nonfile_uri,
+                            version: None,
+                            full_document_diagnostic_report: lsp::FullDocumentDiagnosticReport {
+                                result_id: Some("must-not-attach-to-a".into()),
+                                items: vec![lsp::Diagnostic {
+                                    range: lsp::Range::new(
+                                        lsp::Position::new(0, 0),
+                                        lsp::Position::new(0, 3),
+                                    ),
+                                    severity: Some(lsp::DiagnosticSeverity::ERROR),
+                                    message: "nonfile error".into(),
+                                    ..lsp::Diagnostic::default()
+                                }],
+                            },
+                        },
+                    ),
+                ],
             }),
         ),
     });
@@ -5169,6 +5195,14 @@ async fn test_workspace_diagnostics_long_poll_is_kept_open(cx: &mut gpui::TestAp
                 warning_count: 0,
             },
             "partial results streamed over the open request must still be applied"
+        );
+        assert_eq!(
+            project
+                .lsp_store()
+                .read(cx)
+                .result_ids_for_workspace_refresh(fake_server.server.server_id(), &None,),
+            HashMap::from_iter([(PathBuf::from(path!("/dir/b.rs")), "ws-1".into())]),
+            "nonfile result IDs must not be attached to a filesystem buffer"
         );
     });
 

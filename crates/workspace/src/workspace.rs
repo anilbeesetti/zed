@@ -3166,6 +3166,7 @@ impl Workspace {
         cb: &mut dyn FnMut(&mut NavHistory, &mut App) -> Option<NavigationEntry>,
         cx: &mut Context<Workspace>,
     ) -> Task<Result<()>> {
+        let mut restore = None;
         let to_load = if let Some(pane) = pane.upgrade() {
             pane.update(cx, |pane, cx| {
                 window.focus(&pane.focus_handle(cx), cx);
@@ -3193,6 +3194,17 @@ impl Workspace {
                             break None;
                         }
                     } else {
+                        if let Some(data) = entry.data.clone()
+                            && let Some(task) = entry.item.restore_navigation(
+                                self.project.clone(),
+                                data,
+                                window,
+                                cx,
+                            )
+                        {
+                            restore = Some((task, entry));
+                            break None;
+                        }
                         // If the item is no longer present in this pane, then retrieve its
                         // path info in order to reopen it.
                         if let Some((project_path, abs_path)) =
@@ -3206,6 +3218,32 @@ impl Workspace {
         } else {
             None
         };
+
+        if let Some((restore, entry)) = restore {
+            return cx.spawn_in(window, async move |workspace, cx| {
+                let item = match restore.await {
+                    Ok(item) => item,
+                    Err(error) => {
+                        workspace.update(cx, |workspace, cx| {
+                            workspace.show_error(
+                                format!("Unable to reopen library document: {error}"),
+                                cx,
+                            )
+                        })?;
+                        return Err(error);
+                    }
+                };
+                pane.update_in(cx, |pane, window, cx| {
+                    pane.nav_history_mut().set_mode(mode);
+                    pane.add_item(item.clone(), true, true, None, window, cx);
+                    pane.nav_history_mut().set_mode(NavigationMode::Normal);
+                    if let Some(data) = entry.data {
+                        item.navigate(data, window, cx);
+                    }
+                })?;
+                Ok(())
+            });
+        }
 
         if let Some((project_path, abs_path, entry)) = to_load {
             // If the item was no longer present, then load it again from its previous path, first try the local path
@@ -5334,6 +5372,7 @@ impl Workspace {
         T: ProjectItem,
     {
         use project::ProjectItem as _;
+        let project_item_entity_id = project_item.entity_id();
         let project_item = project_item.read(cx);
         let entry_id = project_item.entry_id(cx);
         let project_path = project_item.project_path(cx);
@@ -5348,7 +5387,17 @@ impl Workspace {
             item = pane.read(cx).item_for_path(project_path, cx);
         }
 
-        item.and_then(|item| item.downcast::<T>())
+        item.and_then(|item| item.downcast::<T>()).or_else(|| {
+            pane.read(cx).items().find_map(|item| {
+                if item.buffer_kind(cx) == ItemBufferKind::Singleton
+                    && item.project_item_model_ids(cx).as_slice() == [project_item_entity_id]
+                {
+                    item.downcast::<T>()
+                } else {
+                    None
+                }
+            })
+        })
     }
 
     pub fn is_project_item_open<T>(

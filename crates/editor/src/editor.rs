@@ -1637,8 +1637,10 @@ enum SelectSyntaxNodeScrollBehavior {
     CursorBottom,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct NavigationData {
+    language_server_document:
+        Option<Result<project::lsp_store::LanguageServerDocumentLocation, String>>,
     cursor_anchor: Anchor,
     cursor_position: Point,
     scroll_anchor: ScrollAnchor,

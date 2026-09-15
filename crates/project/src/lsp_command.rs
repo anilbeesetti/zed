@@ -3368,6 +3368,7 @@ impl LspCommand for GetCompletions {
                         lsp_completion: Box::new(lsp_completion),
                         lsp_defaults: lsp_defaults.clone(),
                         resolved: false,
+                        completion_session: None,
                     },
                 }
             })
@@ -5395,20 +5396,15 @@ impl LspCommand for GetDocumentDiagnostics {
     async fn response_from_lsp(
         self,
         message: lsp::DocumentDiagnosticReportResult,
-        _: Entity<LspStore>,
+        lsp_store: Entity<LspStore>,
         buffer: Entity<Buffer>,
         server_id: LanguageServerId,
         cx: AsyncApp,
     ) -> Result<Self::Response> {
-        let url = buffer.read_with(&cx, |buffer, cx| {
-            buffer
-                .file()
-                .and_then(|file| file.as_local())
-                .map(|file| {
-                    let abs_path = file.abs_path(cx);
-                    file_path_to_lsp_url(&abs_path)
-                })
-                .transpose()?
+        let url = lsp_store.read_with(&cx, |store, cx| {
+            let buffer = buffer.read(cx);
+            store
+                .buffer_lsp_uri(buffer, cx)?
                 .with_context(|| format!("missing url on buffer {}", buffer.remote_id()))
         })?;
 

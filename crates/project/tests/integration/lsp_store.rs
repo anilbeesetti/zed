@@ -29,6 +29,342 @@ use util::{path, rel_path::rel_path};
 use crate::init_test;
 
 #[gpui::test]
+async fn test_kotlin_completion_sessions_expire_on_import_restart_and_other_documents(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/project"),
+        json!({"main.rs": "But", "other.rs": "But"}),
+    )
+    .await;
+    let project = Project::test(fs, [Path::new(path!("/project"))], cx).await;
+    let languages = project.read_with(cx, |project, _| project.languages().clone());
+    languages.add(rust_lang());
+    let mut servers = languages.register_fake_lsp(
+        "Rust",
+        FakeLspAdapter {
+            name: "kotlin-lsp",
+            capabilities: lsp::ServerCapabilities {
+                completion_provider: Some(lsp::CompletionOptions::default()),
+                execute_command_provider: Some(lsp::ExecuteCommandOptions {
+                    commands: vec!["jetbrains.kotlin.completion.apply".into()],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    let (buffer, _handle) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/project/main.rs"), cx)
+        })
+        .await
+        .expect("source opens");
+    let server = servers.next().await.expect("Kotlin server starts");
+    cx.run_until_parked();
+    let install_completions = |server: &lsp::FakeLanguageServer| {
+        server.set_request_handler::<lsp::request::Completion, _, _>(|params, _| async move {
+            let position = params.text_document_position.position;
+            Ok(Some(lsp::CompletionResponse::Array(vec![
+                lsp::CompletionItem {
+                    label: "Button".into(),
+                    text_edit: Some(lsp::CompletionTextEdit::Edit(lsp::TextEdit::new(
+                        lsp::Range::new(position, position),
+                        String::new(),
+                    ))),
+                    command: Some(lsp::Command {
+                        title: "Apply Completion".into(),
+                        command: "jetbrains.kotlin.completion.apply".into(),
+                        arguments: Some(vec![json!(1)]),
+                    }),
+                    ..Default::default()
+                },
+            ])))
+        });
+    };
+    install_completions(&server);
+    let lsp_store = project.read_with(cx, |project, _| project.lsp_store());
+    let request = |buffer: &Entity<Buffer>, cx: &mut TestAppContext| {
+        project.update(cx, |project, cx| {
+            project.completions(
+                buffer,
+                3,
+                lsp::CompletionContext {
+                    trigger_kind: lsp::CompletionTriggerKind::INVOKED,
+                    trigger_character: None,
+                },
+                cx,
+            )
+        })
+    };
+    let first = request(&buffer, cx)
+        .await
+        .expect("completion response")
+        .into_iter()
+        .flat_map(|response| response.completions)
+        .next()
+        .expect("completion item");
+    assert!(lsp_store.read_with(cx, |store, cx| {
+        store.completion_is_current(&buffer, &first, cx)
+    }));
+    enum ImportLog {}
+    impl lsp::notification::Notification for ImportLog {
+        type Params = serde_json::Value;
+        const METHOD: &'static str = "intellij/importLog";
+    }
+    server.notify::<ImportLog>(json!({"started": true}));
+    cx.run_until_parked();
+    assert!(!lsp_store.read_with(cx, |store, cx| {
+        store.completion_is_current(&buffer, &first, cx)
+    }));
+    let project::CompletionSource::Lsp {
+        server_id,
+        lsp_completion,
+        completion_session,
+        ..
+    } = first.source
+    else {
+        panic!("LSP completion expected")
+    };
+    let result = lsp_store
+        .update(cx, |store, cx| {
+            store.apply_completion_command(
+                buffer.clone(),
+                project::CodeAction {
+                    server_id,
+                    range: language::Anchor::min_min_range_for_buffer(buffer.read(cx).remote_id()),
+                    lsp_action: project::LspAction::Command(
+                        lsp_completion.command.expect("completion command"),
+                    ),
+                    resolved: false,
+                },
+                completion_session,
+                cx,
+            )
+        })
+        .await;
+    assert!(
+        result
+            .err()
+            .expect("old model command is rejected")
+            .to_string()
+            .contains("Completion expired")
+    );
+    let after_import = request(&buffer, cx)
+        .await
+        .expect("new model completion")
+        .into_iter()
+        .flat_map(|response| response.completions)
+        .next()
+        .expect("completion item");
+    let (other_buffer, _other_handle) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/project/other.rs"), cx)
+        })
+        .await
+        .expect("second source opens");
+    request(&other_buffer, cx)
+        .await
+        .expect("other document completion");
+    assert!(
+        !lsp_store.read_with(cx, |store, cx| store.completion_is_current(
+            &buffer,
+            &after_import,
+            cx
+        )),
+        "the server session belongs to the latest document request"
+    );
+    let before_restart = request(&buffer, cx)
+        .await
+        .expect("completion before restart")
+        .into_iter()
+        .flat_map(|response| response.completions)
+        .next()
+        .expect("completion item");
+    lsp_store.update(cx, |store, cx| store.restart_all_language_servers(cx));
+    let restarted = servers.next().await.expect("replacement server starts");
+    cx.run_until_parked();
+    assert!(
+        !lsp_store.read_with(cx, |store, cx| store.completion_is_current(
+            &buffer,
+            &before_restart,
+            cx
+        ))
+    );
+    install_completions(&restarted);
+    let after_restart = request(&buffer, cx)
+        .await
+        .expect("new runtime completion")
+        .into_iter()
+        .flat_map(|response| response.completions)
+        .next()
+        .expect("completion item");
+    assert!(
+        lsp_store.read_with(cx, |store, cx| store.completion_is_current(
+            &buffer,
+            &after_restart,
+            cx
+        ))
+    );
+
+    restarted.set_request_handler::<lsp::request::Completion, _, _>(|_, _| async {
+        Err(lsp::ResponseError::new(
+            lsp::ResponseErrorCode::Other(-32603),
+            "fixture Kotlin internal error",
+        )
+        .into())
+    });
+    let error = request(&buffer, cx)
+        .await
+        .err()
+        .expect("internal completion error must reach the caller");
+    assert!(format!("{error:#}").contains("fixture Kotlin internal error"));
+    restarted.set_request_handler::<lsp::request::Completion, _, _>(|_, _| async {
+        Err(lsp::ResponseError::server_cancelled().into())
+    });
+    assert!(
+        request(&buffer, cx)
+            .await
+            .expect("cancellation is quiet")
+            .is_empty()
+    );
+
+    cx.update(|cx| {
+        use gpui::UpdateGlobal as _;
+        settings::SettingsStore::update_global(cx, |store, cx| {
+            store.update_user_settings(cx, &|settings: &mut settings::SettingsContent| {
+                settings
+                    .global_lsp_settings
+                    .get_or_insert_default()
+                    .request_timeout = Some(1);
+            });
+        });
+    });
+    let mut server = restarted;
+    for command_timeout in [false, true] {
+        install_completions(&server);
+        if command_timeout {
+            let completion = request(&buffer, cx)
+                .await
+                .expect("completion before timeout")
+                .into_iter()
+                .flat_map(|response| response.completions)
+                .next()
+                .expect("completion");
+            let project::CompletionSource::Lsp {
+                server_id,
+                lsp_completion,
+                completion_session,
+                ..
+            } = completion.source
+            else {
+                panic!("LSP completion expected");
+            };
+            server.set_request_handler::<lsp::request::ExecuteCommand, _, _>(|_, _| {
+                futures::future::pending()
+            });
+            let error = lsp_store
+                .update(cx, |store, cx| {
+                    store.apply_completion_command(
+                        buffer.clone(),
+                        project::CodeAction {
+                            server_id,
+                            range: language::Anchor::min_min_range_for_buffer(
+                                buffer.read(cx).remote_id(),
+                            ),
+                            lsp_action: project::LspAction::Command(
+                                lsp_completion.command.expect("command"),
+                            ),
+                            resolved: false,
+                        },
+                        completion_session,
+                        cx,
+                    )
+                })
+                .await
+                .err()
+                .expect("command times out");
+            assert!(format!("{error:#}").contains("timed out"));
+        } else {
+            server.set_request_handler::<lsp::request::Completion, _, _>(|_, _| {
+                futures::future::pending()
+            });
+            let error = request(&buffer, cx)
+                .await
+                .err()
+                .expect("completion times out");
+            assert!(format!("{error:#}").contains("timed out"));
+        }
+        cx.run_until_parked();
+        // A server can keep working after the request timeout and send unversioned
+        // edits. The missing response leaves its global completion state unknown.
+        let response = server
+            .server
+            .request::<lsp::request::ApplyWorkspaceEdit>(
+                lsp::ApplyWorkspaceEditParams {
+                    label: None,
+                    edit: lsp::WorkspaceEdit::new(
+                        [(
+                            Uri::from_file_path(path!("/project/main.rs")).expect("source URI"),
+                            vec![lsp::TextEdit::new(
+                                lsp::Range::new(lsp::Position::default(), lsp::Position::new(0, 3)),
+                                "Button()".into(),
+                            )],
+                        )]
+                        .into_iter()
+                        .collect(),
+                    ),
+                },
+                lsp::DEFAULT_LSP_REQUEST_TIMEOUT,
+            )
+            .await
+            .into_response()
+            .expect("late edit response");
+        assert!(!response.applied);
+        assert!(
+            response
+                .failure_reason
+                .is_some_and(|reason| reason.contains("Restart the language server"))
+        );
+        assert_eq!(buffer.read_with(cx, |buffer, _| buffer.text()), "But");
+        let shown = server
+            .server
+            .request::<lsp::request::ShowDocument>(
+                lsp::ShowDocumentParams {
+                    uri: Uri::from_file_path(path!("/project/main.rs")).expect("source URI"),
+                    external: None,
+                    take_focus: Some(true),
+                    selection: Some(lsp::Range::default()),
+                },
+                lsp::DEFAULT_LSP_REQUEST_TIMEOUT,
+            )
+            .await
+            .into_response()
+            .expect("late navigation response");
+        assert!(!shown.success);
+        install_completions(&server);
+        let error = request(&buffer, cx)
+            .await
+            .err()
+            .expect("an unknown session requires restart");
+        assert!(format!("{error:#}").contains("Restart the language server"));
+        lsp_store.update(cx, |store, cx| store.restart_all_language_servers(cx));
+        server = servers.next().await.expect("server restarts after timeout");
+        cx.run_until_parked();
+        install_completions(&server);
+        assert!(
+            !request(&buffer, cx)
+                .await
+                .expect("completion recovers after restart")
+                .is_empty()
+        );
+    }
+}
+
+#[gpui::test]
 async fn test_lsp_workspace_edit_reports_failure(cx: &mut TestAppContext) {
     init_test(cx);
     let fs = FakeFs::new(cx.executor());
@@ -134,29 +470,46 @@ async fn test_diagnostic_batches_skip_paths_without_worktrees(cx: &mut TestAppCo
             let mut events = cx.events(&project);
             let mut paths = vec![path!("/dir/a.rs"), path!("/dir/b.rs")];
             paths.insert(skipped_index, path!("/outside.rs"));
-            let updates = paths
+            let source_uri = Uri::from_file_path(path!("/dir/a.rs")).unwrap();
+            let uris = paths
                 .into_iter()
-                .map(|path| DocumentDiagnosticsUpdate {
-                    diagnostics: lsp::PublishDiagnosticsParams {
-                        uri: Uri::from_file_path(path).unwrap(),
-                        version: None,
-                        diagnostics: message
-                            .into_iter()
-                            .map(|message| lsp::Diagnostic {
-                                range: lsp::Range::new(
-                                    lsp::Position::new(0, 0),
-                                    lsp::Position::new(0, 3),
-                                ),
-                                severity: Some(lsp::DiagnosticSeverity::ERROR),
-                                message: lsp::DiagnosticMessage::from(message),
-                                ..lsp::Diagnostic::default()
-                            })
-                            .collect(),
-                    },
-                    result_id: None,
-                    registration_id: None,
-                    server_id,
-                    disk_based_sources: Cow::Borrowed(&[]),
+                .map(|path| Uri::from_file_path(path).unwrap())
+                .chain(["jar", "jrt"].into_iter().map(|scheme| {
+                    source_uri
+                        .as_str()
+                        .replacen("file:", &format!("{scheme}:"), 1)
+                        .parse::<Uri>()
+                        .unwrap()
+                }));
+            let updates = uris
+                .map(|uri| {
+                    let message = if uri.scheme() == "file" {
+                        message
+                    } else {
+                        Some("nonfile error must not attach to a.rs")
+                    };
+                    DocumentDiagnosticsUpdate {
+                        diagnostics: lsp::PublishDiagnosticsParams {
+                            uri,
+                            version: None,
+                            diagnostics: message
+                                .into_iter()
+                                .map(|message| lsp::Diagnostic {
+                                    range: lsp::Range::new(
+                                        lsp::Position::new(0, 0),
+                                        lsp::Position::new(0, 3),
+                                    ),
+                                    severity: Some(lsp::DiagnosticSeverity::ERROR),
+                                    message: lsp::DiagnosticMessage::from(message),
+                                    ..lsp::Diagnostic::default()
+                                })
+                                .collect(),
+                        },
+                        result_id: None,
+                        registration_id: None,
+                        server_id,
+                        disk_based_sources: Cow::Borrowed(&[]),
+                    }
                 })
                 .collect();
             lsp_store.update(cx, |lsp_store, cx| {
@@ -629,22 +982,61 @@ async fn test_kotlin_virtual_documents_preserve_uri_ownership_and_model(cx: &mut
     assert_eq!(library, duplicate);
     assert_eq!(*fetched.lock(), vec![binary.to_string()]);
 
+    server.set_request_handler::<lsp::request::DocumentDiagnosticRequest, _, _>(
+        |params, _| async move {
+            assert_eq!(params.text_document.uri.scheme(), "jar");
+            Ok(lsp::DocumentDiagnosticReportResult::Report(
+                lsp::DocumentDiagnosticReport::Full(
+                    lsp::RelatedFullDocumentDiagnosticReport::default(),
+                ),
+            ))
+        },
+    );
     server
         .request::<lsp::request::RegisterCapability>(
             lsp::RegistrationParams {
-                registrations: vec![lsp::Registration {
-                    id: "jar-hover".into(),
-                    method: "textDocument/hover".into(),
-                    register_options: Some(
-                        json!({"documentSelector": [{"scheme": "jar", "language": "rust"}]}),
-                    ),
-                }],
+                registrations: vec![
+                    lsp::Registration {
+                        id: "jar-hover".into(),
+                        method: "textDocument/hover".into(),
+                        register_options: Some(
+                            json!({"documentSelector": [{"scheme": "jar", "language": "rust"}]}),
+                        ),
+                    },
+                    lsp::Registration {
+                        id: "jar-diagnostics".into(),
+                        method: "textDocument/diagnostic".into(),
+                        register_options: Some(json!({
+                            "documentSelector": [{"scheme": "jar", "language": "rust"}],
+                            "interFileDependencies": false,
+                            "workspaceDiagnostics": false
+                        })),
+                    },
+                ],
             },
             lsp::DEFAULT_LSP_REQUEST_TIMEOUT,
         )
         .await
         .into_response()
         .expect("register jar hover");
+    let lsp_store = project.read_with(cx, |project, _| project.lsp_store());
+    let diagnostics = lsp_store
+        .update(cx, |store, cx| store.pull_diagnostics(library.clone(), cx))
+        .await
+        .expect("library diagnostics keep the server URI")
+        .expect("library diagnostic response");
+    assert_eq!(diagnostics.len(), 1);
+    assert!(matches!(
+        diagnostics.first(),
+        Some(project::LspPullDiagnostics::Response { server_id: owner, uri, .. })
+            if *owner == server_id && uri == &binary
+    ));
+    lsp_store
+        .update(cx, |store, cx| {
+            store.pull_diagnostics_for_buffer(library.clone(), cx)
+        })
+        .await
+        .expect("background library diagnostics should not require a filesystem path");
     server.set_request_handler::<lsp::request::HoverRequest, _, _>({
         let binary = binary.clone();
         move |params, _| {

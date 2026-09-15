@@ -32,10 +32,10 @@ use self::document_symbols::DocumentSymbolsData;
 use self::dynamic_registration::DynamicRegistrations;
 use self::inlay_hints::BufferInlayHints;
 use crate::{
-    CodeAction, Completion, CompletionDisplayOptions, CompletionResponse, CompletionSource,
-    CoreCompletion, Hover, InlayHint, InlayId, LocationLink, LspAction, LspPullDiagnostics,
-    ManifestProvidersStore, Project, ProjectItem, ProjectPath, ProjectTransaction,
-    PulledDiagnostics, ResolveState, Symbol,
+    CodeAction, Completion, CompletionDisplayOptions, CompletionResponse, CompletionSession,
+    CompletionSource, CoreCompletion, CoreCompletionResponse, Hover, InlayHint, InlayId,
+    LocationLink, LspAction, LspPullDiagnostics, ManifestProvidersStore, Project, ProjectItem,
+    ProjectPath, ProjectTransaction, PulledDiagnostics, ResolveState, Symbol,
     buffer_store::{BufferStore, BufferStoreEvent},
     environment::ProjectEnvironment,
     lsp_command::{self, *},
@@ -316,6 +316,36 @@ struct VirtualDocumentId {
     uri: Uri,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LanguageServerDocumentLocation {
+    uri: Uri,
+    worktree_root: PathBuf,
+    server_root: String,
+    server_name: String,
+    language: String,
+    settings_fingerprint: [u8; 32],
+    #[serde(skip)]
+    session: Option<(gpui::EntityId, VirtualDocumentId)>,
+}
+
+fn virtual_document_settings_fingerprint(
+    settings: &LspSettings,
+    toolchain: Option<&Toolchain>,
+) -> Result<[u8; 32]> {
+    let mut value = serde_json::json!({
+        "binary": settings.binary,
+        "initialization_options": settings.initialization_options,
+        "settings": settings.settings,
+        "toolchain": toolchain.map(|toolchain| serde_json::json!({
+            "path": toolchain.path.as_ref(),
+            "language": toolchain.language_name.to_string(),
+            "data": toolchain.as_json,
+        })),
+    });
+    value.sort_all_objects();
+    Ok(Sha256::digest(serde_json::to_vec(&value)?).into())
+}
+
 struct LspFile {
     document: VirtualDocumentId,
     path: Arc<RelPath>,
@@ -419,6 +449,11 @@ pub struct LocalLspStore {
     virtual_buffer_loads:
         HashMap<VirtualDocumentId, Shared<Task<Result<Entity<Buffer>, Arc<anyhow::Error>>>>>,
     virtual_document_versions: HashMap<LanguageServerId, u64>,
+    next_completion_session_id: u64,
+    completion_sessions: HashMap<LanguageServerId, CompletionSession>,
+    completion_request_locks: HashMap<LanguageServerId, Arc<futures::lock::Mutex<()>>>,
+    active_completion_commands: HashMap<LanguageServerId, CompletionSession>,
+    uncertain_completion_sessions: HashSet<LanguageServerId>,
     buffer_pull_diagnostics_result_ids: HashMap<
         LanguageServerId,
         HashMap<Option<SharedString>, HashMap<PathBuf, Option<SharedString>>>,
@@ -797,7 +832,7 @@ impl LocalLspStore {
             })
         };
         let state = LanguageServerState::Starting {
-            startup,
+            startup: startup.shared(),
             pending_workspace_folders,
         };
 
@@ -1366,8 +1401,23 @@ impl LocalLspStore {
                     let lsp_store = lsp_store.clone();
                     let mut cx = cx.clone();
                     async move {
+                        if lsp_store
+                            .read_with(&cx, |store, cx| {
+                                store.validate_active_completion_command(server_id, cx)
+                            })?
+                            .is_err()
+                        {
+                            return Ok(lsp::ShowDocumentResult { success: false });
+                        }
                         let (tx, rx) = async_channel::bounded(1);
+                        let completion_session = lsp_store.read_with(&cx, |store, _| {
+                            store.as_local().and_then(|local| {
+                                local.active_completion_commands.get(&server_id).cloned()
+                            })
+                        })?;
                         let request = LanguageServerShowDocumentRequest {
+                            language_server_id: server_id,
+                            completion_session,
                             uri: params.uri,
                             external: params.external.unwrap_or(false),
                             take_focus: params.take_focus.unwrap_or(false),
@@ -3376,17 +3426,15 @@ impl LocalLspStore {
                 {
                     return None;
                 }
-                if !only_register_servers.is_empty() {
-                    if let Some(server_id) = server_node.server_id()
-                        && !only_register_servers.contains(&LanguageServerSelector::Id(server_id))
-                    {
-                        return None;
-                    }
-                    if let Some(name) = server_node.name()
-                        && !only_register_servers.contains(&LanguageServerSelector::Name(name))
-                    {
-                        return None;
-                    }
+                if !only_register_servers.is_empty()
+                    && !server_node.server_id().is_some_and(|server_id| {
+                        only_register_servers.contains(&LanguageServerSelector::Id(server_id))
+                    })
+                    && !server_node.name().is_some_and(|name| {
+                        only_register_servers.contains(&LanguageServerSelector::Name(name))
+                    })
+                {
+                    return None;
                 }
 
                 let server_id = server_node.server_id_or_init(|disposition| {
@@ -3928,6 +3976,9 @@ impl LocalLspStore {
 
         let mut project_transaction = ProjectTransaction::default();
         for operation in operations {
+            this.read_with(cx, |this, cx| {
+                this.validate_active_completion_command(language_server.server_id(), cx)
+            })?;
             match operation {
                 lsp::DocumentChangeOperation::Op(lsp::ResourceOp::Create(op)) => {
                     let abs_path = op
@@ -3938,6 +3989,9 @@ impl LocalLspStore {
                     if let Some(parent_path) = abs_path.parent() {
                         fs.create_dir(parent_path).await?;
                     }
+                    this.read_with(cx, |this, cx| {
+                        this.validate_active_completion_command(language_server.server_id(), cx)
+                    })?;
                     if abs_path.ends_with("/") {
                         fs.create_dir(&abs_path).await?;
                     } else {
@@ -3997,6 +4051,9 @@ impl LocalLspStore {
                         create_parents: true,
                     };
 
+                    this.read_with(cx, |this, cx| {
+                        this.validate_active_completion_command(language_server.server_id(), cx)
+                    })?;
                     fs.rename(&source_abs_path, &target_abs_path, options)
                         .await?;
 
@@ -4152,6 +4209,9 @@ impl LocalLspStore {
                         })
                         .await?;
 
+                    this.read_with(cx, |this, cx| {
+                        this.validate_active_completion_command(language_server.server_id(), cx)
+                    })?;
                     let transaction = buffer_to_edit.update(cx, |buffer, cx| {
                         buffer.finalize_last_transaction();
                         buffer.start_transaction();
@@ -4167,6 +4227,16 @@ impl LocalLspStore {
                                 buffer.forget_transaction(transaction_id)
                             }
                         })
+                    });
+                    this.update(cx, |this, cx| {
+                        if let Some(session) = this.as_local_mut().and_then(|local| {
+                            local
+                                .active_completion_commands
+                                .get_mut(&language_server.server_id())
+                        }) && session.buffer_id == buffer_to_edit.read(cx).remote_id()
+                        {
+                            session.buffer_version = buffer_to_edit.read(cx).version();
+                        }
                     });
                     if let Some(transaction) = transaction {
                         project_transaction.0.insert(buffer_to_edit, transaction);
@@ -4959,6 +5029,46 @@ fn should_log_lsp_response_error(error: &anyhow::Error) -> bool {
         .is_none_or(|response_error| !response_error.is_request_denied())
 }
 
+fn collect_completion_responses(
+    results: Vec<Result<Option<CompletionResponse>>>,
+) -> Result<Vec<CompletionResponse>> {
+    let mut responses = Vec::new();
+    let mut first_error = None;
+    for result in results {
+        match result {
+            Ok(Some(response)) => responses.push(response),
+            Ok(None) => {}
+            Err(error) if !should_log_lsp_response_error(&error) => {}
+            Err(error) => {
+                log::warn!("Fetching completions failed: {error:#}");
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    if responses.is_empty()
+        && let Some(error) = first_error
+    {
+        return Err(error);
+    }
+    Ok(responses)
+}
+
+fn log_completion_error(error: &anyhow::Error) {
+    if should_log_lsp_response_error(error) {
+        log::warn!("Completion request failed: {error:#}");
+    }
+}
+
+fn completion_response_is_uncertain<T>(response: &ConnectionResult<T>) -> bool {
+    match response {
+        ConnectionResult::Timeout | ConnectionResult::ConnectionReset => true,
+        ConnectionResult::Result(Err(error)) => {
+            error.downcast_ref::<lsp::ResponseError>().is_none()
+        }
+        ConnectionResult::Result(Ok(_)) => false,
+    }
+}
+
 fn lsp_pull_cancelled_with_retrigger(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<lsp::ResponseError>()
@@ -5142,6 +5252,11 @@ impl LspStore {
                 virtual_buffers: HashMap::default(),
                 virtual_buffer_loads: HashMap::default(),
                 virtual_document_versions: HashMap::default(),
+                next_completion_session_id: 0,
+                completion_sessions: HashMap::default(),
+                completion_request_locks: HashMap::default(),
+                active_completion_commands: HashMap::default(),
+                uncertain_completion_sessions: HashSet::default(),
                 buffer_pull_diagnostics_result_ids: HashMap::default(),
                 workspace_pull_diagnostics_result_ids: HashMap::default(),
                 restricted_worktrees_tasks: HashMap::default(),
@@ -6535,7 +6650,24 @@ impl LspStore {
                 None
             };
 
-            let result = lsp_request.await.into_response();
+            let result = lsp_request.await;
+            if <R::LspRequest as lsp::request::Request>::METHOD == "textDocument/completion"
+                && completion_response_is_uncertain(&result)
+            {
+                cx.update(|cx| {
+                    this.update(cx, |store, cx| {
+                        if store.as_local().is_some_and(|local| {
+                            local
+                                .completion_sessions
+                                .contains_key(&language_server.server_id())
+                        }) {
+                            store
+                                .mark_completion_session_uncertain(language_server.server_id(), cx);
+                        }
+                    })
+                })?;
+            }
+            let result = result.into_response();
 
             let response = result.map_err(|err| {
                 let context = format!(
@@ -6827,15 +6959,82 @@ impl LspStore {
     pub fn apply_code_action(
         &self,
         buffer_handle: Entity<Buffer>,
-        mut action: CodeAction,
+        action: CodeAction,
         push_to_history: bool,
         cx: &mut Context<Self>,
     ) -> Task<Result<ProjectTransaction>> {
+        self.apply_code_action_with_completion_session(
+            buffer_handle,
+            action,
+            push_to_history,
+            None,
+            cx,
+        )
+    }
+
+    pub fn apply_completion_command(
+        &self,
+        buffer: Entity<Buffer>,
+        action: CodeAction,
+        session: Option<CompletionSession>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<ProjectTransaction>> {
+        let task =
+            self.apply_code_action_with_completion_session(buffer, action, false, session, cx);
+        Self::retain_completion_task(task, cx)
+    }
+
+    fn retain_completion_task<T: 'static>(
+        task: Task<Result<T>>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<T>> {
+        let (sender, receiver) = oneshot::channel();
+        // Cancelling the client future must not release the guard while the server can still change its session or send unversioned edits.
+        cx.spawn(async move |_, _| {
+            if let Err(Err(error)) = sender.send(task.await) {
+                if should_log_lsp_response_error(&error) {
+                    log::error!("Completion request failed: {error:#}");
+                }
+            }
+        })
+        .detach();
+        cx.spawn(async move |_, _| receiver.await.context("completion request stopped")?)
+    }
+
+    fn apply_code_action_with_completion_session(
+        &self,
+        buffer_handle: Entity<Buffer>,
+        mut action: CodeAction,
+        push_to_history: bool,
+        completion_session: Option<CompletionSession>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<ProjectTransaction>> {
+        if action
+            .lsp_action
+            .command()
+            .is_some_and(|command| command.command == "jetbrains.kotlin.completion.apply")
+            && completion_session.is_none()
+        {
+            return Task::ready(Err(lsp::ResponseError::new(
+                lsp::ResponseErrorCode::ContentModified,
+                "Completion has no current client session",
+            )
+            .into()));
+        }
+        if let Some(session) = &completion_session
+            && let Err(error) =
+                self.validate_completion_session(&buffer_handle, action.server_id, session, cx)
+        {
+            return Task::ready(Err(error));
+        }
         if let Some((upstream_client, project_id)) = self.upstream_client() {
             let request = proto::ApplyCodeAction {
                 project_id,
                 buffer_id: buffer_handle.read(cx).remote_id().into(),
                 action: Some(Self::serialize_code_action(&action)),
+                completion_session: completion_session
+                    .as_ref()
+                    .map(Self::serialize_completion_session),
             };
             let buffer_store = self.buffer_store();
             cx.spawn(async move |_, cx| {
@@ -6910,14 +7109,35 @@ impl LspStore {
                         .get_request_timeout()
                 });
 
-                this.update(cx, |this, _| {
+                let server_id = lang_server.server_id();
+                this.update(cx, |this, cx| {
+                    if let Some(session) = &completion_session {
+                        this.validate_completion_session(&buffer_handle, server_id, session, cx)?;
+                        let local = this.as_local_mut().context("local language server store unavailable")?;
+                        anyhow::ensure!(!local.active_completion_commands.contains_key(&server_id), "A completion command is still running");
+                        local.active_completion_commands.insert(server_id, session.clone());
+                    }
                     this.as_local_mut()
-                        .unwrap()
+                        .context("local language server store unavailable")?
                         .last_workspace_edits_by_language_server
-                        .remove(&lang_server.server_id());
-                })?;
+                        .remove(&server_id);
+                    anyhow::Ok(())
+                })??;
+                let guarded_completion = completion_session.is_some();
+                let _completion_guard = completion_session.map(|session| {
+                    let this = this.clone();
+                    let mut cx = cx.clone();
+                    defer(move || {
+                        this.update(&mut cx, |this, _| {
+                            if let Some(local) = this.as_local_mut()
+                                && local.active_completion_commands.get(&server_id).is_some_and(|active| active.id == session.id) {
+                                local.active_completion_commands.remove(&server_id);
+                            }
+                        }).log_err();
+                    })
+                });
 
-                let _result = lang_server
+                let result = lang_server
                     .request::<lsp::request::ExecuteCommand>(
                         lsp::ExecuteCommandParams {
                             command: command.command.clone(),
@@ -6926,9 +7146,11 @@ impl LspStore {
                         },
                         request_timeout,
                     )
-                    .await
-                    .into_response()
-                    .context("execute command")?;
+                    .await;
+                if guarded_completion && completion_response_is_uncertain(&result) {
+                    this.update(cx, |store, cx| store.mark_completion_session_uncertain(server_id, cx))?;
+                }
+                result.into_response().context("execute command")?;
 
                 return this.update(cx, |this, _| {
                     this.as_local_mut()
@@ -8085,6 +8307,187 @@ impl LspStore {
         }
     }
 
+    pub fn completion_is_current(
+        &self,
+        buffer: &Entity<Buffer>,
+        completion: &Completion,
+        cx: &App,
+    ) -> bool {
+        if !completion.source.command_requires_current_session() {
+            return true;
+        }
+        let CompletionSource::Lsp {
+            server_id,
+            completion_session: Some(session),
+            ..
+        } = &completion.source
+        else {
+            return false;
+        };
+        self.validate_completion_session(buffer, *server_id, session, cx)
+            .is_ok()
+    }
+
+    fn validate_completion_session(
+        &self,
+        buffer: &Entity<Buffer>,
+        server_id: LanguageServerId,
+        session: &CompletionSession,
+        cx: &App,
+    ) -> Result<()> {
+        self.validate_completion_session_known(server_id)?;
+        let buffer = buffer.read(cx);
+        let current = buffer.remote_id() == session.buffer_id
+            && buffer.version() == session.buffer_version
+            && self.as_local().is_none_or(|local| {
+                local
+                    .completion_sessions
+                    .get(&server_id)
+                    .is_some_and(|latest| latest.id == session.id)
+                    && self.language_server_for_id(server_id).is_some()
+                    && local
+                        .virtual_document_versions
+                        .get(&server_id)
+                        .copied()
+                        .unwrap_or_default()
+                        == session.model_version
+            });
+        if !current {
+            return Err(lsp::ResponseError::new(lsp::ResponseErrorCode::ContentModified, "Completion expired after the document, completion session, or project model changed").into());
+        }
+        Ok(())
+    }
+
+    fn validate_active_completion_command(
+        &self,
+        server_id: LanguageServerId,
+        cx: &App,
+    ) -> Result<()> {
+        self.validate_completion_session_known(server_id)?;
+        if self.language_server_for_id(server_id).is_none() {
+            return Err(lsp::ResponseError::new(
+                lsp::ResponseErrorCode::ContentModified,
+                "Language server session has stopped",
+            )
+            .into());
+        }
+        if let Some(session) = self
+            .as_local()
+            .and_then(|local| local.active_completion_commands.get(&server_id))
+        {
+            let buffer = self.buffer_store.read(cx).get_existing(session.buffer_id)?;
+            self.validate_completion_session(&buffer, server_id, session, cx)?;
+        }
+        Ok(())
+    }
+
+    fn mark_completion_session_uncertain(
+        &mut self,
+        server_id: LanguageServerId,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(local) = self.as_local_mut()
+            && local.uncertain_completion_sessions.insert(server_id)
+        {
+            cx.emit(LspStoreEvent::Notification("Completion state is unknown after a language server timeout or connection failure. Restart the language server to continue.".into()));
+        }
+    }
+
+    fn validate_completion_session_known(&self, server_id: LanguageServerId) -> Result<()> {
+        anyhow::ensure!(
+            !self
+                .as_local()
+                .is_some_and(|local| local.uncertain_completion_sessions.contains(&server_id)),
+            "Completion state is unknown after a timeout or connection failure. Restart the language server to continue."
+        );
+        Ok(())
+    }
+
+    fn request_completions(
+        &mut self,
+        buffer: Entity<Buffer>,
+        server: LanguageServerToQuery,
+        request: GetCompletions,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<CoreCompletionResponse>> {
+        let server_id = buffer.update(cx, |buffer, cx| {
+            let local = self.as_local()?;
+            local.language_servers_for_buffer(buffer, cx)
+                .find(|(adapter, candidate)| {
+                    (matches!(server, LanguageServerToQuery::FirstCapable) || matches!(server, LanguageServerToQuery::Other(id) if id == candidate.server_id()))
+                        && lsp_command_allowed_for_buffer(local, &request, buffer, adapter, candidate)
+                }).map(|(_, server)| server.server_id())
+        });
+        let session = server_id.and_then(|server_id| {
+            let server = self.language_server_for_id(server_id)?;
+            if !server
+                .capabilities()
+                .execute_command_provider
+                .as_ref()
+                .is_some_and(|options| {
+                    options
+                        .commands
+                        .iter()
+                        .any(|command| command == "jetbrains.kotlin.completion.apply")
+                })
+            {
+                return None;
+            }
+            let local = self.as_local_mut()?;
+            local.next_completion_session_id += 1;
+            let session = CompletionSession {
+                id: local.next_completion_session_id,
+                buffer_id: buffer.read(cx).remote_id(),
+                buffer_version: buffer.read(cx).version(),
+                model_version: local
+                    .virtual_document_versions
+                    .get(&server_id)
+                    .copied()
+                    .unwrap_or_default(),
+            };
+            local.completion_sessions.insert(server_id, session.clone());
+            let lock = local
+                .completion_request_locks
+                .entry(server_id)
+                .or_default()
+                .clone();
+            Some((server_id, session, lock))
+        });
+        let Some((server_id, session, lock)) = session else {
+            return self.request_lsp(buffer, server, request, cx);
+        };
+        let task = cx.spawn(async move |this, cx| {
+            // Kotlin's completion keys belong to one server-global session, so an older response must finish before sending the next request.
+            let _guard = lock.lock().await;
+            let response = this.update(cx, |this, cx| {
+                this.validate_completion_session(&buffer, server_id, &session, cx)?;
+                anyhow::Ok(this.request_lsp(
+                    buffer.clone(),
+                    LanguageServerToQuery::Other(server_id),
+                    request,
+                    cx,
+                ))
+            })??;
+            let mut response = response.await?;
+            this.read_with(cx, |this, cx| {
+                this.validate_completion_session(&buffer, server_id, &session, cx)
+            })??;
+            for completion in &mut response.completions {
+                if completion.source.command_requires_current_session()
+                    && let CompletionSource::Lsp {
+                        completion_session, ..
+                    } = &mut completion.source
+                {
+                    *completion_session = Some(session.clone());
+                    // The command refers to the server's original position and global session.
+                    response.is_incomplete = true;
+                }
+            }
+            Ok(response)
+        });
+        Self::retain_completion_task(task, cx)
+    }
+
     #[inline(never)]
     pub fn completions(
         &self,
@@ -8143,19 +8546,17 @@ impl LspStore {
                                     .cloned()
                             });
                             let upstream_client = upstream_client.clone();
-                            let response = this
-                                .update(cx, |this, cx| {
-                                    this.send_lsp_proto_request(
-                                        buffer,
-                                        upstream_client,
-                                        project_id,
-                                        request,
-                                        cx,
-                                    )
-                                })
-                                .log_err();
+                            let response = this.update(cx, |this, cx| {
+                                this.send_lsp_proto_request(
+                                    buffer,
+                                    upstream_client,
+                                    project_id,
+                                    request,
+                                    cx,
+                                )
+                            });
                             async move {
-                                let response = response?.await.log_err()?;
+                                let response = response?.await?;
 
                                 let completions = populate_labels_for_completions(
                                     response.completions,
@@ -8164,16 +8565,16 @@ impl LspStore {
                                 )
                                 .await;
 
-                                Some(CompletionResponse {
+                                anyhow::Ok(Some(CompletionResponse {
                                     completions,
                                     display_options: CompletionDisplayOptions::default(),
                                     is_incomplete: response.is_incomplete,
-                                })
+                                }))
                             }
                         })
                         .collect::<Vec<_>>(),
                 );
-                Ok(requests.await.into_iter().flatten().collect::<Vec<_>>())
+                collect_completion_responses(requests.await)
             })
         } else if let Some(local) = self.as_local() {
             let snapshot = buffer.read(cx).snapshot();
@@ -8231,7 +8632,7 @@ impl LspStore {
                                 None => false,
                             }
                         }).fuse();
-                        let mut lsp_request = lsp_store.request_lsp(
+                        let mut lsp_request = lsp_store.request_completions(
                             buffer.clone(),
                             LanguageServerToQuery::Other(server_id),
                             GetCompletions {
@@ -8260,23 +8661,21 @@ impl LspStore {
                 })?;
 
                 let futures = tasks.into_iter().map(async |(lsp_adapter, task)| {
-                    let completion_response = task.await.ok()??;
+                    let Some(completion_response) = task.await? else { return Ok(None); };
                     let completions = populate_labels_for_completions(
                             completion_response.completions,
                             language.clone(),
                             lsp_adapter,
                         )
                         .await;
-                    Some(CompletionResponse {
+                    anyhow::Ok(Some(CompletionResponse {
                         completions,
                         display_options: CompletionDisplayOptions::default(),
                         is_incomplete: completion_response.is_incomplete,
-                    })
+                    }))
                 });
 
-                let responses: Vec<Option<CompletionResponse>> = join_all(futures).await;
-
-                Ok(responses.into_iter().flatten().collect())
+                collect_completion_responses(join_all(futures).await)
             })
         } else {
             Task::ready(Err(anyhow!("No upstream client or local language server")))
@@ -8338,8 +8737,8 @@ impl LspStore {
                             client.clone(),
                         )
                         .await
-                        .log_err()
-                        .is_some()
+                        .inspect_err(log_completion_error)
+                        .is_ok()
                         {
                             did_resolve = true;
                         }
@@ -8381,8 +8780,8 @@ impl LspStore {
                             true,
                         )
                         .await
-                        .log_err()
-                        .is_some();
+                        .inspect_err(log_completion_error)
+                        .is_ok();
                         if resolved {
                             Self::regenerate_completion_labels(
                                 adapter,
@@ -8447,7 +8846,7 @@ impl LspStore {
                 }
             }
         };
-        let resolved_completion = request
+        let mut resolved_completion = request
             .await
             .into_response()
             .context("resolve completion")?;
@@ -8468,6 +8867,12 @@ impl LspStore {
                 server_id == *completion_server_id,
                 "server_id mismatch, applying completion resolve for {server_id} but completion server id is {completion_server_id}"
             );
+            if resolved_completion.command.is_none() {
+                resolved_completion.command = lsp_completion.command.clone();
+            }
+            if resolved_completion.data.is_none() {
+                resolved_completion.data = lsp_completion.data.clone();
+            }
             **lsp_completion = resolved_completion;
             *resolved = true;
 
@@ -8636,6 +9041,7 @@ impl LspStore {
             resolved,
             server_id: completion_server_id,
             lsp_defaults: _,
+            completion_session: _,
         } = &mut completion.source
         {
             let completion_insert_range = response
@@ -8678,6 +9084,13 @@ impl LspStore {
         all_commit_ranges: Vec<Range<language::Anchor>>,
         cx: &mut Context<Self>,
     ) -> Task<Result<Option<Transaction>>> {
+        if !completions
+            .borrow()
+            .get(completion_index)
+            .is_some_and(|completion| self.completion_is_current(&buffer_handle, completion, cx))
+        {
+            return Task::ready(Ok(None));
+        }
         if let Some((client, project_id)) = self.upstream_client() {
             let buffer = buffer_handle.read(cx);
             let buffer_id = buffer.remote_id();
@@ -8753,6 +9166,11 @@ impl LspStore {
                 .await
                 .context("resolving completion")?;
                 let completion = completions.borrow()[completion_index].clone();
+                if !this.read_with(cx, |this, cx| {
+                    this.completion_is_current(&buffer_handle, &completion, cx)
+                })? {
+                    return Ok(None);
+                }
                 let additional_text_edits = completion
                     .source
                     .lsp_completion(true)
@@ -8771,6 +9189,11 @@ impl LspStore {
                         })?
                         .await?;
 
+                    if !this.read_with(cx, |this, cx| {
+                        this.completion_is_current(&buffer_handle, &completion, cx)
+                    })? {
+                        return Ok(None);
+                    }
                     buffer_handle.update(cx, |buffer, cx| {
                         buffer.finalize_last_transaction();
                         buffer.start_transaction();
@@ -10722,6 +11145,154 @@ impl LspStore {
             .transpose()
     }
 
+    pub fn language_server_document_location(
+        &self,
+        buffer: &Buffer,
+        cx: &App,
+    ) -> Result<Option<LanguageServerDocumentLocation>> {
+        let Some(file) = LspFile::from_buffer(buffer) else {
+            return Ok(None);
+        };
+        let local = self
+            .as_local()
+            .context("Library document owner is unavailable")?;
+        anyhow::ensure!(
+            local.virtual_document_is_current(&file.document),
+            "This library document belongs to an outdated project model"
+        );
+        let (seed, server) = local
+            .language_server_ids
+            .iter()
+            .find(|(seed, server)| {
+                server.id == file.document.server_id && seed.worktree_id == file.worktree_id
+            })
+            .context("Library document owner was removed")?;
+        let server_root = server
+            .project_roots
+            .iter()
+            .min()
+            .context("Library document has no server root")?;
+        let worktree = self
+            .worktree_store
+            .read(cx)
+            .worktree_for_id(seed.worktree_id, cx)
+            .context("Library document workspace was removed")?;
+        let settings = language_server_settings_for(
+            SettingsLocation {
+                worktree_id: seed.worktree_id,
+                path: server_root,
+            },
+            &seed.name,
+            cx,
+        )
+        .cloned()
+        .unwrap_or_default();
+        anyhow::ensure!(
+            seed.settings.binary == settings.binary
+                && seed.settings.initialization_options == settings.initialization_options,
+            "Library document server settings changed"
+        );
+        Ok(Some(LanguageServerDocumentLocation {
+            uri: file.document.uri.clone(),
+            worktree_root: worktree.read(cx).abs_path().to_path_buf(),
+            server_root: server_root.as_unix_str().to_owned(),
+            server_name: seed.name.to_string(),
+            language: self
+                .language_server_statuses
+                .get(&server.id)
+                .and_then(|status| status.language_name.as_ref())
+                .context("Library document owner language is unavailable")?
+                .to_string(),
+            settings_fingerprint: virtual_document_settings_fingerprint(
+                &settings,
+                seed.toolchain.as_ref(),
+            )?,
+            session: Some((local.weak.entity_id(), file.document.clone())),
+        }))
+    }
+
+    pub fn restore_language_server_document(
+        &mut self,
+        location: LanguageServerDocumentLocation,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Entity<Buffer>>> {
+        let languages = self.languages.clone();
+        cx.spawn(async move |this, cx| {
+            anyhow::ensure!(matches!(location.uri.scheme(), "jar" | "jrt") && location.server_name == "kotlin-lsp",
+                "Unsupported library document location");
+            let language = languages.language_for_name(&location.language).await?;
+            let (server_id, ready) = this.update(cx, |store, cx| {
+                let local = store.as_local_mut().context("Library document restoration requires its local workspace")?;
+                if let Some((session, document)) = &location.session {
+                    anyhow::ensure!(*session == local.weak.entity_id() && local.virtual_document_is_current(document),
+                        "This library document belongs to an outdated language server or project model");
+                }
+                let worktree = local.worktree_store.read(cx).visible_worktrees(cx)
+                    .find(|worktree| worktree.read(cx).abs_path().as_ref() == location.worktree_root.as_path())
+                    .context("The library document's owning workspace was removed")?;
+                let worktree_id = worktree.read(cx).id();
+                let path = RelPath::new(Path::new(&location.server_root), PathStyle::Unix)?.into_arc();
+                let name = LanguageServerName::from(location.server_name.as_str());
+                anyhow::ensure!(!local.all_language_servers_stopped && !local.stopped_language_servers.contains(&name),
+                    "The library document's language server is stopped");
+                let settings = language_server_settings_for(SettingsLocation { worktree_id, path: &path }, &name, cx).cloned().unwrap_or_default();
+                let toolchain = local.toolchain_store.read(cx).active_toolchain(worktree_id, &path, language.name());
+                anyhow::ensure!(virtual_document_settings_fingerprint(&settings, toolchain.as_ref())? == location.settings_fingerprint,
+                    "The library document's server or import settings changed");
+                let delegate = LocalLspAdapterDelegate::from_local_lsp(local, &worktree, cx);
+                let manifest_delegate: Arc<dyn ManifestDelegate> = Arc::new(ManifestQueryDelegate::new(worktree.read(cx).snapshot()));
+                let nodes = local.lsp_tree.walk(ProjectPath {worktree_id, path}, language.name(), language.manifest(), &manifest_delegate, cx).collect::<Vec<_>>();
+                let node = nodes.into_iter().find(|node| node.name().as_ref() == Some(&name))
+                    .context("The library document's owning server is no longer configured")?;
+                let server_id = node.server_id_or_init(|disposition| local.get_or_insert_language_server(&worktree, delegate, disposition, &language.name(), cx))
+                    .context("The library document's owning server was removed")?;
+                if let Some((_, document)) = &location.session {
+                    anyhow::ensure!(server_id == document.server_id, "The library document's language server changed");
+                }
+                let ready = match local.language_servers.get(&server_id) {
+                    Some(LanguageServerState::Running { .. }) => None,
+                    Some(LanguageServerState::Starting { startup, .. }) => {
+                        let startup = startup.clone();
+                        let (sender, receiver) = oneshot::channel();
+                        let mut sender = Some(sender);
+                        let subscription = cx.subscribe(&cx.entity(), move |_, _, event, _| {
+                            if matches!(event, LspStoreEvent::LanguageServerRemoved(id) if *id == server_id)
+                                && let Some(sender) = sender.take() {
+                                sender.send(()).ok();
+                            }
+                        });
+                        Some((startup, receiver, subscription))
+                    },
+                    None => anyhow::bail!("The library document's server failed to start"),
+                };
+                anyhow::Ok((server_id, ready))
+            })??;
+            if let Some((ready, stopped, _subscription)) = ready {
+                select_biased! {
+                    _ = stopped.fuse() => anyhow::bail!("The library document's language server was stopped"),
+                    server = ready.fuse() => { server.context("The library document's language server failed to start")?; }
+                }
+            }
+            let buffer = this.update(cx, |store, cx| {
+                let local = store.as_local().context("Library document owner is unavailable")?;
+                anyhow::ensure!(local.language_server_ids.values().any(|server| server.id == server_id)
+                    && !local.all_language_servers_stopped
+                    && !local.stopped_language_servers.contains(&LanguageServerName::from(location.server_name.as_str())),
+                    "The library document's language server was stopped");
+                if let Some((_, document)) = &location.session {
+                    anyhow::ensure!(local.virtual_document_is_current(document), "The library document's project model changed");
+                }
+                // Resolve through the current server's URI cache; saved decompiled text is never restored.
+                anyhow::Ok(store.open_local_buffer_via_lsp(location.uri.clone(), server_id, cx))
+            })??.await?;
+            let restored = this.read_with(cx, |store, cx| store.language_server_document_location(buffer.read(cx), cx))??
+                .context("Restored document lost its language server owner")?;
+            anyhow::ensure!(restored.worktree_root == location.worktree_root && restored.server_root == location.server_root && restored.settings_fingerprint == location.settings_fingerprint,
+                "The library document's server or import settings changed while reopening it");
+            Ok(buffer)
+        })
+    }
+
     fn open_kotlin_virtual_buffer(
         &mut self,
         uri: Uri,
@@ -11101,7 +11672,7 @@ impl LspStore {
 
         let response = this
             .update(&mut cx, |this, cx| {
-                this.request_lsp(buffer_handle.clone(), server_to_query, request, cx)
+                this.request_completions(buffer_handle.clone(), server_to_query, request, cx)
             })
             .await?;
         this.update(&mut cx, |this, cx| {
@@ -11561,10 +12132,19 @@ impl LspStore {
         let sender_id = envelope.original_sender_id().unwrap_or_default();
         let action =
             Self::deserialize_code_action(envelope.payload.action.context("invalid action")?)?;
+        let completion_session = envelope
+            .payload
+            .completion_session
+            .map(Self::deserialize_completion_session)
+            .transpose()?;
         let apply_code_action = this.update(&mut cx, |this, cx| {
             let buffer_id = BufferId::new(envelope.payload.buffer_id)?;
             let buffer = this.buffer_store.read(cx).get_existing(buffer_id)?;
-            anyhow::Ok(this.apply_code_action(buffer, action, false, cx))
+            anyhow::Ok(if completion_session.is_some() {
+                this.apply_completion_command(buffer, action, completion_session, cx)
+            } else {
+                this.apply_code_action(buffer, action, false, cx)
+            })
         })?;
 
         let project_transaction = apply_code_action.await?;
@@ -13454,6 +14034,30 @@ impl LspStore {
             } else {
                 self.stop_local_language_servers_for_buffers(&[], only_restart_servers.clone(), cx)
             };
+            // Replacement servers get new IDs; select their names only after stopping the requested IDs.
+            let register_servers = if only_restart_servers.is_empty() {
+                HashSet::default()
+            } else {
+                stopped_names
+                    .iter()
+                    .cloned()
+                    .map(LanguageServerSelector::Name)
+                    .chain(
+                        only_restart_servers
+                            .iter()
+                            .filter_map(|selector| match selector {
+                                LanguageServerSelector::Name(name) => {
+                                    Some(LanguageServerSelector::Name(name.clone()))
+                                }
+                                LanguageServerSelector::Id(_) => None,
+                            }),
+                    )
+                    .collect()
+            };
+            if !only_restart_servers.is_empty() && register_servers.is_empty() {
+                stop_task.detach();
+                return;
+            }
             cx.spawn(async move |lsp_store, cx| {
                 stop_task.await;
                 lsp_store.update(cx, |lsp_store, cx| {
@@ -13479,7 +14083,7 @@ impl LspStore {
                     for buffer in buffers {
                         lsp_store.register_buffer_with_language_servers(
                             &buffer,
-                            only_restart_servers.clone(),
+                            register_servers.clone(),
                             true,
                             cx,
                         );
@@ -13649,6 +14253,9 @@ impl LspStore {
         let updates = lsp_diagnostics
             .into_iter()
             .filter_map(|update| {
+                if update.diagnostics.uri.scheme() != "file" {
+                    return None;
+                }
                 let abs_path = update.diagnostics.uri.to_file_path().ok()?;
                 Some(DocumentDiagnosticsUpdate {
                     diagnostics: self.lsp_to_document_diagnostics(
@@ -14409,6 +15016,26 @@ impl LspStore {
         })
     }
 
+    pub fn serialize_completion_session(session: &CompletionSession) -> proto::CompletionSession {
+        proto::CompletionSession {
+            id: session.id,
+            buffer_id: session.buffer_id.into(),
+            buffer_version: serialize_version(&session.buffer_version),
+            model_version: session.model_version,
+        }
+    }
+
+    pub(crate) fn deserialize_completion_session(
+        session: proto::CompletionSession,
+    ) -> Result<CompletionSession> {
+        Ok(CompletionSession {
+            id: session.id,
+            buffer_id: BufferId::new(session.buffer_id)?,
+            buffer_version: deserialize_version(&session.buffer_version),
+            model_version: session.model_version,
+        })
+    }
+
     pub(crate) fn serialize_completion(completion: &CoreCompletion) -> proto::Completion {
         let mut serialized_completion = proto::Completion {
             old_replace_start: Some(serialize_anchor(&completion.replace_range.start)),
@@ -14423,6 +15050,7 @@ impl LspStore {
                 lsp_completion,
                 lsp_defaults,
                 resolved,
+                completion_session,
             } => {
                 let (old_insert_start, old_insert_end) = insert_range
                     .as_ref()
@@ -14438,6 +15066,9 @@ impl LspStore {
                     .as_deref()
                     .map(|lsp_defaults| serde_json::to_vec(lsp_defaults).unwrap());
                 serialized_completion.resolved = *resolved;
+                serialized_completion.completion_session = completion_session
+                    .as_ref()
+                    .map(Self::serialize_completion_session);
             }
             CompletionSource::BufferWord {
                 word_range,
@@ -14495,6 +15126,10 @@ impl LspStore {
                         .map(serde_json::from_slice)
                         .transpose()?,
                     resolved: completion.resolved,
+                    completion_session: completion
+                        .completion_session
+                        .map(Self::deserialize_completion_session)
+                        .transpose()?,
                 },
                 Some(proto::completion::Source::BufferWord) => {
                     let word_range = completion
@@ -14604,6 +15239,10 @@ impl LspStore {
                 .virtual_buffer_loads
                 .retain(|document, _| document.server_id != for_server);
             local.virtual_document_versions.remove(&for_server);
+            local.completion_sessions.remove(&for_server);
+            local.completion_request_locks.remove(&for_server);
+            local.active_completion_commands.remove(&for_server);
+            local.uncertain_completion_sessions.remove(&for_server);
             local.buffer_pull_diagnostics_result_ids.remove(&for_server);
             local
                 .workspace_pull_diagnostics_result_ids
@@ -14836,6 +15475,9 @@ impl LspStore {
             .fold(
                 HashMap::default(),
                 |mut acc, (server_id, uri, diagnostics, version, new_registration_id)| {
+                    if uri.scheme() != "file" {
+                        return acc;
+                    }
                     let (result_id, diagnostics) = match diagnostics {
                         PulledDiagnostics::Unchanged { result_id } => {
                             unchanged_buffers
@@ -16417,6 +17059,8 @@ impl PartialEq for LanguageServerPromptRequest {
 
 #[derive(Clone, Debug)]
 pub struct LanguageServerShowDocumentRequest {
+    pub language_server_id: LanguageServerId,
+    pub completion_session: Option<CompletionSession>,
     pub uri: lsp::Uri,
     pub external: bool,
     pub take_focus: bool,
@@ -16425,6 +17069,20 @@ pub struct LanguageServerShowDocumentRequest {
 }
 
 impl LanguageServerShowDocumentRequest {
+    pub fn is_current(&self, lsp_store: &LspStore, cx: &App) -> bool {
+        self.completion_session.as_ref().is_none_or(|session| {
+            lsp_store
+                .buffer_store
+                .read(cx)
+                .get_existing(session.buffer_id)
+                .is_ok_and(|buffer| {
+                    lsp_store
+                        .validate_completion_session(&buffer, self.language_server_id, session, cx)
+                        .is_ok()
+                })
+        })
+    }
+
     pub fn respond(self, success: bool) {
         self.response_channel.try_send(success).ok();
     }
@@ -16534,7 +17192,7 @@ pub struct WorkspaceRefreshTask {
 
 pub enum LanguageServerState {
     Starting {
-        startup: Task<Option<Arc<LanguageServer>>>,
+        startup: Shared<Task<Option<Arc<LanguageServer>>>>,
         /// List of language servers that will be added to the workspace once it's initialization completes.
         pending_workspace_folders: Arc<Mutex<BTreeSet<Uri>>>,
     },
