@@ -179,7 +179,7 @@ impl ProjectEnvironment {
             .read_with(cx, |worktree_store, cx| {
                 crate::Project::default_visible_worktree_paths(worktree_store, cx)
                     .into_iter()
-                    .next()
+                    .find(|path| !fs::is_archive_path(path))
             })
             .ok()
             .flatten()
@@ -203,9 +203,9 @@ impl ProjectEnvironment {
             return Task::ready(Some(cli_environment)).shared();
         }
 
-        // Archive entries have no shell working directory. Their server uses the project environment.
+        // Archive entries have no shell working directory. Use the project's JDK and PATH.
         if fs::is_archive_path(&abs_path) {
-            return Task::ready(None).shared();
+            return self.default_environment(cx);
         }
 
         self.local_environments
