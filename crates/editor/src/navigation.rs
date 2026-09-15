@@ -1050,7 +1050,10 @@ impl Editor {
                 return Ok(Navigated::Yes);
             }
             match fallback_strategy {
-                GoToDefinitionFallback::None => Ok(Navigated::No),
+                GoToDefinitionFallback::None => editor.update_in(cx, |editor, window, cx| {
+                    editor.show_no_navigation_results(window, cx);
+                    Navigated::No
+                }),
                 GoToDefinitionFallback::FindAllReferences => {
                     match editor.update_in(cx, |editor, window, cx| {
                         editor.find_all_references(&FindAllReferences::default(), window, cx)
@@ -1366,6 +1369,41 @@ impl Editor {
         Some(cx.spawn(async move |_, _| Ok(references.await?.unwrap_or_default())))
     }
 
+    pub fn show_no_navigation_results(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let source = self.selections.newest_anchor().head();
+        let analyzing = self.project.as_ref().is_some_and(|project| {
+            self.buffer
+                .read(cx)
+                .text_anchor_for_position(source, cx)
+                .is_some_and(|(buffer, _)| {
+                    let buffer_id = buffer.read(cx).remote_id();
+                    project
+                        .read(cx)
+                        .lsp_store()
+                        .update(cx, |store, _| store.is_kotlin_analyzing_buffer(buffer_id))
+                })
+        });
+        let message = if analyzing {
+            "Code navigation is not possible while analyzing project"
+        } else {
+            "Cannot find declaration to go to"
+        };
+        let context_menu = ContextMenu::build(window, cx, |menu, _, _| menu.label(message));
+        let character_size = self.character_dimensions(window, cx);
+        hover_popover::hide_hover(self, cx);
+        self.mouse_context_menu = Some(MouseContextMenu::new(
+            self,
+            mouse_context_menu::MenuPosition::PinnedToEditor {
+                source,
+                offset: gpui::point(character_size.em_width, character_size.line_height),
+            },
+            context_menu,
+            window,
+            cx,
+        ));
+        cx.notify();
+    }
+
     pub fn find_all_references(
         &mut self,
         action: &FindAllReferences,
@@ -1418,9 +1456,7 @@ impl Editor {
                 }
             });
 
-            let Some(locations) = references.await? else {
-                return anyhow::Ok(Navigated::No);
-            };
+            let locations = references.await?.unwrap_or_default();
             let mut locations = cx.update(|_, cx| {
                 locations
                     .into_iter()
@@ -1440,6 +1476,9 @@ impl Editor {
                     .into_group_map()
             })?;
             if locations.is_empty() {
+                editor.update_in(cx, |editor, window, cx| {
+                    editor.show_no_navigation_results(window, cx);
+                })?;
                 return anyhow::Ok(Navigated::No);
             }
             for ranges in locations.values_mut() {

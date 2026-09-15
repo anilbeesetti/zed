@@ -10591,6 +10591,32 @@ impl LspStore {
         self.as_local()?.buffers_opened_in_servers.get(&buffer_id)
     }
 
+    pub fn is_kotlin_analyzing_buffer(&mut self, buffer_id: BufferId) -> bool {
+        let LspStoreMode::Local(local) = &mut self.mode else {
+            return false;
+        };
+        local
+            .buffers_opened_in_servers
+            .get(&buffer_id)
+            .is_some_and(|servers| {
+                servers.iter().any(|server_id| {
+                    local
+                        .kotlin_workspace_imports
+                        .get_mut(server_id)
+                        .is_some_and(|import| {
+                            import.borrow().is_none()
+                                || self.language_server_statuses.get(server_id).is_some_and(
+                                    |status| {
+                                        status.pending_work.values().any(|progress| {
+                                            progress.title.as_deref() == Some("Analyzing project")
+                                        })
+                                    },
+                                )
+                        })
+                })
+            })
+    }
+
     pub fn language_server_for_local_buffer<'a>(
         &'a self,
         buffer: &'a Buffer,
@@ -13042,7 +13068,15 @@ impl LspStore {
             };
 
         match progress {
-            lsp::WorkDoneProgress::Begin(report) => {
+            lsp::WorkDoneProgress::Begin(mut report) => {
+                if self.as_local().is_some_and(|local| {
+                    local
+                        .kotlin_workspace_imports
+                        .contains_key(&language_server_id)
+                }) && matches!(report.title.as_str(), "Importing" | "Indexing")
+                {
+                    report.title = "Analyzing project".into();
+                }
                 if is_disk_based_diagnostics_progress {
                     self.disk_based_diagnostics_started(language_server_id, cx);
                 }

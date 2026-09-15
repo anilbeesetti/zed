@@ -574,3 +574,19 @@ resource and application class outputs that were absent; they do not explain an
 empty workspace list. Generated-symbol support and cold navigation readiness
 remain open gates. The implementation is under review in
 [PR #21](https://github.com/anilbeesetti/zed/pull/21).
+
+### Analysis feedback during navigation
+
+Official Kotlin import and indexing progress now display `Analyzing project`.
+Empty navigation results open a popup beside the caret instead of a workspace
+notification: `Code navigation is not possible while analyzing project` while
+that buffer's Kotlin server is importing or indexing, otherwise
+`Cannot find declaration to go to`. Successful navigation remains available
+during analysis. The popup uses the existing editor context-menu lifecycle.
+
+All eight navigation-picker tests, seven editor navigation regressions, and the
+expanded Kotlin restart/import-state test pass (16 tests). These cover empty
+results, Cmd-click fallback, caret-movement dismissal, successful navigation,
+import completion, and subsequent indexing. Focused Clippy for `project`,
+`editor`, and `lsp_locations`, workspace formatting, and diff whitespace checks
+pass. The release executable built at `dc8ce22888` predates this UI follow-up.

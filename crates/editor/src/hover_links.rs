@@ -208,20 +208,26 @@ impl Editor {
     ) {
         let focus_handle = self.focus_handle(cx);
         let reveal_task = self.cmd_click_reveal_task(point, modifiers, window, cx);
-        cx.spawn_in(window, async move |_, cx| {
+        cx.spawn_in(window, async move |editor, cx| {
             let definition_revealed = reveal_task.await.log_err().unwrap_or(Navigated::No);
             if definition_revealed == Navigated::Yes {
                 return;
             }
             cx.update(|window, cx| {
                 match EditorSettings::get_global(cx).go_to_definition_fallback {
-                    GoToDefinitionFallback::None => {}
+                    GoToDefinitionFallback::None => {
+                        editor
+                            .update(cx, |editor, cx| {
+                                editor.show_no_navigation_results(window, cx)
+                            })
+                            .log_err();
+                    }
                     GoToDefinitionFallback::FindAllReferences => {
                         focus_handle.dispatch_action(&FindAllReferences::default(), window, cx);
                     }
                 }
             })
-            .ok();
+            .log_err();
         })
         .detach();
     }

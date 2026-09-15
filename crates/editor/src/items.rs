@@ -2946,6 +2946,7 @@ mod tests {
         use futures::{FutureExt as _, StreamExt as _};
         use gpui::UpdateGlobal as _;
         use language::FakeLspAdapter;
+        use std::time::Duration;
         use workspace::ItemHandle as _;
 
         enum ImportState {}
@@ -2986,7 +2987,51 @@ mod tests {
             .unwrap();
         let server = servers.next().await.unwrap();
         cx.run_until_parked();
+        let analyzing = |cx: &mut gpui::TestAppContext| {
+            let buffer_id = source.read_with(cx, |buffer, _| buffer.remote_id());
+            project
+                .read_with(cx, |project, _| project.lsp_store())
+                .update(cx, |store, _| store.is_kotlin_analyzing_buffer(buffer_id))
+        };
+        assert!(analyzing(cx));
+        server
+            .start_progress_with(
+                "import",
+                lsp::WorkDoneProgressBegin {
+                    title: "Importing".into(),
+                    ..Default::default()
+                },
+                Duration::from_secs(5),
+            )
+            .await;
+        cx.run_until_parked();
+        project.read_with(cx, |project, cx| {
+            assert!(project.language_server_statuses(cx).any(|(_, status)| {
+                status
+                    .pending_work
+                    .values()
+                    .any(|progress| progress.title.as_deref() == Some("Analyzing project"))
+            }));
+        });
+        server.end_progress("import");
         server.notify::<ImportState>(imported.clone());
+        cx.run_until_parked();
+        assert!(!analyzing(cx));
+        server
+            .start_progress_with(
+                "index",
+                lsp::WorkDoneProgressBegin {
+                    title: "Indexing".into(),
+                    ..Default::default()
+                },
+                Duration::from_secs(5),
+            )
+            .await;
+        cx.run_until_parked();
+        assert!(analyzing(cx));
+        server.end_progress("index");
+        cx.run_until_parked();
+        assert!(!analyzing(cx));
         let uri: lsp::Uri = "jar:///cache%20directory/library-1.0.jar!/example/Library.class"
             .parse()
             .unwrap();
