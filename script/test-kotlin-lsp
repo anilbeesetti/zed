@@ -1,0 +1,439 @@
+#!/usr/bin/env python3
+"""Probe the official Kotlin LSP against examples/android-ide, without an editor."""
+
+import argparse
+import hashlib
+import io
+import json
+import os
+from pathlib import Path
+import queue
+import subprocess
+import threading
+import time
+
+
+class ProbeError(Exception):
+    def __init__(self, outcome, message):
+        super().__init__(message)
+        self.outcome = outcome
+
+
+def position(text, offset):
+    before = text[:offset]
+    return {"line": before.count("\n"), "character": len(before.rsplit("\n", 1)[-1].encode("utf-16-le")) // 2}
+
+
+def offset(text, location):
+    lines = text.split("\n")
+    line, character = location["line"], location["character"]
+    if line < 0 or line >= len(lines) or character < 0:
+        raise ValueError("Invalid LSP position")
+    encoded = lines[line].encode("utf-16-le")
+    if character * 2 > len(encoded):
+        raise ValueError("LSP position exceeds line")
+    return sum(len(value) + 1 for value in lines[:line]) + len(encoded[:character * 2].decode("utf-16-le"))
+
+
+def incremental_change(before, after):
+    start = 0
+    while start < min(len(before), len(after)) and before[start] == after[start]:
+        start += 1
+    end, replacement_end = len(before), len(after)
+    while end > start and replacement_end > start and before[end - 1] == after[replacement_end - 1]:
+        end -= 1
+        replacement_end -= 1
+    return {"range": {"start": position(before, start), "end": position(before, end)}, "text": after[start:replacement_end]}
+
+
+def apply_edits(text, edits):
+    replacements = sorted((offset(text, edit["range"]["start"]), offset(text, edit["range"]["end"]), edit["newText"]) for edit in edits)
+    boundary = len(text)
+    for start, end, replacement in reversed(replacements):
+        if start > end or end > boundary:
+            raise ValueError("Overlapping or reversed text edits")
+        text = text[:start] + replacement + text[end:]
+        boundary = start
+    return text
+
+
+def outcome(response):
+    error = response.get("error")
+    if error:
+        return {-32800: "cancelled", -32802: "cancelled", -32801: "stale_content"}.get(error.get("code"), "server_error")
+    result = response.get("result")
+    if result is None or result == [] or (isinstance(result, dict) and result.get("items") == []):
+        return "empty"
+    return "success"
+
+
+def read_message(stream):
+    headers = {}
+    while True:
+        line = stream.readline()
+        if not line:
+            raise EOFError("Language server closed stdout")
+        if line == b"\r\n":
+            break
+        key, value = line.decode().split(":", 1)
+        headers[key.lower()] = value.strip()
+    remaining = int(headers["content-length"])
+    chunks = []
+    while remaining:
+        chunk = stream.read(remaining)
+        if not chunk:
+            raise EOFError("Truncated language server response")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return json.loads(b"".join(chunks))
+
+
+class Probe:
+    def __init__(self, process, wire, results, root, source_file, source):
+        self.process, self.wire, self.results, self.root = process, wire, results, root
+        self.uri, self.text, self.version = source_file.as_uri(), source, 1
+        self.messages, self.identifier = queue.Queue(), 0
+        self.started = time.monotonic()
+        self.progress, self.index_finished, self.import_finished = {}, False, False
+
+        def reader():
+            try:
+                while True:
+                    self.messages.put(read_message(process.stdout))
+            except Exception as error:
+                self.messages.put(error)
+
+        threading.Thread(target=reader, daemon=True).start()
+
+    def record(self, direction, message):
+        self.wire.write(json.dumps({"seconds": round(time.monotonic() - self.started, 3), "direction": direction, "message": message}) + "\n")
+        self.wire.flush()
+
+    def send(self, **message):
+        message["jsonrpc"] = "2.0"
+        self.record("client", message)
+        data = json.dumps(message).encode()
+        self.process.stdin.write(f"Content-Length: {len(data)}\r\n\r\n".encode() + data)
+        self.process.stdin.flush()
+
+    def notify(self, method, params):
+        self.send(method=method, params=params)
+
+    def change(self, text):
+        if text == self.text:
+            return
+        edit = incremental_change(self.text, text)
+        self.text, self.version = text, self.version + 1
+        self.notify("textDocument/didChange", {"textDocument": {"uri": self.uri, "version": self.version}, "contentChanges": [edit]})
+
+    def receive(self, deadline):
+        try:
+            message = self.messages.get(timeout=max(0, deadline - time.monotonic()))
+        except queue.Empty:
+            raise ProbeError("timeout", "Timed out waiting for the language server") from None
+        if isinstance(message, Exception):
+            raise ProbeError("transport_error", str(message))
+        self.record("server", message)
+        method, params = message.get("method"), message.get("params", {})
+        if method in ("$/progress", "intellij/importLog", "intellij/workspaceImportStatus", "window/showMessage", "window/logMessage"):
+            self.results["events"].append({"seconds": round(time.monotonic() - self.started, 3), "method": method, "params": params})
+        if method == "$/progress":
+            token, value = params["token"], params["value"]
+            if value["kind"] == "begin":
+                self.progress[token] = value.get("title")
+            elif value["kind"] == "end" and self.progress.pop(token, None) == "Indexing":
+                self.index_finished = True
+                self.results["last_index_finished_seconds"] = round(time.monotonic() - self.started, 3)
+        if method == "intellij/importLog":
+            if params.get("failed"):
+                raise ProbeError("import_failure", params.get("message", "Project import failed"))
+            if params.get("started"):
+                self.index_finished, self.import_finished = False, False
+            if params.get("succeeded"):
+                self.import_finished = True
+                self.results["import_finished_seconds"] = round(time.monotonic() - self.started, 3)
+        if method == "intellij/workspaceImportStatus" and params.get("blockedFolders"):
+            raise ProbeError("import_failure", "Import blocked: " + json.dumps(params))
+        if method and "id" in message:
+            self.respond(message)
+        return message
+
+    def respond(self, message):
+        method, params = message["method"], message.get("params", {})
+        result = None
+        if method == "workspace/configuration":
+            result = [None for item in params["items"]]
+        elif method == "workspace/workspaceFolders":
+            result = [{"uri": self.root.as_uri(), "name": self.root.name}]
+        elif method == "workspace/applyEdit":
+            try:
+                changes = params["edit"].get("changes", {})
+                edits = list(changes.get(self.uri, []))
+                if any(uri != self.uri for uri in changes):
+                    raise ValueError("Probe only edits its open fixture buffer")
+                for change in params["edit"].get("documentChanges", []):
+                    document = change.get("textDocument", {})
+                    if document.get("uri") != self.uri or document.get("version") not in (None, self.version):
+                        raise ValueError("Unexpected document or stale edit version")
+                    edits.extend(change["edits"])
+                self.change(apply_edits(self.text, edits))
+                result = {"applied": True}
+            except (KeyError, ValueError) as error:
+                result = {"applied": False, "failureReason": str(error)}
+            self.results["applied_edits"].append({"version": self.version, "params": params, "result": result})
+        elif method == "window/showDocument":
+            result = {"success": params.get("uri") == self.uri}
+            if result["success"] and params.get("selection"):
+                offset(self.text, params["selection"]["start"])
+                offset(self.text, params["selection"]["end"])
+            self.results["show_documents"].append(params)
+        elif method not in ("window/workDoneProgress/create", "client/registerCapability", "workspace/diagnostic/refresh", "workspace/semanticTokens/refresh", "workspace/inlayHint/refresh", "workspace/codeLens/refresh", "window/showMessageRequest"):
+            self.results.setdefault("unhandled_requests", []).append(message)
+            self.send(id=message["id"], error={"code": -32601, "message": "Probe does not implement " + method})
+            return
+        self.send(id=message["id"], result=result)
+
+    def request(self, method, params, timeout=90):
+        self.identifier += 1
+        identifier, started, version = self.identifier, time.monotonic(), self.version
+        self.send(id=identifier, method=method, params=params)
+        try:
+            while True:
+                response = self.receive(started + timeout)
+                if response.get("id") == identifier and "method" not in response:
+                    break
+        except ProbeError as error:
+            self.results["requests"].append({"id": identifier, "method": method, "version": version, "milliseconds": round((time.monotonic() - started) * 1000, 2), "outcome": error.outcome, "error": str(error)})
+            if error.outcome == "timeout":
+                self.notify("$/cancelRequest", {"id": identifier})
+            raise
+        self.results["requests"].append({"id": identifier, "method": method, "version": version, "milliseconds": round((time.monotonic() - started) * 1000, 2), "outcome": outcome(response), "error": response.get("error")})
+        return response
+
+    def check(self, name, passed, detail=None, required=True):
+        self.results["checks"].append({"name": name, "passed": bool(passed), "required": required, "detail": detail})
+        print(f"{'PASS' if passed else 'FAIL'} {name}", flush=True)
+
+    def ready(self, timeout):
+        deadline = time.monotonic() + timeout
+        while not (self.import_finished and self.index_finished and "Indexing" not in self.progress.values()):
+            try:
+                self.receive(deadline)
+            except ProbeError as error:
+                if error.outcome == "timeout":
+                    raise ProbeError("readiness_timeout", "Import and indexing did not complete") from error
+                raise
+        self.results["ready_seconds"] = round(time.monotonic() - self.started, 3)
+        self.check("import_and_indexing_completed", True)
+
+
+def run(probe, args, source):
+    response = probe.request("initialize", {
+        "processId": os.getpid(), "clientInfo": {"name": "Zed Kotlin compatibility probe", "version": "1"},
+        "rootUri": probe.root.as_uri(), "workspaceFolders": [{"uri": probe.root.as_uri(), "name": probe.root.name}],
+        "initializationOptions": {"defaultSdk": str(args.java_home), "projects": [{"type": "gradle", "path": probe.root.as_uri(), "java-home": str(args.java_home)}]},
+        "capabilities": {
+            "general": {"positionEncodings": ["utf-16"]},
+            "window": {"workDoneProgress": True, "showDocument": {"support": True}},
+            "workspace": {"applyEdit": True, "workspaceEdit": {"documentChanges": True}, "configuration": True, "workspaceFolders": True, "executeCommand": {"dynamicRegistration": True}, "diagnostics": {"refreshSupport": True}},
+            "textDocument": {"synchronization": {"dynamicRegistration": False}, "completion": {"completionItem": {"snippetSupport": True, "insertReplaceSupport": True, "resolveSupport": {"properties": ["documentation", "detail", "additionalTextEdits"]}}}, "definition": {"linkSupport": True}, "diagnostic": {"relatedDocumentSupport": True}},
+        },
+    })
+    if response.get("error"):
+        raise ProbeError("server_error", json.dumps(response["error"]))
+    initialization = response["result"]
+    probe.results["initialize"] = initialization
+    probe.check("tested_server_release", initialization.get("serverInfo", {}).get("version") == "ILS-" + args.expected_release, initialization.get("serverInfo"))
+    capabilities = initialization["capabilities"]
+    synchronization = capabilities.get("textDocumentSync", {})
+    synchronization = synchronization.get("change") if isinstance(synchronization, dict) else synchronization
+    probe.check("negotiated_incremental_sync", synchronization == 2, synchronization)
+    if synchronization != 2 or capabilities.get("positionEncoding", "utf-16") != "utf-16":
+        raise ProbeError("unsupported_protocol", "This regression probe requires incremental UTF-16 synchronization")
+    probe.notify("initialized", {})
+    probe.notify("textDocument/didOpen", {"textDocument": {"uri": probe.uri, "languageId": "kotlin", "version": probe.version, "text": source}})
+    probe.ready(args.timeout)
+    probe.results["import_status"] = probe.request("intellij/workspaceImportStatus", {})
+    model_path = probe.root / "workspace.json"
+    if model_path.exists():
+        raise ProbeError("fixture_error", "Use an isolated native Gradle fixture without workspace.json")
+    try:
+        exported = probe.request("workspace/executeCommand", {"command": "exportWorkspace", "arguments": [str(probe.root)]})
+        if exported.get("error") or not model_path.exists():
+            raise ProbeError("server_error", "Could not export the imported model: " + json.dumps(exported))
+        model = json.loads(model_path.read_text())
+        modules = [module["name"] for module in model["modules"]]
+        probe.results["active_modules"] = modules
+        probe.results["libraries"] = [{"name": library["name"], "has_sources": any(root.get("type") == "SOURCES" for root in library.get("roots", []))} for library in model["libraries"]]
+        probe.check("selected_application_variant", any(name.endswith(".mobile." + args.variant) for name in modules), modules)
+        library_variant = "debug" if args.variant.endswith("Debug") else "release"
+        probe.check("selected_library_variant", any(name.endswith(".greeting." + library_variant) for name in modules), modules)
+    finally:
+        model_path.unlink(missing_ok=True)
+    contents = {}
+    for symbol in ("headlineSmall", "Text", "padding", "dp", "Modifier", "Column", "stringResource", "LibraryGreeting", "Greeting", "BuildConfig", "Bundle", "headlineSmall"):
+        location = source.index("Greeting.message") if symbol == "Greeting" else source.rindex(symbol)
+        response = probe.request("textDocument/definition", {"textDocument": {"uri": probe.uri}, "position": position(source, location + 1)})
+        targets = response.get("result") or []
+        if isinstance(targets, dict):
+            targets = [targets]
+        probe.check("definition_" + symbol, bool(targets) and not response.get("error"), {"outcome": outcome(response), "targets": targets})
+        for target in targets:
+            uri = target.get("uri", target.get("targetUri"))
+            if not uri.startswith(("jar:", "jrt:")):
+                continue
+            if uri not in contents:
+                content = probe.request("workspace/executeCommand", {"command": "decompile", "arguments": [uri]})
+                contents[uri] = content.get("result") or {}
+                probe.check("readable_virtual_document", bool(contents[uri].get("code")) and bool(contents[uri].get("language")), uri)
+            code = contents[uri].get("code", "")
+            selection = target.get("targetSelectionRange", target.get("range"))
+            selected = code[offset(code, selection["start"]):offset(code, selection["end"])] if code else ""
+            probe.check("target_range_" + symbol, symbol in selected, {"uri": uri, "selection": selected})
+            if symbol in ("headlineSmall", "Text", "padding", "dp", "Modifier", "Column", "stringResource"):
+                probe.check("original_source_" + symbol, uri.endswith(".kt"), uri, required=args.require_original_sources)
+    probe.results["virtual_documents"] = contents
+    source_document = next(((uri, content) for uri, content in contents.items() if uri.endswith("Typography.kt")), None)
+    if source_document:
+        uri, content = source_document
+        probe.notify("textDocument/didOpen", {"textDocument": {"uri": uri, "languageId": content["language"], "version": 1, "text": content["code"]}})
+        nested = probe.request("textDocument/definition", {"textDocument": {"uri": uri}, "position": position(content["code"], content["code"].rindex("TextStyle") + 1)})
+        probe.check("nested_library_definition", bool(nested.get("result")), nested)
+        probe.notify("textDocument/didClose", {"textDocument": {"uri": uri}})
+    else:
+        probe.check("nested_library_definition", False, "Original Typography.kt is unavailable", required=args.require_original_sources)
+    cases = [
+        ("local", 'val localGreeting = "hello"\n loc|', "localGreeting"),
+        ("string_member", 'val localGreeting = "hello"\n localGreeting.|', "length"),
+        ("compose_modifier", "Modifier.pa|", "padding"),
+        ("compose_theme", "MaterialTheme.ty|", "typography"),
+        ("compose_imported", "Tex|", "Text"),
+        ("compose_named_argument", "Text(te|)", "text ="),
+        ("android_resource", "R.string.|", "app_name"),
+        ("compose_autoimport", "Button|", "Button"),
+    ]
+    for name, snippet, expected in cases:
+        marked = source + "\n@Composable\nprivate fun compatibilityProbe() {\n " + snippet + "\n}\n"
+        caret = marked.index("|")
+        probe.change(marked.replace("|", ""))
+        response = probe.request("textDocument/completion", {"textDocument": {"uri": probe.uri}, "position": position(probe.text, caret), "context": {"triggerKind": 1}})
+        result = response.get("result") or {}
+        items = result if isinstance(result, list) else result.get("items", [])
+        item = next((item for item in items if item["label"].strip() == expected), None)
+        probe.check("unsaved_completion_" + name, item is not None, {"outcome": outcome(response), "version": probe.version, "count": len(items), "rank": items.index(item) + 1 if item else None})
+        if name == "compose_autoimport" and item:
+            resolved = probe.request("completionItem/resolve", item)
+            probe.check("completion_resolve_succeeded", "error" not in resolved, resolved.get("error"))
+            item = resolved.get("result") or item
+            command = item.get("command")
+            probe.check("completion_command_retained", bool(command), item)
+            if command:
+                edit = item.get("textEdit")
+                if edit:
+                    probe.change(apply_edits(probe.text, [{"range": edit.get("range", edit.get("insert")), "newText": edit["newText"]}, *item.get("additionalTextEdits", [])]))
+                executed = probe.request("workspace/executeCommand", command)
+                probe.check("completion_command_succeeded", "error" not in executed, executed)
+                probe.check("completion_import_and_call", probe.text.count("import androidx.compose.material3.Button\n") == 1 and "Button()" in probe.text, probe.text)
+                probe.check("completion_workspace_edits", bool(probe.results["applied_edits"]) and all(edit["result"]["applied"] for edit in probe.results["applied_edits"]))
+                probe.check("completion_caret", any(document.get("selection") and document["uri"] == probe.uri for document in probe.results["show_documents"]))
+                probe.check("compose_trailing_lambda", "Button() {" in probe.text, "Compose insertion parity is a later milestone", required=False)
+    probe.change(source)
+    diagnostics = probe.request("textDocument/diagnostic", {"textDocument": {"uri": probe.uri}})
+    probe.check("pull_diagnostics", "error" not in diagnostics and isinstance(diagnostics.get("result"), dict), diagnostics)
+    probe.notify("textDocument/didClose", {"textDocument": {"uri": probe.uri}})
+
+
+def self_test():
+    for before, after in [("", "hello"), ("a😀b\n", "a😀c\n"), ("hello", ""), ("same", "same"), ("a\nb", "a\n😀b")]:
+        change = incremental_change(before, after)
+        assert apply_edits(before, [{"range": change["range"], "newText": change["text"]}]) == after
+        for index in range(len(after) + 1):
+            assert offset(after, position(after, index)) == index
+    assert outcome({"result": []}) == "empty"
+    assert outcome({"error": {"code": -32800}}) == "cancelled"
+    assert outcome({"error": {"code": -32801}}) == "stale_content"
+    assert outcome({"error": {"code": -32603}}) == "server_error"
+    probe = object.__new__(Probe)
+    probe.text, probe.version = "unchanged", 1
+    probe.change("unchanged")
+    assert probe.version == 1
+    probe.messages, probe.progress = queue.Queue(), {}
+    probe.import_finished, probe.index_finished = True, False
+    try:
+        probe.ready(0)
+    except ProbeError as error:
+        assert error.outcome == "readiness_timeout"
+    else:
+        raise AssertionError("Import success without indexing was accepted")
+    assert read_message(io.BytesIO(b'Content-Length: 13\r\n\r\n{"result":[]}')) == {"result": []}
+    for message, expected in [
+        ({"method": "intellij/importLog", "params": {"failed": True}}, "import_failure"),
+        ({"method": "intellij/workspaceImportStatus", "params": {"blockedFolders": ["file:///sample"]}}, "import_failure"),
+    ]:
+        probe = object.__new__(Probe)
+        probe.messages, probe.wire, probe.started, probe.results = queue.Queue(), io.StringIO(), time.monotonic(), {"events": []}
+        probe.messages.put(message)
+        try:
+            probe.receive(time.monotonic() + 1)
+        except ProbeError as error:
+            assert error.outcome == expected
+        else:
+            raise AssertionError("Import failure was accepted")
+    print("PASS protocol self-test")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--self-test", action="store_true", help="Run deterministic protocol checks without a server")
+    parser.add_argument("--project", type=Path, help="An isolated copy of examples/android-ide (Gradle writes caches)")
+    parser.add_argument("--server", type=Path, help="Official intellij-server executable")
+    parser.add_argument("--output", type=Path, help="Report directory; also contains persistent server indexes")
+    parser.add_argument("--java-home", type=Path, default=os.environ.get("JAVA_HOME"), help="Project JDK, separate from the bundled server runtime")
+    parser.add_argument("--variant", choices=("demoDebug", "fullDebug", "demoRelease", "fullRelease"), default="demoDebug")
+    parser.add_argument("--expected-release", default="263.4702.0")
+    parser.add_argument("--timeout", type=int, default=240, help="Maximum import/indexing time in seconds")
+    parser.add_argument("--require-original-sources", action="store_true", help="Fail the run if original Compose sources or nested navigation are unavailable")
+    args = parser.parse_args()
+    if args.self_test:
+        self_test()
+        return 0
+    if not all((args.project, args.server, args.output, args.java_home)):
+        parser.error("--project, --server, --output and --java-home (or JAVA_HOME) are required")
+    if not args.server.is_file() or not args.java_home.is_dir() or args.timeout <= 0:
+        parser.error("The server and JDK must exist, and --timeout must be positive")
+    root, output = args.project.resolve(), args.output.resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    source_file = root / "mobile/src/main/java/dev/zed/androidsample/MainActivity.kt"
+    if not source_file.is_file():
+        parser.error("--project must point to a copy of examples/android-ide")
+    source = source_file.read_text()
+    results = {"project": str(root), "server": str(args.server.resolve()), "expected_release": args.expected_release, "requested_variant": args.variant, "project_jdk": str(args.java_home), "source_sha256": hashlib.sha256(source.encode()).hexdigest(), "checks": [], "requests": [], "events": [], "applied_edits": [], "show_documents": []}
+    results["fixture_sources"] = {str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest() for module in ("mobile", "greeting") for path in sorted((root / module / "src").rglob("*")) if path.suffix in (".kt", ".java")}
+    environment = dict(os.environ, JAVA_HOME=str(args.java_home), LSP_ANDROID_VARIANT=args.variant, IJ_JAVA_OPTIONS=f"-Didea.config.path={output / 'config'} -Didea.log.path={output / 'logs'} -Dintellij.server.eula.persistence=false")
+    with (output / "stderr.log").open("w") as log, (output / "wire.jsonl").open("w") as wire:
+        process = subprocess.Popen([str(args.server.resolve()), "--stdio", "--system-path=" + str(output / "system"), "--data-sharing=none"], cwd=root, env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log)
+        probe = Probe(process, wire, results, root, source_file, source)
+        try:
+            run(probe, args, source)
+            probe.request("shutdown", None, timeout=10)
+            probe.notify("exit", None)
+        except Exception as error:
+            results["failure"] = {"outcome": getattr(error, "outcome", "probe_error"), "message": str(error)}
+            print(json.dumps(results["failure"]), flush=True)
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+            probe.check("source_unchanged_on_disk", source_file.read_text() == source)
+            results["duration_seconds"] = round(time.monotonic() - probe.started, 3)
+            results["passed"] = "failure" not in results and all(check["passed"] for check in results["checks"] if check["required"])
+            (output / "results.json").write_text(json.dumps(results, indent=2) + "\n")
+    print(f"Report: {output / 'results.json'}", flush=True)
+    return 0 if results["passed"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
