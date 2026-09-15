@@ -91,8 +91,12 @@ nested source navigation, and trailing-lambda gaps are reported separately;
 add `--require-original-sources` to make original/nested-source checks required.
 `--variant fullRelease` also checks that the dependent library selects `release`;
 the tested server currently falls back to `greeting.debug`, which fails this gate.
-This is a headless protocol check. Zed completion acceptance, buffer lifecycle,
-undo, stale-session handling and visible navigation latency need client tests.
+This is a headless protocol check. Separate Zed client regressions cover
+incremental completion acceptance, command edits, caret undo/redo, workspace-edit
+failure reporting, and virtual-document ownership/lifecycle in
+`crates/editor/src/editor_tests.rs` and `crates/project/tests/integration/lsp_store.rs`.
+Expired completion sessions, real server semantics, and visible navigation latency
+remain separate validation gates.
 
 Run `script/install-android-kotlin`, `script/install-android-debugger`, and
 `script/install-android-preview` once before launching the IDE. **Configure Java**
