@@ -811,3 +811,77 @@ p95 of 26.06 ms, and String completion p95 of 961.40 ms remain the recorded back
 baseline. Completion/first-analysis performance, longer-session memory,
 current-dependency-model archive ownership, broader import/generated-source
 coverage, and packaged-platform/distribution validation remain open promotion gates.
+
+
+### First navigation immediately after readiness — 2026-09-16
+
+**Step 8 remains open. No production latency fix was established.** Starting from
+merged restoration baseline `14f42531ebacdf45bb2ab4a80fb9895ca729f6e4`, this
+investigation reproduced the first-request delay in the unchanged official
+`263.4702.0+android-2` engine. The skipped completion task/PR #24 was not used or
+integrated, and its latency gate remains open. Community remains the default.
+
+`script/test-kotlin-lsp --navigation-only` now issues a definition immediately
+after import success and the original Indexing progress completion, before model
+export, memory sampling, any other semantic request, or a sleep. It supports an
+isolated larger project's active Kotlin file, separate result directories with
+shared persisted indexes, in-memory wire logging, first definition/content/launch
+timing, exact source-archive text and range verification, and separate warm
+samples. The self-test asserts request ordering and the 30-sample warm boundary.
+Normal full-suite and explicit warmup behavior are preserved.
+
+On the Apple M4 / 16 GiB / macOS 26.6.2 machine, 30 fresh native processes per
+fixture produced these results, with no concurrent builds, tests, or profiler:
+
+| Persisted indexes | First definition p50 / p95 | First + content p95 | Launch to first content p50 / p95 | Warm protocol p95 |
+| --- | ---: | ---: | ---: | ---: |
+| Android sample, `headlineSmall` | 1000.82 / 1101.50 ms | 1104.36 ms | 3.787 / 3.897 s | 1.52 ms |
+| nav3-recipes, original `Text` | 1785.73 / 1832.24 ms | 1835.08 ms | 5.248 / 5.449 s | 1.94 ms |
+
+All 60 first results and all 1,800 warm results were retained and passed target
+checks; **none of the first requests met 500 ms**. Each lifecycle contributed 30
+warm requests; maximum per-lifecycle warm p95 was 1.67 / 2.48 ms. Original source
+text matched the exact archive entry and selected the expected symbol. Wire-log
+overhead p95 was 0.093 / 0.112 ms, too small to explain the semantic delay.
+
+Individual first-import observations with fresh indexes were 19.659 / 36.451 s
+to readiness, 1473.27 / 2354.47 ms for the first definition, and 2.47 / 5.80 ms
+for original content. Engine/dependency downloads were already cached; these are
+not first-install benchmarks. Launch timing starts at subprocess creation, not
+editor project-open or worktree scanning. The prior release UI warm navigation
+p95 of 26.06 ms remains the UI baseline; this protocol series does not replace
+it or establish a new first-action/rendering budget pass.
+
+A separate JFR run shows lazy class/lambda initialization, FIR dependency-symbol
+resolution, persistent stub/content reads, and source PSI parsing in the first
+request. Existing CMD-hover/CMD-click and Cmd+B paths already share definition
+resolution, session/model-aware virtual content loading, and buffer/editor reuse.
+Source fetch is only a few milliseconds. The existing debug GPUI harness still
+adds wrapping invariant checks and synchronous wire logging, so it remains a
+correctness harness rather than evidence for release UI percentiles.
+
+Early diagnostics immediately after didOpen or at indexing start returned empty
+and left first definitions at 1190.65 / 1131.67 ms. A private single-resolution
+provider prototype took 1287.98 ms; a separate JVM tier-1 compilation experiment
+took 1098.47 ms. These are individual negative experiments, not statistical
+comparisons or shipped changes. No production preparation, readiness-marker
+change, target suppression, settings/ownership relaxation, or JVM tuning was
+added. A supported engine improvement that makes current active-file analysis
+available before the original readiness boundary is still needed; this session
+has not established such an implementation.
+
+Commands, raw lifecycle reports, profiling, experiment provenance, test results,
+and limits are retained in this checkout's
+`target/kotlin-first-navigation/VALIDATION.md` and `summary.json`. First-install
+download timing, actual project-open-to-rendered-first-jump measurements, packaging,
+and all other previously open rollout gates remain unverified by this change.
+
+Final regression validation passes the protocol self-test, 117/117 required native
+compatibility checks, the native GPUI navigation/acceptance and fresh-process
+restoration probe, 100 restoration scheduler seeds plus 400 Android lifecycle
+runs, CMD-hover/click and seven keyboard-navigation regressions, all 27 LSP-store
+tests, and focused `./script/clippy -p android_tools --offline`. Rust source is
+unchanged: the GPUI/LSP binaries were cloned from the identical integrated
+restoration tree, and their hashes/provenance are recorded in `source.json`.
+No newly built editor, production performance fix, or completion improvement is
+claimed. The README review notice is preserved.

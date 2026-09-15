@@ -10,10 +10,12 @@ import os
 from pathlib import Path
 import platform
 import queue
+import resource
 import statistics
 import subprocess
 import threading
 import time
+import zipfile
 from urllib.parse import unquote, urlparse
 
 
@@ -102,6 +104,7 @@ class Probe:
         self.started = time.monotonic()
         self.results["started_at_unix_seconds"] = time.time()
         self.progress, self.index_finished, self.import_finished = {}, False, False
+        self.wire_seconds = 0
 
         def reader():
             try:
@@ -113,8 +116,10 @@ class Probe:
         threading.Thread(target=reader, daemon=True).start()
 
     def record(self, direction, message):
+        started = time.monotonic()
         self.wire.write(json.dumps({"seconds": round(time.monotonic() - self.started, 3), "direction": direction, "message": message}) + "\n")
         self.wire.flush()
+        self.wire_seconds += time.monotonic() - started
 
     def send(self, **message):
         message["jsonrpc"] = "2.0"
@@ -271,7 +276,53 @@ class Probe:
                     raise ProbeError("readiness_timeout", "Import and indexing did not complete") from error
                 raise
         self.results["ready_seconds"] = round(time.monotonic() - self.started, 3)
-        self.check("import_and_indexing_completed", True)
+
+
+def first_navigation(probe, symbol, samples, require_original_sources):
+    params = {"textDocument": {"uri": probe.uri}, "position": position(probe.text, probe.text.rindex(symbol) + 1)}
+    started, wire_started = time.monotonic(), probe.wire_seconds
+    measurement = {"symbol": symbol, "dispatch_seconds": started - probe.started}
+    probe.results["first_navigation"] = measurement
+    response = probe.request("textDocument/definition", params)
+    measurement["definition"] = probe.results["requests"][-1]
+    measurement["result_seconds"] = time.monotonic() - probe.started
+    measurement["wire_milliseconds"] = (probe.wire_seconds - wire_started) * 1000
+    targets = response.get("result") or []
+    targets = [targets] if isinstance(targets, dict) else targets
+    measurement["targets"] = targets
+    documents = []
+    for target in targets:
+        uri = target.get("uri", target.get("targetUri"))
+        if uri.startswith(("jar:", "jrt:")):
+            content = probe.request("workspace/executeCommand", {"command": "decompile", "arguments": [uri]})
+            code = (content.get("result") or {}).get("code", "")
+            selection = target.get("targetSelectionRange", target.get("range"))
+            selected = code[offset(code, selection["start"]):offset(code, selection["end"])] if code else ""
+            documents.append((uri, code, selected))
+    measurement["content_finished_seconds"] = time.monotonic() - probe.started
+    measurement["definition_and_content_milliseconds"] = (time.monotonic() - started) * 1000
+    probe.check("first_navigation_has_target", bool(targets) and not response.get("error"), response)
+    for uri, code, selected in documents:
+        probe.check("first_navigation_source_range", symbol in selected, {"uri": uri, "selection": selected})
+        original = False
+        if uri.startswith("jar:") and uri.endswith(".kt"):
+            archive, entry = unquote(urlparse(uri).path).split("!/", 1)
+            with zipfile.ZipFile(archive) as sources:
+                original = sources.read(entry).decode("utf-8") == code
+        probe.check("first_navigation_original_source", original, uri, required=require_original_sources)
+    probe.check("first_navigation_protocol_budget", measurement["definition"]["milliseconds"] < 500, measurement, required=False)
+    timings, failures = [], []
+    for sample in range(samples):
+        response = probe.request("textDocument/definition", params)
+        timings.append(probe.results["requests"][-1]["milliseconds"])
+        repeated_targets = response.get("result") or []
+        repeated_targets = [repeated_targets] if isinstance(repeated_targets, dict) else repeated_targets
+        if response.get("error") or repeated_targets != targets:
+            failures.append({"sample": sample, "response": response})
+    if timings:
+        measurement["warm"] = {"milliseconds": timings, "failures": failures, "p50_ms": statistics.median(timings), "p95_ms": sorted(timings)[math.ceil(len(timings) * .95) - 1], "maximum_ms": max(timings)}
+        probe.check("warm_navigation_targets", not failures, failures)
+        probe.check("warm_navigation_protocol_budget", measurement["warm"]["p95_ms"] < 150, measurement["warm"], required=False)
 
 
 def completion_items(response):
@@ -601,6 +652,11 @@ def run(probe, args, source):
     if not args.model_only:
         probe.notify("textDocument/didOpen", {"textDocument": {"uri": probe.uri, "languageId": "kotlin", "version": probe.version, "text": source}})
     probe.ready(args.timeout)
+    if args.navigation_only:
+        first_navigation(probe, args.navigation_symbol, args.navigation_samples, args.require_original_sources)
+        probe.check("import_and_indexing_completed", True)
+        return
+    probe.check("import_and_indexing_completed", True)
     if args.performance_samples:
         process_memory(probe, "after_readiness")
     probe.results["import_status"] = probe.request("intellij/workspaceImportStatus", {})
@@ -769,6 +825,7 @@ def self_test():
     ]:
         probe = object.__new__(Probe)
         probe.messages, probe.wire, probe.started, probe.results = queue.Queue(), io.StringIO(), time.monotonic(), {"events": []}
+        probe.wire_seconds = 0
         probe.messages.put(message)
         try:
             probe.receive(time.monotonic() + 1)
@@ -776,6 +833,29 @@ def self_test():
             assert error.outcome == expected
         else:
             raise AssertionError("Import failure was accepted")
+    from types import SimpleNamespace
+    probe = object.__new__(Probe)
+    probe.uri, probe.text, probe.version = "file:///sample.kt", "val target = 1\ntarget", 1
+    probe.root, probe.started, probe.wire_seconds = Path("/sample"), time.monotonic(), 0
+    probe.results = {"requests": [], "checks": []}
+    operations = []
+    probe.notify = lambda method, params: operations.append(method)
+    probe.ready = lambda timeout: operations.append("ready")
+    probe.check = lambda name, passed, detail=None, required=True: probe.results["checks"].append((name, passed))
+    def request(method, params):
+        operations.append(method)
+        probe.results["requests"].append({"method": method, "milliseconds": 1})
+        if method == "initialize":
+            return {"result": {"serverInfo": {"version": "ILS-test"}, "capabilities": {"textDocumentSync": 2}}}
+        assert method == "textDocument/definition"
+        return {"result": [{"uri": "file:///target.kt"}]}
+    probe.request = request
+    run(probe, SimpleNamespace(java_home="/jdk", expected_release="test", model_only=False, timeout=1,
+                              navigation_only=True, navigation_symbol="target", navigation_samples=30,
+                              require_original_sources=False), probe.text)
+    assert operations[:5] == ["initialize", "initialized", "textDocument/didOpen", "ready", "textDocument/definition"]
+    assert len(probe.results["first_navigation"]["warm"]["milliseconds"]) == 30
+    assert all(passed for _, passed in probe.results["checks"])
     print("PASS protocol self-test")
 
 
@@ -797,6 +877,12 @@ def main():
     parser.add_argument("--require-compose", action="store_true", help="Require Compose naming and required-lambda checks; implies --extended")
     parser.add_argument("--extended", action="store_true", help="Check references, multi-file rename, diagnostics, formatting, code actions and Compose contexts")
     parser.add_argument("--performance-samples", type=int, default=0, help="Run at least 30 samples per warm protocol scenario (0 disables)")
+    parser.add_argument("--navigation-only", action="store_true", help="Measure the first definition immediately after readiness, fetch its source, then exit; supports arbitrary isolated Kotlin projects")
+    parser.add_argument("--navigation-source", type=Path, default=Path("mobile/src/main/java/dev/zed/androidsample/MainActivity.kt"), help="Project-relative active Kotlin file for --navigation-only")
+    parser.add_argument("--navigation-symbol", default="headlineSmall", help="Symbol at its last occurrence in the active source; requested immediately after readiness")
+    parser.add_argument("--navigation-samples", type=int, default=0, help="Additional warm definitions (0 or at least 30), separate from the first request")
+    parser.add_argument("--system-path", type=Path, help="Reuse these indexes across fresh server processes, keeping a separate --output for every lifecycle")
+    parser.add_argument("--buffer-wire", action="store_true", help="Keep wire logs in memory until process exit; report serialization overhead separately")
     parser.add_argument("--plugins", type=Path, help="Isolated IntelliJ plugin directory for engine compatibility experiments")
     parser.add_argument("--warmup", choices=("none", "diagnostics", "document-symbols", "hover"), default="none", help="One bounded active-file request after indexing, before navigation; measured separately")
     parser.add_argument("--jfr", action="store_true", help="Capture a bounded server Java Flight Recorder profile; adds profiling overhead")
@@ -812,18 +898,28 @@ def main():
         parser.error("The server and JDK must exist, and --timeout must be positive")
     if args.performance_samples and args.performance_samples < 30:
         parser.error("--performance-samples must be 0 or at least 30")
-    if not args.model_only and not args.variant.endswith(("Debug", "Release")) and not args.expected_library_variant:
+    if args.navigation_samples and args.navigation_samples < 30:
+        parser.error("--navigation-samples must be 0 or at least 30")
+    if args.navigation_samples and not args.navigation_only:
+        parser.error("--navigation-samples requires --navigation-only")
+    if args.navigation_only and (args.model_only or args.extended or args.performance_samples or args.warmup != "none"):
+        parser.error("--navigation-only cannot run model, completion or warmup checks")
+    if not args.model_only and not args.navigation_only and not args.variant.endswith(("Debug", "Release")) and not args.expected_library_variant:
         parser.error("Custom build types require --expected-library-variant")
-    if not args.module.startswith(":") or args.module == ":" or (not args.model_only and args.module != ":mobile"):
+    if not args.module.startswith(":") or args.module == ":" or (not args.model_only and not args.navigation_only and args.module != ":mobile"):
         parser.error("--module requires a Gradle module path; the full fixture suite requires :mobile")
     if args.model_only and (args.extended or args.performance_samples or args.warmup != "none" or args.require_original_sources):
         parser.error("--model-only cannot run document, source or performance checks")
     root, output = args.project.resolve(), args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
-    source_file = None if args.model_only else root / "mobile/src/main/java/dev/zed/androidsample/MainActivity.kt"
+    source_file = None if args.model_only else (root / args.navigation_source).resolve()
+    if source_file and (not source_file.is_relative_to(root) or source_file.suffix != ".kt"):
+        parser.error("--navigation-source must be a Kotlin file inside the isolated project")
     if source_file and not source_file.is_file():
-        parser.error("--project must point to a copy of examples/android-ide")
+        parser.error("The active Kotlin source file must exist")
     source = source_file.read_text() if source_file else ""
+    if source_file and (not args.navigation_symbol or args.navigation_symbol not in source):
+        parser.error("--navigation-symbol must occur in the active source")
     results = {"project": str(root), "server": str(args.server.resolve()), "expected_release": args.expected_release, "requested_variant": args.variant, "project_jdk": str(args.java_home), "source_sha256": hashlib.sha256(source.encode()).hexdigest(), "checks": [], "requests": [], "events": [], "applied_edits": [], "show_documents": []}
     results["fixture_sources"] = {str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest() for module in ("mobile", "greeting") for path in sorted((root / module / "src").rglob("*")) if path.suffix in (".kt", ".java")}
     results["hardware"] = {"platform": platform.platform(), "architecture": platform.machine(), "logical_cpus": os.cpu_count(), "load_average_1_5_15": os.getloadavg()}
@@ -839,6 +935,9 @@ def main():
     results["model_only"] = args.model_only
     results["require_compose"] = args.require_compose
     results["require_original_sources"] = args.require_original_sources
+    results["wire_logging"] = "memory until process exit" if args.buffer_wire else "synchronous file writes"
+    system_path = (args.system_path or output / "system").resolve()
+    results["system_path"] = str(system_path)
     environment = dict(os.environ, JAVA_HOME=str(args.java_home), LSP_ANDROID_MODULE=args.module, LSP_ANDROID_VARIANT=args.variant, IJ_JAVA_OPTIONS=f"-Didea.config.path={output / 'config'} -Didea.log.path={output / 'logs'} -Dintellij.server.eula.persistence=false")
     if args.generate_resources:
         setup = (Path(__file__).resolve().parent.parent / "crates/android_tools/src/kotlin.rs").read_text()
@@ -860,9 +959,12 @@ def main():
     if args.jfr:
         environment["IJ_JAVA_OPTIONS"] += f" -Xlog:jfr*=warning:stderr -XX:StartFlightRecording=filename={output / 'server.jfr'},settings=profile,dumponexit=true,maxsize=32m"
         results["profile"] = {"path": str(output / "server.jfr"), "kind": "JFR profile", "maximum_mib": 32, "scope": "Profiling overhead is included in reported timings"}
-    with (output / "stderr.log").open("w") as log, (output / "wire.jsonl").open("w") as wire:
-        process = subprocess.Popen([str(args.server.resolve()), "--stdio", "--system-path=" + str(output / "system"), "--data-sharing=none"], cwd=root, env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log)
+    with (output / "stderr.log").open("w") as log, (io.StringIO() if args.buffer_wire else (output / "wire.jsonl").open("w")) as wire:
+        started = time.monotonic()
+        cpu_before = resource.getrusage(resource.RUSAGE_CHILDREN)
+        process = subprocess.Popen([str(args.server.resolve()), "--stdio", "--system-path=" + str(system_path), "--data-sharing=none"], cwd=root, env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log)
         probe = Probe(process, wire, results, root, source_file, source)
+        results["process_spawn_seconds"] = probe.started - started
         try:
             run(probe, args, source)
             probe.request("shutdown", None, timeout=10)
@@ -881,7 +983,12 @@ def main():
                 probe.check("source_unchanged_on_disk", source_file.read_text() == source)
             probe.check("refactoring_sources_unchanged_on_disk", all(Path(unquote(urlparse(uri).path)).read_text() == text for uri, text in probe.original_sources.items()))
             results["duration_seconds"] = round(time.monotonic() - probe.started, 3)
+            cpu_after = resource.getrusage(resource.RUSAGE_CHILDREN)
+            results["server_lifecycle_cpu_seconds"] = cpu_after.ru_utime + cpu_after.ru_stime - cpu_before.ru_utime - cpu_before.ru_stime
+            results["wire_milliseconds"] = probe.wire_seconds * 1000
             results["passed"] = "failure" not in results and all(check["passed"] for check in results["checks"] if check["required"])
+            if args.buffer_wire:
+                (output / "wire.jsonl").write_text(wire.getvalue())
             (output / "results.json").write_text(json.dumps(results, indent=2) + "\n")
     print(f"Report: {output / 'results.json'}", flush=True)
     return 0 if results["passed"] else 1
