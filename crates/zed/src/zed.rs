@@ -5505,6 +5505,21 @@ mod tests {
         })
     }
 
+    #[gpui::test]
+    fn test_jetbrains_keymaps_resolve_registered_actions(cx: &mut TestAppContext) {
+        init_keymap_test(cx);
+        cx.update(|cx| {
+            for platform in ["macos", "linux"] {
+                KeymapFile::load_asset(
+                    &format!("keymaps/{platform}/jetbrains.json"),
+                    Some(KeybindSource::Base),
+                    cx,
+                )
+                .expect("Every built-in JetBrains binding must resolve");
+            }
+        });
+    }
+
     actions!(test_only, [ActionA, ActionB]);
 
     /// The actions the emacs keymap resolves for `keystroke` in `context`.
@@ -5891,6 +5906,7 @@ mod tests {
                 "activity_indicator",
                 "agent",
                 "agents_sidebar",
+                "android",
                 "app_menu",
                 "assistant",
                 "assistant2",
@@ -5955,6 +5971,7 @@ mod tests {
                 "remote_debug",
                 "repl",
                 "search",
+                "search_everywhere",
                 "settings_editor",
                 "settings_profile_selector",
                 "skill_creator",

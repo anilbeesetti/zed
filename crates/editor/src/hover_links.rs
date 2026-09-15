@@ -207,21 +207,32 @@ impl Editor {
         cx: &mut Context<Editor>,
     ) {
         let focus_handle = self.focus_handle(cx);
+        let started = std::time::Instant::now();
         let reveal_task = self.cmd_click_reveal_task(point, modifiers, window, cx);
-        cx.spawn_in(window, async move |_, cx| {
+        cx.spawn_in(window, async move |editor, cx| {
             let definition_revealed = reveal_task.await.log_err().unwrap_or(Navigated::No);
             if definition_revealed == Navigated::Yes {
+                cx.update(|window, _| {
+                    Editor::trace_interaction_latency("cmd_click", started, window)
+                })
+                .log_err();
                 return;
             }
             cx.update(|window, cx| {
                 match EditorSettings::get_global(cx).go_to_definition_fallback {
-                    GoToDefinitionFallback::None => {}
+                    GoToDefinitionFallback::None => {
+                        editor
+                            .update(cx, |editor, cx| {
+                                editor.show_no_navigation_results(window, cx)
+                            })
+                            .log_err();
+                    }
                     GoToDefinitionFallback::FindAllReferences => {
                         focus_handle.dispatch_action(&FindAllReferences::default(), window, cx);
                     }
                 }
             })
-            .ok();
+            .log_err();
         })
         .detach();
     }
@@ -260,6 +271,17 @@ impl Editor {
         if let Some(hovered_link_state) = self.hovered_link_state.take() {
             self.hide_hovered_link(cx);
             if !hovered_link_state.links.is_empty() {
+                // The usages fallback must query the clicked declaration, even when
+                // its cached definition points back to itself.
+                self.select(
+                    SelectPhase::Begin {
+                        position: point.next_valid,
+                        add: false,
+                        click_count: 1,
+                    },
+                    window,
+                    cx,
+                );
                 if !self.focus_handle.is_focused(window) {
                     window.focus(&self.focus_handle, cx);
                 }
@@ -1394,6 +1416,41 @@ mod tests {
             2,
             "expected one definition request per distinct position"
         );
+    }
+
+    #[gpui::test]
+    async fn test_cached_declaration_click_moves_caret_before_usages(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx, |_| {});
+        let mut cx = EditorLspTestContext::new_rust(
+            lsp::ServerCapabilities {
+                definition_provider: Some(lsp::OneOf::Left(true)),
+                ..Default::default()
+            },
+            cx,
+        )
+        .await;
+        cx.set_state("fn first() {}ˇ\nfn second() {}\n");
+        let range = cx.lsp_range("fn first() {}\nfn «second»() {}\n");
+        let mut requests =
+            cx.set_request_handler::<GotoDefinition, _, _>(move |url, _, _| async move {
+                Ok(Some(lsp::GotoDefinitionResponse::Link(vec![
+                    lsp::LocationLink {
+                        origin_selection_range: Some(range),
+                        target_uri: url,
+                        target_range: range,
+                        target_selection_range: range,
+                    },
+                ])))
+            });
+        let point = cx.pixel_position("fn first() {}\nfn secˇond() {}\n");
+        cx.simulate_mouse_move(point, None, Modifiers::secondary_key());
+        requests.next().await;
+        cx.run_until_parked();
+        cx.simulate_click(point, Modifiers::secondary_key());
+        cx.run_until_parked();
+        cx.assert_editor_state("fn first() {}\nfn secˇond() {}\n");
     }
 
     #[gpui::test]

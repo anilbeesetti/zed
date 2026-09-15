@@ -650,6 +650,31 @@ impl Item for Editor {
         }
     }
 
+    fn restore_navigation(
+        project: Entity<Project>,
+        data: Arc<dyn Any + Send>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<Task<Result<Entity<Self>>>> {
+        let location = data
+            .downcast_ref::<NavigationData>()?
+            .language_server_document
+            .clone()?;
+        let location = match location {
+            Ok(location) => location,
+            Err(error) => return Some(Task::ready(Err(anyhow!(error)))),
+        };
+        let open = project.read(cx).lsp_store().update(cx, |store, cx| {
+            store.restore_language_server_document(location, cx)
+        });
+        Some(window.spawn(cx, async move |cx| {
+            let buffer = open.await?;
+            cx.update(|window, cx| {
+                cx.new(|cx| Editor::for_buffer(buffer, Some(project), window, cx))
+            })
+        }))
+    }
+
     fn navigate(
         &mut self,
         data: Arc<dyn Any + Send>,
@@ -1299,6 +1324,7 @@ impl SerializableItem for Editor {
                 } else {
                     SerializedEditor {
                         abs_path: serialized_editor.abs_path,
+                        language_server_document: serialized_editor.language_server_document,
                         contents: None,
                         language: None,
                         mtime: None,
@@ -1318,6 +1344,21 @@ impl SerializableItem for Editor {
             "Deserialized editor {item_id:?} in workspace {workspace_id:?}, {serialized_editor:?}"
         );
 
+        if let Some(location) = serialized_editor.language_server_document {
+            let open = project.read(cx).lsp_store().update(cx, |store, cx| {
+                store.restore_language_server_document(location, cx)
+            });
+            return window.spawn(cx, async move |cx| {
+                let buffer = open.await?;
+                cx.update(|window, cx| {
+                    cx.new(|cx| {
+                        let mut editor = Editor::for_buffer(buffer, Some(project), window, cx);
+                        editor.read_metadata_from_db(item_id, workspace_id, window, cx);
+                        editor
+                    })
+                })
+            });
+        }
         match serialized_editor {
             SerializedEditor {
                 abs_path: None,
@@ -1492,6 +1533,31 @@ impl SerializableItem for Editor {
 
         let buffer = self.buffer().read(cx).as_singleton()?;
 
+        if buffer.read(cx).language_server_document().is_some() {
+            let location = match project
+                .read(cx)
+                .lsp_store()
+                .read(cx)
+                .language_server_document_location(buffer.read(cx), cx)
+            {
+                Ok(Some(location)) => location,
+                Ok(None) => return None,
+                Err(error) => return Some(Task::ready(Err(error))),
+            };
+            let db = EditorDb::global(cx);
+            return Some(cx.background_spawn(async move {
+                db.save_serialized_editor(
+                    item_id,
+                    workspace_id,
+                    SerializedEditor {
+                        language_server_document: Some(location),
+                        ..Default::default()
+                    },
+                )
+                .await
+            }));
+        }
+
         let abs_path = buffer.read(cx).file().and_then(|file| {
             let worktree_id = file.worktree_id(cx);
             project
@@ -1529,6 +1595,7 @@ impl SerializableItem for Editor {
             };
 
             let editor = SerializedEditor {
+                language_server_document: None,
                 abs_path,
                 contents,
                 language,
@@ -2519,6 +2586,11 @@ pub(crate) fn handle_lsp_show_document(
     cx: &mut Context<Workspace>,
 ) -> Task<()> {
     let request = request.clone();
+    let project = workspace.project().clone();
+    if !request.is_current(project.read(cx).lsp_store().read(cx), cx) {
+        request.respond(false);
+        return Task::ready(());
+    }
     if request.external {
         cx.open_url(request.uri.as_str());
         request.respond(true);
@@ -2532,6 +2604,52 @@ pub(crate) fn handle_lsp_show_document(
         request.respond(false);
         return Task::ready(());
     };
+    if request.completion_session.is_some() {
+        let buffer = project.update(cx, |project, cx| project.open_local_buffer(abs_path, cx));
+        return cx.spawn_in(window, async move |workspace, cx| {
+            let result = async {
+                let buffer = buffer.await?;
+                workspace.update_in(cx, |workspace, window, cx| {
+                    if !request.is_current(project.read(cx).lsp_store().read(cx), cx) {
+                        return false;
+                    }
+                    // Completion commands use unversioned positions. Keep opening, focus and
+                    // selection in the same update as the last session check.
+                    let editor = workspace.open_project_item::<Editor>(
+                        None,
+                        buffer,
+                        true,
+                        request.take_focus,
+                        true,
+                        false,
+                        window,
+                        cx,
+                    );
+                    if let Some(selection) = request.selection {
+                        editor.update(cx, |editor, cx| {
+                            let snapshot = editor.buffer().read(cx).snapshot(cx);
+                            let range = language::range_from_lsp(selection);
+                            let start = snapshot.point_utf16_to_offset(
+                                snapshot.clip_point_utf16(range.start, Bias::Left),
+                            );
+                            let end = snapshot.point_utf16_to_offset(
+                                snapshot.clip_point_utf16(range.end, Bias::Left),
+                            );
+                            editor.change_selections(
+                                SelectionEffects::scroll(Autoscroll::center()),
+                                window,
+                                cx,
+                                |selections| selections.select_ranges([start..end]),
+                            );
+                        });
+                    }
+                    true
+                })
+            }
+            .await;
+            request.respond(result.log_err().unwrap_or(false));
+        });
+    }
     let open_task = workspace.open_abs_path(
         abs_path,
         OpenOptions {
@@ -2824,6 +2942,460 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_kotlin_library_history_and_restart_restoration(cx: &mut gpui::TestAppContext) {
+        use futures::{FutureExt as _, StreamExt as _};
+        use gpui::UpdateGlobal as _;
+        use language::FakeLspAdapter;
+        use std::time::Duration;
+        use workspace::ItemHandle as _;
+
+        enum ImportState {}
+        impl lsp::notification::Notification for ImportState {
+            type Params = serde_json::Value;
+            const METHOD: &'static str = "intellij/workspaceImportState";
+        }
+        let imported = json!({"phase": "FINISHED", "folders": [{
+            "folderUri": lsp::Uri::from_file_path(path!("/project")).unwrap(),
+            "tool": "gradle", "status": "SUCCESS"
+        }]});
+
+        init_test(cx, |_| {});
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/project"), json!({"main.rs": "fn main() {}"}))
+            .await;
+        let project = Project::test(fs.clone(), [Path::new(path!("/project"))], cx).await;
+        let languages = project.read_with(cx, |project, _| project.languages().clone());
+        languages.add(languages::rust_lang());
+        let mut capabilities = lsp::LanguageServer::full_capabilities();
+        capabilities.execute_command_provider = Some(lsp::ExecuteCommandOptions {
+            commands: vec!["decompile".into()],
+            ..Default::default()
+        });
+        let mut servers = languages.register_fake_lsp(
+            "Rust",
+            FakeLspAdapter {
+                name: "kotlin-lsp",
+                capabilities: capabilities.clone(),
+                ..Default::default()
+            },
+        );
+        let (source, _source_handle) = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer_with_lsp(path!("/project/main.rs"), cx)
+            })
+            .await
+            .unwrap();
+        let server = servers.next().await.unwrap();
+        cx.run_until_parked();
+        let analyzing = |cx: &mut gpui::TestAppContext| {
+            let buffer_id = source.read_with(cx, |buffer, _| buffer.remote_id());
+            project
+                .read_with(cx, |project, _| project.lsp_store())
+                .update(cx, |store, _| store.is_kotlin_analyzing_buffer(buffer_id))
+        };
+        assert!(analyzing(cx));
+        server
+            .start_progress_with(
+                "import",
+                lsp::WorkDoneProgressBegin {
+                    title: "Importing".into(),
+                    ..Default::default()
+                },
+                Duration::from_secs(5),
+            )
+            .await;
+        cx.run_until_parked();
+        project.read_with(cx, |project, cx| {
+            assert!(project.language_server_statuses(cx).any(|(_, status)| {
+                status
+                    .pending_work
+                    .values()
+                    .any(|progress| progress.title.as_deref() == Some("Analyzing project"))
+            }));
+        });
+        server.end_progress("import");
+        server.notify::<ImportState>(imported.clone());
+        cx.run_until_parked();
+        assert!(!analyzing(cx));
+        server
+            .start_progress_with(
+                "index",
+                lsp::WorkDoneProgressBegin {
+                    title: "Indexing".into(),
+                    ..Default::default()
+                },
+                Duration::from_secs(5),
+            )
+            .await;
+        cx.run_until_parked();
+        assert!(analyzing(cx));
+        server.end_progress("index");
+        cx.run_until_parked();
+        assert!(!analyzing(cx));
+        let uri: lsp::Uri = "jar:///cache%20directory/library-1.0.jar!/example/Library.class"
+            .parse()
+            .unwrap();
+        server.set_request_handler::<lsp::request::ExecuteCommand, _, _>({
+            let uri = uri.clone();
+            move |params, _| {
+                assert_eq!(params.command, "decompile");
+                assert_eq!(params.arguments, vec![json!(uri)]);
+                async {
+                    Ok(Some(
+                        json!({"code": "// library\npub fn old() {}", "language": "rust"}),
+                    ))
+                }
+            }
+        });
+        server.set_request_handler::<lsp::request::GotoDefinition, _, _>({
+            let uri = uri.clone();
+            move |_, _| {
+                let uri = uri.clone();
+                async move {
+                    Ok(Some(lsp::GotoDefinitionResponse::Scalar(lsp::Location {
+                        uri,
+                        range: lsp::Range::new(lsp::Position::new(1, 4), lsp::Position::new(1, 4)),
+                    })))
+                }
+            }
+        });
+        let buffer = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer_via_lsp(uri.clone(), server.server.server_id(), cx)
+            })
+            .await
+            .unwrap();
+        let location = project
+            .read_with(cx, |project, cx| {
+                project
+                    .lsp_store()
+                    .read(cx)
+                    .language_server_document_location(buffer.read(cx), cx)
+            })
+            .unwrap()
+            .unwrap();
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |multi, _| multi.workspace().clone());
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        let editor = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.open_project_item::<Editor>(
+                None,
+                buffer.clone(),
+                true,
+                true,
+                true,
+                false,
+                window,
+                cx,
+            )
+        });
+        editor.update_in(cx, |editor, window, cx| {
+            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                selections.select_ranges([Point::new(1, 4)..Point::new(1, 4)])
+            })
+        });
+        let source_editor = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.open_project_item::<Editor>(None, source, true, true, true, false, window, cx)
+        });
+        workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.go_back(pane.downgrade(), window, cx)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            pane.read_with(cx, |pane, _| pane.active_item().unwrap().item_id()),
+            editor.item_id()
+        );
+        for _ in 0..3 {
+            workspace.update_in(cx, |workspace, window, cx| {
+                assert!(workspace.activate_item(&source_editor, true, true, window, cx));
+            });
+            let navigated = source_editor
+                .update_in(cx, |editor, window, cx| {
+                    editor.go_to_definition(&crate::GoToDefinition::default(), window, cx)
+                })
+                .await
+                .unwrap();
+            assert_eq!(navigated, crate::Navigated::Yes);
+            pane.read_with(cx, |pane, _| {
+                assert_eq!(pane.active_item().unwrap().item_id(), editor.item_id());
+                assert_eq!(
+                    pane.items_len(),
+                    2,
+                    "Repeated navigation must reuse the library tab"
+                );
+            });
+        }
+        pane.update_in(cx, |pane, window, cx| {
+            pane.close_item_by_id(editor.item_id(), workspace::SaveIntent::Skip, window, cx)
+        })
+        .await
+        .unwrap();
+        cx.update(|_, _| {
+            drop(editor);
+            drop(buffer);
+        });
+        cx.run_until_parked();
+        workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.reopen_closed_item(window, cx)
+            })
+            .await
+            .unwrap();
+        let reopened = pane.read_with(cx, |pane, _| {
+            pane.active_item().unwrap().downcast::<Editor>().unwrap()
+        });
+        reopened.read_with(cx, |editor, cx| {
+            let buffer = editor.buffer.read(cx).as_singleton().unwrap();
+            assert_eq!(buffer.read(cx).language_server_document().unwrap().uri, uri);
+            assert_eq!(buffer.read(cx).capability(), Capability::ReadOnly);
+            assert_eq!(
+                editor
+                    .selections
+                    .newest_anchor()
+                    .head()
+                    .to_point(&editor.buffer.read(cx).read(cx)),
+                Point::new(1, 4)
+            );
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.activate_item(&source_editor, true, true, window, cx)
+        });
+        pane.update_in(cx, |pane, window, cx| {
+            pane.close_item_by_id(reopened.item_id(), workspace::SaveIntent::Skip, window, cx)
+        })
+        .await
+        .unwrap();
+        cx.update(|_, _| drop(reopened));
+        cx.run_until_parked();
+        workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.go_back(pane.downgrade(), window, cx)
+            })
+            .await
+            .unwrap();
+        pane.read_with(cx, |pane, cx| {
+            let editor = pane.active_item().unwrap().downcast::<Editor>().unwrap();
+            let buffer = editor.read(cx).buffer.read(cx).as_singleton().unwrap();
+            assert_eq!(buffer.read(cx).language_server_document().unwrap().uri, uri);
+        });
+
+        let editor_db = cx.update(|_, cx| EditorDb::global(cx));
+        let workspace_id = cx
+            .update(|_, cx| workspace::WorkspaceDb::global(cx))
+            .next_id()
+            .await
+            .unwrap();
+        let item_id = 8181;
+        editor_db
+            .save_serialized_editor(
+                item_id,
+                workspace_id,
+                SerializedEditor {
+                    language_server_document: Some(location.clone()),
+                    contents: Some("saved text must never be restored".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let saved = editor_db
+            .get_serialized_editor(item_id, workspace_id)
+            .unwrap()
+            .unwrap();
+        assert!(saved.abs_path.is_none());
+        assert!(
+            !serde_json::to_string(&saved.language_server_document)
+                .unwrap()
+                .contains("session")
+        );
+
+        let restarted_project = Project::test(fs, [Path::new(path!("/project"))], cx).await;
+        let restarted_languages =
+            restarted_project.read_with(cx, |project, _| project.languages().clone());
+        restarted_languages.add(languages::rust_lang());
+        let mut restore = workspace.update_in(cx, |_, window, cx| {
+            Editor::deserialize(
+                restarted_project.clone(),
+                workspace.downgrade(),
+                workspace_id,
+                item_id,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert!(
+            (&mut restore).now_or_never().is_none(),
+            "Library restoration must wait for the extension adapter to finish loading"
+        );
+        let mut restarted_servers = restarted_languages.register_fake_lsp(
+            "Rust",
+            FakeLspAdapter {
+                name: "kotlin-lsp",
+                capabilities,
+                initializer: Some(Box::new({
+                    let uri = uri.clone();
+                    move |server| {
+                        server.set_request_handler::<lsp::request::ExecuteCommand, _, _>({
+                            let uri = uri.clone();
+                            move |params, _| {
+                                assert_eq!(params.arguments, vec![json!(uri)]);
+                                async {
+                                    Ok(Some(
+                                        json!({"code": "pub fn fresh() {}", "language": "rust"}),
+                                    ))
+                                }
+                            }
+                        });
+                    }
+                })),
+                ..Default::default()
+            },
+        );
+        let restarted_server = restarted_servers.next().await.unwrap();
+        cx.run_until_parked();
+        assert!(
+            (&mut restore).now_or_never().is_none(),
+            "Library restoration must wait for the project import"
+        );
+        restarted_server.notify::<ImportState>(imported);
+        assert_ne!(
+            restarted_project.read_with(cx, |project, _| project.lsp_store().entity_id()),
+            project.read_with(cx, |project, _| project.lsp_store().entity_id())
+        );
+        let restored = restore.await.unwrap();
+        assert_eq!(
+            restarted_server
+                .server
+                .workspace_folders()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![lsp::Uri::from_file_path(path!("/project")).unwrap()],
+            "Restoring a library tab before a source tab must initialize the owning workspace"
+        );
+        restored.read_with(cx, |editor, cx| {
+            assert_eq!(editor.text(cx), "pub fn fresh() {}");
+            let buffer = editor.buffer.read(cx).as_singleton().unwrap();
+            let buffer = buffer.read(cx);
+            assert_eq!(buffer.capability(), Capability::ReadOnly);
+            assert_eq!(buffer.language_server_document().unwrap().uri, uri);
+            assert_eq!(
+                buffer.language_server_document().unwrap().server_id,
+                restarted_server.server.server_id()
+            );
+        });
+        let current_location = restored.read_with(cx, |editor, cx| {
+            let buffer = editor.buffer.read(cx).as_singleton().unwrap();
+            restarted_project
+                .read(cx)
+                .lsp_store()
+                .read(cx)
+                .language_server_document_location(buffer.read(cx), cx)
+                .unwrap()
+                .unwrap()
+        });
+        enum ImportLog {}
+        impl lsp::notification::Notification for ImportLog {
+            type Params = serde_json::Value;
+            const METHOD: &'static str = "intellij/importLog";
+        }
+        restarted_server.notify::<ImportLog>(json!({"started": true}));
+        cx.run_until_parked();
+        let store = restarted_project.read_with(cx, |project, _| project.lsp_store());
+        assert!(
+            store
+                .update(cx, |store, cx| store
+                    .restore_language_server_document(current_location, cx))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("outdated")
+        );
+
+        let foreign_session = restarted_project
+            .read_with(cx, |project, _| project.lsp_store())
+            .update(cx, |store, cx| {
+                store.restore_language_server_document(location, cx)
+            })
+            .await;
+        assert!(
+            foreign_session
+                .unwrap_err()
+                .to_string()
+                .contains("outdated")
+        );
+
+        let location = saved.language_server_document.unwrap();
+        for folders in [json!([]), json!([{"status": "FAILED"}])] {
+            restarted_server
+                .notify::<ImportState>(json!({"phase": "FINISHED", "folders": folders}));
+            cx.run_until_parked();
+            let error = store
+                .update(cx, |store, cx| {
+                    store.restore_language_server_document(location.clone(), cx)
+                })
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("did not successfully import"));
+        }
+        restarted_server.notify::<ImportLog>(json!({"started": true}));
+        cx.run_until_parked();
+        let error = store
+            .update(cx, |store, cx| {
+                store.restore_language_server_document(location.clone(), cx)
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Timed out waiting for Kotlin project import")
+        );
+        let mut pending_restore = store.update(cx, |store, cx| {
+            store.restore_language_server_document(location.clone(), cx)
+        });
+        cx.run_until_parked();
+        assert!((&mut pending_restore).now_or_never().is_none());
+        cx.update(|_, cx| {
+            settings::SettingsStore::update_global(cx, |settings, cx| {
+                settings.set_user_settings(&json!({"lsp": {"kotlin-lsp": {"binary": {"env": {"LSP_ANDROID_VARIANT": "fullRelease"}}}}}).to_string(), cx).unwrap();
+            });
+        });
+        assert!(
+            store
+                .update(cx, |store, cx| store
+                    .restore_language_server_document(location.clone(), cx))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("settings changed")
+        );
+        restarted_project.update(cx, |project, cx| {
+            let worktree_id = project.worktrees(cx).next().unwrap().read(cx).id();
+            project.remove_worktree(worktree_id, cx);
+        });
+        assert!(
+            pending_restore
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("stopped")
+        );
+        assert!(
+            store
+                .update(cx, |store, cx| store
+                    .restore_language_server_document(location, cx))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("workspace was removed")
+        );
+    }
+
+    #[gpui::test]
     async fn test_deserialize(cx: &mut gpui::TestAppContext) {
         init_test(cx, |_| {});
 
@@ -2849,6 +3421,7 @@ mod tests {
                 .mtime;
 
             let serialized_editor = SerializedEditor {
+                language_server_document: None,
                 abs_path: Some(PathBuf::from(path!("/file.rs"))),
                 contents: Some("fn main() {}".to_string()),
                 language: Some("Rust".to_string()),
@@ -2886,6 +3459,7 @@ mod tests {
 
             let item_id = 5678 as ItemId;
             let serialized_editor = SerializedEditor {
+                language_server_document: None,
                 abs_path: Some(PathBuf::from(path!("/file.rs"))),
                 contents: None,
                 language: None,
@@ -2929,6 +3503,7 @@ mod tests {
 
             let item_id = 9012 as ItemId;
             let serialized_editor = SerializedEditor {
+                language_server_document: None,
                 abs_path: None,
                 contents: Some("hello".to_string()),
                 language: Some("Rust".to_string()),
@@ -2972,6 +3547,7 @@ mod tests {
             let item_id = 9345 as ItemId;
             let old_mtime = MTime::from_seconds_and_nanos(0, 50);
             let serialized_editor = SerializedEditor {
+                language_server_document: None,
                 abs_path: Some(PathBuf::from(path!("/file.rs"))),
                 contents: Some("fn main() {}".to_string()),
                 language: Some("Rust".to_string()),
@@ -3006,6 +3582,7 @@ mod tests {
 
             let item_id = 10000 as ItemId;
             let serialized_editor = SerializedEditor {
+                language_server_document: None,
                 abs_path: None,
                 contents: None,
                 language: None,
@@ -3060,6 +3637,7 @@ mod tests {
 
             // Simulate serialized state: file with unsaved changes
             let serialized_editor = SerializedEditor {
+                language_server_document: None,
                 abs_path: Some(PathBuf::from(path!("/standalone.rs"))),
                 contents: Some("modified content".to_string()),
                 language: Some("Rust".to_string()),
@@ -3186,6 +3764,7 @@ mod tests {
         let item_id = 99999 as ItemId;
 
         let serialized_editor = SerializedEditor {
+            language_server_document: None,
             abs_path: Some(PathBuf::from(path!("/outside/settings.json"))),
             contents: None,
             language: None,

@@ -1637,8 +1637,10 @@ enum SelectSyntaxNodeScrollBehavior {
     CursorBottom,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct NavigationData {
+    language_server_document:
+        Option<Result<project::lsp_store::LanguageServerDocumentLocation, String>>,
     cursor_anchor: Anchor,
     cursor_position: Point,
     scroll_anchor: ScrollAnchor,
@@ -1789,6 +1791,18 @@ impl Render for GutterButtonTooltip {
 }
 
 impl Editor {
+    pub fn trace_interaction_latency(action: &'static str, started: Instant, window: &mut Window) {
+        const LOGGER: zlog::Logger = zlog::scoped!("interaction_latency");
+        if zlog::filter::is_scope_enabled(&LOGGER.scope, None, log::Level::Debug) {
+            // The second callback runs after a frame with the changed editor; compositor latency is excluded.
+            window.on_next_frame(move |window, _| {
+                window.on_next_frame(move |_, _| {
+                    zlog::debug!(LOGGER => "action={action} rendered_ms={:.3}", started.elapsed().as_secs_f64() * 1000.0);
+                });
+            });
+        }
+    }
+
     pub fn single_line(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let buffer = cx.new(|cx| Buffer::local("", cx));
         let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));

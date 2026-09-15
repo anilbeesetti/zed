@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+"""Build the pinned Kotlin/Java Android debug adapter into the local IDE profile."""
+
+import os
+from pathlib import Path
+import runpy
+import shutil
+import subprocess
+import tarfile
+import tempfile
+
+REVISION = "7f05669b642d21afa46ac7b75307fa5d523a7263"
+SHA256 = "69ae1dc3d97b372bfe326c25a32469adf3bead1a254b0371c2e0ead93fceb6bd"
+VERSION = REVISION + "+android-1"
+
+
+def main():
+    bootstrap = runpy.run_path(str(Path(__file__).with_name("install-android-kotlin")))
+    bootstrap["main"]()
+    dependencies = bootstrap["DEPENDENCIES"]
+    installation = dependencies / "kotlin-debug-adapter"
+    if installation.exists():
+        if installation.is_symlink() or (installation / ".revision").read_text().strip() != VERSION:
+            raise RuntimeError(f"Preserving {installation}; move it aside before installing")
+        if not (installation / "bin/kotlin-debug-adapter").is_file():
+            raise RuntimeError("The debugger installation is incomplete; move it aside and rerun")
+        print(f"Already installed: {installation}")
+        return
+    archive = bootstrap["download"]("kotlin-debug-adapter-source.tar.gz", f"https://codeload.github.com/fwcd/kotlin-debug-adapter/tar.gz/{REVISION}", SHA256)
+    shared_archive = bootstrap["download"]("fwcd-kls-6d9e61b.tar.gz", f"https://codeload.github.com/fwcd/kotlin-language-server/tar.gz/{bootstrap['REVISION']}", bootstrap["SOURCE_SHA256"])
+    java11 = Path(os.environ.get("JAVA11_HOME", dependencies / "temurin11/jdk-11.0.32.1+1/Contents/Home"))
+    with tempfile.TemporaryDirectory(prefix="android-debug-build-", dir=dependencies) as temporary:
+        temporary = Path(temporary)
+        for path in [archive, shared_archive]:
+            with tarfile.open(path) as source:
+                source.extractall(temporary, filter="data")
+        source = temporary / f"kotlin-debug-adapter-{REVISION}"
+        shared = temporary / f"kotlin-language-server-{bootstrap['REVISION']}"
+        patch = Path(__file__).with_name("android-kotlin-debugger.patch").resolve()
+        subprocess.run(["patch", "--batch", "-p1", "-i", str(patch)], cwd=source, check=True)
+        subprocess.run([str(source / "gradlew"), "-p", str(source), "--include-build", str(shared),
+                        "-PkotlinVersion=2.1.0", ":adapter:test", ":adapter:installDist",
+                        "--console=plain", "--max-workers=2"],
+                       env=dict(os.environ, JAVA_HOME=str(java11)), check=True)
+        distribution = source / "adapter/build/install/adapter"
+        shutil.copy2(source / "LICENSE", distribution / "LICENSE.txt")
+        shutil.copy2(shared / "LICENSE.txt", distribution / "KOTLIN-SERVER-LICENSE.txt")
+        (distribution / ".revision").write_text(VERSION + "\n")
+        (distribution / "SOURCE.txt").write_text(f"https://github.com/fwcd/kotlin-debug-adapter/tree/{REVISION}\nShared dependency: {bootstrap['REVISION']}\nPatch: script/android-kotlin-debugger.patch\n")
+        distribution.rename(installation)
+    print(f"Installed: {installation}")
+    print("Relaunch script/android-ide to enable Android Kotlin debugging.")
+
+
+if __name__ == "__main__":
+    main()
