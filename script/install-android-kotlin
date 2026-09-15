@@ -22,7 +22,7 @@ REPOSITORY = Path(__file__).resolve().parent.parent
 DEPENDENCIES = REPOSITORY / "target/android-ide/dependencies"
 INSTALLATION = DEPENDENCIES / "kotlin-language-server"
 OFFICIAL_VERSION = "263.4702.0"
-OFFICIAL_REVISION = OFFICIAL_VERSION + "+android-3"
+OFFICIAL_REVISION = OFFICIAL_VERSION + "+android-4"
 OFFICIAL_SHA256 = "95da3fc6d3b9092c7616345044a05edb85e5408dc648d081e4e433595c892bec"
 OFFICIAL_ARCHIVE = f"kotlin-server-{OFFICIAL_VERSION}-aarch64.sit"
 OFFICIAL_URL = f"https://download.jetbrains.com/language-server/kotlin-server/{OFFICIAL_VERSION}/{OFFICIAL_ARCHIVE}"
@@ -32,6 +32,9 @@ OFFICIAL_JAVA_MODULE = "plugins/java-base.lsp/lib/modules/language-server.api.fe
 OFFICIAL_COMMON_MODULE = "lib/language-server.api.features.impl.common.jar"
 OFFICIAL_FIR_MODULE = "plugins/kotlin/lib/intellij.libraries.kotlinc.low.level.api.fir.jar"
 OFFICIAL_FIR_PROVIDERS_MODULE = "plugins/kotlin/lib/intellij.libraries.kotlinc.kotlin.compiler.fir.jar"
+OFFICIAL_COMPLETION_API_MODULE = "plugins/kotlin/lib/intellij.libraries.kotlinc.analysis.api.k2.jar"
+OFFICIAL_COMPLETION_MODULE = "plugins/kotlin/lib/modules/intellij.kotlin.completion.impl.jar"
+OFFICIAL_PROTOCOL_MODULE = "lib/fleet.lsp.protocol.jar"
 
 
 def download(name, url, expected):
@@ -81,7 +84,9 @@ def validate_official_patch(installation):
         raise RuntimeError(f"The native Kotlin importer or Compose patch has changed in {server}; preserve it and reinstall")
     expected_modules = {name: hashlib.sha256((server / name).read_bytes()).hexdigest()
                         for name in (OFFICIAL_MODEL_MODULE, OFFICIAL_JAVA_MODULE, OFFICIAL_COMMON_MODULE,
-                                     OFFICIAL_FIR_MODULE, OFFICIAL_FIR_PROVIDERS_MODULE)}
+                                     OFFICIAL_FIR_MODULE, OFFICIAL_FIR_PROVIDERS_MODULE,
+                                     OFFICIAL_COMPLETION_API_MODULE, OFFICIAL_COMPLETION_MODULE,
+                                     OFFICIAL_PROTOCOL_MODULE)}
     if manifest.get("additional_modules") != expected_modules:
         raise RuntimeError(f"The Kotlin project model or Java refactoring patch has changed in {server}; preserve it and reinstall")
 
@@ -106,6 +111,21 @@ def patch_official(distribution, temporary):
     with tarfile.open(archive) as source_archive:
         source_archive.extractall(source_parent, filter="data")
     source, = source_parent.iterdir()
+    (source / "zed-completion").mkdir()
+    for repository, revision, path, checksum in (
+        ("JetBrains/kotlin", "7835533005e2359b3a9d5bb767337082e6f6bcbc",
+         "analysis/analysis-api-fir/src/org/jetbrains/kotlin/analysis/api/fir/components/KaFirCompletionCandidateChecker.kt",
+         "7518e9de59e4e8ffce0f1544034f6ff1a1fbb6255de380083a03480c7041d055"),
+        ("JetBrains/intellij-community", "f21a5eeb8c857a3cb23ba35e0cacf44769c86e16",
+         "plugins/kotlin/completion/impl-k2/src/org/jetbrains/kotlin/idea/completion/impl/k2/KotlinFirCompletionParameters.kt",
+         "913ca2f84f09b313851e209a784b692ecb139ffaf8c55cd4bee789df420d6267"),
+        ("JetBrains/intellij-community", "f21a5eeb8c857a3cb23ba35e0cacf44769c86e16",
+         "plugins/kotlin/completion/impl-k2/src/org/jetbrains/kotlin/idea/completion/impl/k2/K2CompletionRunner.kt",
+         "3554a0255e02bdcb7cde32d5e12f5c47aa1a1e4ebfef7f5312452abcdb567cbc"),
+    ):
+        name = Path(path).name
+        upstream = download(f"{revision}-{name}", f"https://raw.githubusercontent.com/{repository}/{revision}/{path}", checksum)
+        shutil.copy2(upstream, source / "zed-completion" / name)
     patch = Path(__file__).with_name("android-kotlin-official.patch")
     subprocess.run(["patch", "--batch", "-p1", "-i", str(patch.resolve())], cwd=source, check=True)
     gradle_archive = download(
@@ -158,13 +178,17 @@ def patch_official(distribution, temporary):
         (OFFICIAL_COMMON_MODULE, ["features-impl/common/src/com/jetbrains/ls/api/features/impl/common/processors/LSRenameProcessor.kt"]),
         (OFFICIAL_FIR_MODULE, ["zed-completion/LLFirSoftLazyValue.kt"]),
         (OFFICIAL_FIR_PROVIDERS_MODULE, ["zed-completion/FirCompositeSymbolProvider.kt"]),
+        (OFFICIAL_COMPLETION_API_MODULE, ["zed-completion/KaFirCompletionCandidateChecker.kt"]),
+        (OFFICIAL_COMPLETION_MODULE, ["zed-completion/KotlinFirCompletionParameters.kt", "zed-completion/K2CompletionRunner.kt"]),
+        (OFFICIAL_PROTOCOL_MODULE, ["zed-completion/LSP.kt"]),
     ):
         patched_module = server / module_name
         module_classes = temporary / (patched_module.stem + "-classes")
         module_classes.mkdir()
         subprocess.run([
             str(java_home / "bin/java"), "-Xmx768m", "-cp", os.pathsep.join(map(str, compiler)),
-            "org.jetbrains.kotlin.cli.jvm.K2JVMCompiler", "-no-stdlib", "-no-reflect", "-jvm-target", "21",
+            "org.jetbrains.kotlin.cli.jvm.K2JVMCompiler", "-no-stdlib", "-no-reflect", "-jvm-target",
+            "25" if module_name == OFFICIAL_COMPLETION_MODULE else "21",
             "-Xcontext-parameters", f"-Xfriend-paths={patched_module}",
             "-classpath", os.pathsep.join(map(str, sorted(server.rglob("*.jar")))),
             "-d", str(module_classes), *(str(source / name) for name in source_names),

@@ -318,6 +318,7 @@ pub async fn run_real_kotlin_editor_probe(cx: &mut gpui::TestAppContext) {
         .as_u64()
         .unwrap_or(warm_samples);
     let completion_refinement = config["completion_refinement"] == true;
+    let automatic_first = config["automatic_first"] == true;
     let started = Instant::now();
     let mut report = json!({
         "harness": "real Kotlin subprocess, RealFs, GPUI test window",
@@ -326,7 +327,10 @@ pub async fn run_real_kotlin_editor_probe(cx: &mut gpui::TestAppContext) {
         "samples": [], "memory": [], "phase": "starting",
         "completion_preparation": if completion_refinement { "delete and retype only the prefix using Editor actions" } else { "replace whole function before typing each prefix" },
         "warm_samples": warm_samples, "completion_warm_samples": completion_warm_samples,
-        "request_order": ["definition_after_edit", "definition_unchanged", "string_explicit", "string_triggered", "string_prefix", "modifier", "named_argument", "acceptance"],
+        "request_order": ["definition_after_edit", "definition_unchanged",
+            if automatic_first { "string_triggered" } else { "string_explicit" },
+            if automatic_first { "string_explicit" } else { "string_triggered" },
+            "string_prefix", "modifier", "named_argument", "acceptance"],
     });
     let write_report = |report: &serde_json::Value| {
         std::fs::write(
@@ -500,6 +504,9 @@ pub async fn run_real_kotlin_editor_probe(cx: &mut gpui::TestAppContext) {
         writeln!(wire_log, "{}", json!({"seconds": started.elapsed().as_secs_f64(), "kind": format!("{kind:?}"), "message": message}))
             .expect("write wire log");
         wire_log.flush().expect("flush wire log");
+        if ready.is_none() {
+            return;
+        }
         let Ok(message) = serde_json::from_str::<serde_json::Value>(message) else { return; };
         if !matches!(kind, lsp::IoKind::StdOut) { return; }
         let params = &message["params"];
@@ -656,7 +663,7 @@ pub async fn run_real_kotlin_editor_probe(cx: &mut gpui::TestAppContext) {
     workspace.update_in(cx, |workspace, window, cx| {
         workspace.activate_item(&editor, true, true, window, cx);
     });
-    for (scenario, before, inputs, expected, triggered) in [
+    let mut completion_scenarios = [
         (
             "string_explicit",
             "val greeting = \"hello\"\n greeting",
@@ -680,7 +687,11 @@ pub async fn run_real_kotlin_editor_probe(cx: &mut gpui::TestAppContext) {
         ),
         ("modifier", "Modifier.", &["p", "pa"][..], "padding", false),
         ("named_argument", "Text(", &["t", "te"][..], "text =", false),
-    ] {
+    ];
+    if automatic_first {
+        completion_scenarios.swap(0, 1);
+    }
+    for (scenario, before, inputs, expected, triggered) in completion_scenarios {
         let mut previous_input_length = 0;
         for sample in 0..=completion_warm_samples {
             let input = inputs
