@@ -274,6 +274,89 @@ async fn test_invisible_worktree_reuses_project_lsp_and_cleans_bookkeeping(
 }
 
 #[gpui::test]
+async fn test_first_archive_language_server_starts_in_project(cx: &mut TestAppContext) {
+    init_test(cx);
+    cx.executor().allow_parking();
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(
+        path!("/the-project"),
+        json!({
+            "main.rs": "fn main() {}",
+            ".zed": {"settings.json": json!({
+                "languages": {"Rust": {"language_servers": ["project-rust"]}}
+            }).to_string()}
+        }),
+    )
+    .await;
+    fs.insert_tree(
+        path!("/registry"),
+        json!({
+            "library.jar!": {"dependency.rs": "pub fn dependency() {}"}
+        }),
+    )
+    .await;
+    let project = Project::test(fs, [path!("/the-project").as_ref()], cx).await;
+    let project_worktree = project.read_with(cx, |project, cx| {
+        project.worktrees(cx).next().unwrap().read(cx).id()
+    });
+    let languages = project.read_with(cx, |project, _| project.languages().clone());
+    languages.add(rust_lang());
+    let mut servers = languages.register_fake_lsp(
+        "Rust",
+        FakeLspAdapter {
+            name: "project-rust",
+            ..Default::default()
+        },
+    );
+    let _archive_worktree = project
+        .update(cx, |project, cx| {
+            project.create_worktree(path!("/registry/library.jar!/dependency.rs"), false, cx)
+        })
+        .await
+        .unwrap();
+    let (buffer, _handle) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/registry/library.jar!/dependency.rs"), cx)
+        })
+        .await
+        .unwrap();
+    let server = servers.next().await.unwrap();
+    cx.run_until_parked();
+    project.read_with(cx, |project, cx| {
+        let lsp_store = project.lsp_store().read(cx);
+        assert_eq!(lsp_store.language_server_statuses().count(), 1);
+        assert_eq!(
+            lsp_store
+                .language_server_statuses()
+                .next()
+                .unwrap()
+                .1
+                .worktree,
+            Some(project_worktree)
+        );
+    });
+    server.set_request_handler::<lsp::request::GotoDefinition, _, _>(|params, _| async move {
+        let uri = params.text_document_position_params.text_document.uri;
+        assert_eq!(
+            uri,
+            Uri::from_file_path(path!("/registry/library.jar!/dependency.rs")).unwrap()
+        );
+        Ok(Some(lsp::GotoDefinitionResponse::Scalar(
+            lsp::Location::new(
+                uri,
+                lsp::Range::new(lsp::Position::new(0, 7), lsp::Position::new(0, 17)),
+            ),
+        )))
+    });
+    let definitions = project
+        .update(cx, |project, cx| project.definitions(&buffer, 9, cx))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(definitions.len(), 1);
+}
+
+#[gpui::test]
 async fn test_open_buffer_via_lsp_case_variant_no_duplicate(cx: &mut TestAppContext) {
     init_test(cx);
     cx.executor().allow_parking();

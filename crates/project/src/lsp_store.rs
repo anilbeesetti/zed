@@ -3138,26 +3138,53 @@ impl LocalLspStore {
             return;
         };
         let language_name = language.name();
-        let (reused, delegate, servers) = self
-            .reuse_existing_language_server(&self.lsp_tree, &worktree, &language_name, cx)
-            .map(|(delegate, apply)| (true, delegate, apply(&mut self.lsp_tree)))
-            .unwrap_or_else(|| {
-                let lsp_delegate = LocalLspAdapterDelegate::from_local_lsp(self, &worktree, cx);
-                let delegate: Arc<dyn ManifestDelegate> =
-                    Arc::new(ManifestQueryDelegate::new(worktree.read(cx).snapshot()));
+        let (reused, delegate, servers, startup_worktree) = if let Some((delegate, apply)) =
+            self.reuse_existing_language_server(&self.lsp_tree, &worktree, &language_name, cx)
+        {
+            (true, delegate, apply(&mut self.lsp_tree), worktree.clone())
+        } else {
+            let startup_worktree = if fs::is_archive_path(&abs_path) {
+                // ponytail: new archive servers need one real project; track source ownership for multi-root startup.
+                let worktree_store = self.worktree_store.read(cx);
+                let mut projects = worktree_store
+                    .visible_worktrees(cx)
+                    .filter(|worktree| !fs::is_archive_path(&worktree.read(cx).abs_path()));
+                let Some(project) = projects.next() else {
+                    return;
+                };
+                if projects.next().is_some() {
+                    return;
+                }
+                project
+            } else {
+                worktree.clone()
+            };
+            let startup_worktree_id = startup_worktree.read(cx).id();
+            let path = if startup_worktree_id == worktree_id {
+                path
+            } else {
+                RelPath::empty_arc()
+            };
+            let lsp_delegate = LocalLspAdapterDelegate::from_local_lsp(self, &startup_worktree, cx);
+            let delegate: Arc<dyn ManifestDelegate> = Arc::new(ManifestQueryDelegate::new(
+                startup_worktree.read(cx).snapshot(),
+            ));
 
-                let servers = self
-                    .lsp_tree
-                    .walk(
-                        ProjectPath { worktree_id, path },
-                        language.name(),
-                        language.manifest(),
-                        &delegate,
-                        cx,
-                    )
-                    .collect::<Vec<_>>();
-                (false, lsp_delegate, servers)
-            });
+            let servers = self
+                .lsp_tree
+                .walk(
+                    ProjectPath {
+                        worktree_id: startup_worktree_id,
+                        path,
+                    },
+                    language.name(),
+                    language.manifest(),
+                    &delegate,
+                    cx,
+                )
+                .collect::<Vec<_>>();
+            (false, lsp_delegate, servers, startup_worktree)
+        };
         let servers_and_adapters = servers
             .into_iter()
             .filter_map(|server_node| {
@@ -3186,10 +3213,11 @@ impl LocalLspStore {
                     let path = &disposition.path;
 
                     {
-                        let uri = Uri::from_file_path(worktree.read(cx).absolutize(&path.path));
+                        let uri =
+                            Uri::from_file_path(startup_worktree.read(cx).absolutize(&path.path));
 
                         let server_id = self.get_or_insert_language_server(
-                            &worktree,
+                            &startup_worktree,
                             delegate.clone(),
                             disposition,
                             &language_name,
@@ -3204,6 +3232,15 @@ impl LocalLspStore {
                         server_id
                     }
                 })?;
+                if startup_worktree.read(cx).id() != worktree_id {
+                    self.lsp_tree
+                        .register_reused(worktree_id, language_name.clone(), server_node);
+                    if !worktree.read(cx).is_visible() {
+                        self.register_language_server_for_invisible_worktree(
+                            &worktree, server_id, cx,
+                        );
+                    }
+                }
                 let server_state = self.language_servers.get(&server_id)?;
                 if let LanguageServerState::Running {
                     server, adapter, ..
