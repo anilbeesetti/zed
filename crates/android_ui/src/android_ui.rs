@@ -226,6 +226,14 @@ impl Settings for AndroidPanelSettings {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OfficialKotlinState {
+    Active,
+    Paused,
+}
+
+const UNAVAILABLE_ANDROID_VARIANT: &str = "ZED_ANDROID_VARIANT_UNAVAILABLE";
+
 pub struct AndroidPanel {
     workspace: WeakEntity<Workspace>,
     project: Entity<Project>,
@@ -253,6 +261,8 @@ pub struct AndroidPanel {
     auto_sync_root: Option<PathBuf>,
     _startup_subscriptions: Vec<Subscription>,
     kotlin_task: Option<Task<()>>,
+    kotlin_refresh_task: Option<Task<()>>,
+    kotlin_refresh_pending: Option<PathBuf>,
     java_task: Option<Task<()>>,
     debug_task: Option<Task<()>>,
     preview_task: Option<Task<()>>,
@@ -311,6 +321,8 @@ impl AndroidPanel {
             auto_sync_root: None,
             _startup_subscriptions: Vec::new(),
             kotlin_task: None,
+            kotlin_refresh_task: None,
+            kotlin_refresh_pending: None,
             java_task: None,
             debug_task: None,
             preview_task: None,
@@ -328,10 +340,35 @@ impl AndroidPanel {
     }
 
     fn observe_project_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self._startup_subscriptions.push(cx.observe_in(
+            &cx.entity(),
+            window,
+            |panel, _, window, cx| {
+                if panel.take_official_kotlin_refresh(cx) {
+                    panel.sync_project(window, cx);
+                }
+            },
+        ));
         self._startup_subscriptions.push(cx.subscribe_in(
             &self.project,
             window,
-            |_, _, event, window, cx| {
+            |panel, _, event, window, cx| {
+                if let project::Event::WorktreeUpdatedEntries(worktree_id, changes) = event {
+                    let selected_root_changed = panel
+                        .project
+                        .read(cx)
+                        .worktree_for_id(*worktree_id, cx)
+                        .is_some_and(|worktree| {
+                            Some(worktree.read(cx).abs_path().as_ref()) == panel.root.as_deref()
+                        });
+                    if selected_root_changed
+                        && changes.iter().any(|(path, _, change)| {
+                            *change != project::PathChange::Loaded && android_model_input(path)
+                        })
+                    {
+                        panel.queue_official_kotlin_refresh(window, cx);
+                    }
+                }
                 if matches!(
                     event,
                     project::Event::WorktreeAdded(_)
@@ -395,6 +432,11 @@ impl AndroidPanel {
         {
             self.sync_task = None;
             self.syncing = false;
+            self.kotlin_refresh_task = None;
+            self.kotlin_refresh_pending = None;
+            if self.kotlin_task.take().is_some() {
+                self.running = false;
+            }
             self.root = None;
             self.auto_sync_root = None;
             self.targets.clear();
@@ -485,6 +527,7 @@ impl AndroidPanel {
         self.refresh_devices(cx);
         let executor = cx.background_executor().clone();
         self.sync_task = Some(cx.spawn_in(window, async move |panel, cx| {
+            let expected_root = root.clone();
             let result = cx
                 .background_spawn(async move {
                     ensure!(
@@ -507,10 +550,29 @@ impl AndroidPanel {
                 .await;
             panel
                 .update_in(cx, |panel, window, cx| {
+                    if panel.root.as_ref() != Some(&expected_root) {
+                        return;
+                    }
                     panel.syncing = false;
+                    let result = result.and_then(|targets| {
+                        ensure!(
+                            panel.trusted_root(cx)? == expected_root,
+                            "The Android project changed during sync"
+                        );
+                        Ok(targets)
+                    });
                     match result {
                         Ok(targets) => {
                             panel.apply_targets(targets, cx);
+                            if panel.official_kotlin_state(cx).is_some() {
+                                if let Some(target) = panel.selected_target.clone() {
+                                    panel.configure_official_kotlin(target, window, cx);
+                                } else if let Err(error) =
+                                    panel.pause_official_kotlin(&expected_root, cx)
+                                {
+                                    panel.fail(error, window, cx);
+                                }
+                            }
                             cx.notify();
                         }
                         Err(error) => {
@@ -857,6 +919,7 @@ impl AndroidPanel {
             }.await;
             panel.update_in(cx, |panel, window, cx| {
                 panel.running = false;
+                panel.kotlin_task = None;
                 match result {
                     Ok(()) => {
                         panel.status = "Community Kotlin configured for the selected variant. Run setup again after changing dependencies or variants.".into();
@@ -868,6 +931,169 @@ impl AndroidPanel {
             }).log_err();
         }));
         cx.notify();
+    }
+
+    fn official_kotlin_state(&self, cx: &App) -> Option<OfficialKotlinState> {
+        let Some(root) = self.root.as_ref() else {
+            return None;
+        };
+        let Some(worktree) = self
+            .project
+            .read(cx)
+            .visible_worktrees(cx)
+            .find(|worktree| worktree.read(cx).abs_path().as_ref() == root.as_path())
+        else {
+            return None;
+        };
+        let location = settings::SettingsLocation {
+            worktree_id: worktree.read(cx).id(),
+            path: RelPath::empty(),
+        };
+        let languages = language::language_settings::AllLanguageSettings::get(Some(location), cx);
+        let kotlin = languages.language(Some(location), Some(&"Kotlin".into()), cx);
+        let servers =
+            kotlin.customized_language_servers(&[lsp::LanguageServerName("kotlin-lsp".into())]);
+        let settings = project::project_settings::ProjectSettings::get(Some(location), cx);
+        let binary = settings
+            .lsp
+            .get(&lsp::LanguageServerName("kotlin-lsp".into()))?
+            .binary
+            .as_ref()?;
+        if !kotlin.enable_language_server
+            || !binary.arguments.as_ref().is_some_and(|arguments| {
+                has_official_kotlin_system_path(root, arguments.iter().map(String::as_str))
+            })
+        {
+            return None;
+        }
+        if servers.iter().any(|name| name.0.as_ref() == "kotlin-lsp") {
+            Some(OfficialKotlinState::Active)
+        } else if servers.is_empty()
+            && binary
+                .env
+                .as_ref()
+                .and_then(|env| env.get(UNAVAILABLE_ANDROID_VARIANT))
+                .is_some_and(|value| value == "true")
+        {
+            Some(OfficialKotlinState::Paused)
+        } else {
+            None
+        }
+    }
+
+    fn pause_official_kotlin(&self, root: &Path, cx: &App) -> Result<()> {
+        ensure!(
+            self.trusted_root(cx)? == root && self.selected_target.is_none(),
+            "The Android project or selected variant changed while pausing Kotlin"
+        );
+        let previous = android_tools::kotlin::read_settings(root)?;
+        let updated = paused_official_kotlin_settings(previous.clone(), root, cx)?;
+        android_tools::kotlin::finish_official(root, &previous, &updated)
+    }
+
+    fn queue_official_kotlin_refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.official_kotlin_state(cx).is_none() {
+            return;
+        }
+        let root = self.root.clone();
+        self.kotlin_refresh_pending = None;
+        self.kotlin_refresh_task = Some(cx.spawn_in(window, async move |panel, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(500))
+                .await;
+            panel
+                .update_in(cx, |panel, window, cx| {
+                    panel.kotlin_refresh_pending = root;
+                    if panel.take_official_kotlin_refresh(cx) {
+                        panel.sync_project(window, cx);
+                    }
+                })
+                .log_err();
+        }));
+    }
+
+    fn take_official_kotlin_refresh(&mut self, cx: &App) -> bool {
+        let Some(root) = &self.kotlin_refresh_pending else {
+            return false;
+        };
+        if self.root.as_ref() != Some(root)
+            || self.official_kotlin_state(cx).is_none()
+            || self.trusted_root(cx).is_err()
+        {
+            self.kotlin_refresh_pending = None;
+            return false;
+        }
+        if self.running || self.syncing {
+            return false;
+        }
+        self.kotlin_refresh_pending = None;
+        true
+    }
+
+    fn validate_official_kotlin_target(
+        &self,
+        root: &Path,
+        target: &AndroidTarget,
+        cx: &App,
+    ) -> Result<()> {
+        ensure!(
+            self.trusted_root(cx)? == root,
+            "The Android project changed during Kotlin setup"
+        );
+        ensure!(
+            self.selected_target.as_ref() == Some(target) && self.targets.contains(target),
+            "The selected Android variant changed or is no longer available. Sync and select a current variant before configuring Kotlin."
+        );
+        Ok(())
+    }
+
+    fn publish_official_kotlin_settings(
+        &self,
+        root: &Path,
+        target: &AndroidTarget,
+        previous: &str,
+        updated: &str,
+        cx: &App,
+    ) -> Result<()> {
+        self.validate_official_kotlin_target(root, target, cx)?;
+        android_tools::kotlin::finish_official(root, previous, updated)
+    }
+
+    fn restart_official_kotlin(&self, root: &Path, cx: &mut App) {
+        let project = self.project.read(cx);
+        let Some(worktree_id) = project
+            .visible_worktrees(cx)
+            .find(|worktree| worktree.read(cx).abs_path().as_ref() == root)
+            .map(|worktree| worktree.read(cx).id())
+        else {
+            return;
+        };
+        let store = project.lsp_store();
+        let servers = store
+            .read(cx)
+            .language_server_statuses()
+            .filter(|(_, status)| {
+                status.name.0.as_ref() == "kotlin-lsp" && status.worktree == Some(worktree_id)
+            })
+            .map(|(id, _)| lsp::LanguageServerSelector::Id(id))
+            .collect::<collections::HashSet<_>>();
+        if servers.is_empty() {
+            return;
+        }
+        let buffers = project
+            .buffer_store()
+            .read(cx)
+            .buffers()
+            .filter(|buffer| {
+                buffer
+                    .read(cx)
+                    .file()
+                    .is_some_and(|file| file.worktree_id(cx) == worktree_id)
+            })
+            .collect();
+        store.update(cx, |store, cx| {
+            store.restart_language_servers_for_buffers(buffers, servers, true, cx)
+        });
     }
 
     fn configure_official_kotlin(
@@ -884,40 +1110,53 @@ impl AndroidPanel {
                 return;
             }
         };
+        if self.running || self.syncing {
+            return;
+        }
+        if let Err(error) = self.validate_official_kotlin_target(&root, &target, cx) {
+            self.fail(error, window, cx);
+            return;
+        }
         self.running = true;
         self.error = None;
         self.status = "Configuring official Kotlin and generating Android resources…".into();
         let executor = cx.background_executor().clone();
         self.kotlin_task = Some(cx.spawn_in(window, async move |panel, cx| {
             let result = async {
-                let (java_home, server_binary, previous) = cx.background_spawn({
+                let (java_home, server_binary, previous, resource_guard) = cx.background_spawn({
                     let root = root.clone();
                     async move {
-                        Ok::<_, anyhow::Error>((kotlin::java_home()?, kotlin::official_server_binary()?, kotlin::read_settings(&root)?))
+                        Ok::<_, anyhow::Error>((kotlin::java_home()?, kotlin::official_server_binary()?, kotlin::read_settings(&root)?, kotlin::prepare_official_resource_generation(&root)?))
                     }
                 }).await?;
-                let updated = panel.update_in(cx, |panel, _, cx| {
-                    ensure!(panel.trusted_root(cx)? == root, "The Android project changed during Kotlin setup");
-                    official_kotlin_settings(previous.clone(), &root, &target.variant, &java_home, &server_binary, cx)
-                })??;
-                cx.background_spawn(async move {
-                    let program = if cfg!(windows) { root.join("gradlew.bat") } else { PathBuf::from("/bin/sh") };
-                    let mut arguments = if cfg!(windows) { Vec::new() } else { vec!["./gradlew".into()] };
-                    arguments.extend([target.gradle_task("process", "Resources"), "--console=plain".into()]);
-                    let mut command = new_command(program);
-                    command.args(arguments).current_dir(&root).env("JAVA_HOME", &java_home);
-                    let generation_error = command_output(command, &executor, Duration::from_secs(300)).await.err();
-                    kotlin::finish_official(&root, &previous, &updated)?;
+                let generation_error = cx.background_spawn({
+                    let root = root.clone();
+                    let target = target.clone();
+                    let java_home = java_home.clone();
+                    async move {
+                        let program = if cfg!(windows) { root.join("gradlew.bat") } else { PathBuf::from("/bin/sh") };
+                        let mut arguments = if cfg!(windows) { Vec::new() } else { vec!["./gradlew".into()] };
+                        arguments.extend(["--init-script".into(), resource_guard.to_string_lossy().into_owned(), target.gradle_task("process", "Resources"), "--no-configuration-cache".into(), "--console=plain".into()]);
+                        let mut command = new_command(program);
+                        command.args(arguments).current_dir(&root).env("JAVA_HOME", &java_home);
+                        command_output(command, &executor, Duration::from_secs(300)).await.err()
+                    }
+                }).await;
+                panel.update_in(cx, |panel, _, cx| {
+                    panel.validate_official_kotlin_target(&root, &target, cx)?;
+                    let updated = official_kotlin_settings(previous.clone(), &root, &target, &java_home, &server_binary, cx)?;
+                    panel.publish_official_kotlin_settings(&root, &target, &previous, &updated, cx)?;
                     Ok::<_, anyhow::Error>(generation_error)
-                }).await
+                })?
             }.await;
             panel.update_in(cx, |panel, window, cx| {
                 panel.running = false;
+                panel.kotlin_task = None;
                 match result {
                     Ok(generation_error) => {
-                        panel.status = format!("Official Kotlin {} configured. Open a Kotlin file and wait for import and indexing. Run setup again after changing variants.", kotlin::OFFICIAL_VERSION).into();
+                        panel.status = format!("Official Kotlin {} configured. Open a Kotlin file and wait for import and indexing. Variant and Gradle input changes refresh automatically.", kotlin::OFFICIAL_REVISION).into();
                         panel.error = generation_error.map(|error| format!("Android resource generation failed; generated symbols may be unavailable. Kotlin import can still proceed.\n{error:#}"));
-                        panel.project.read(cx).lsp_store().update(cx, |store, cx| store.restart_all_language_servers(cx));
+                        panel.restart_official_kotlin(&root, cx);
                     }
                     Err(error) => panel.fail(error, window, cx),
                 }
@@ -1146,6 +1385,7 @@ impl AndroidPanel {
 
     fn target_picker(&self, id: &'static str, cx: &Context<Self>) -> impl IntoElement {
         let targets = self.targets.clone();
+        let root = self.root.clone();
         let panel = cx.weak_entity();
         let label = self
             .selected_target
@@ -1172,11 +1412,23 @@ impl AndroidPanel {
                     for target in &targets {
                         let panel = panel.clone();
                         let target = target.clone();
-                        menu = menu.entry(target.label(), None, move |_, cx| {
+                        let root = root.clone();
+                        menu = menu.entry(target.label(), None, move |window, cx| {
                             panel
                                 .update(cx, |panel, cx| {
+                                    if panel.running
+                                        || panel.syncing
+                                        || panel.root != root
+                                        || !panel.targets.contains(&target)
+                                    {
+                                        return;
+                                    }
+                                    let changed = panel.selected_target.as_ref() != Some(&target);
                                     panel.selected_target = Some(target.clone());
                                     panel.remember_target(cx);
+                                    if changed && panel.official_kotlin_state(cx).is_some() {
+                                        panel.configure_official_kotlin(target.clone(), window, cx);
+                                    }
                                     cx.notify();
                                 })
                                 .log_err();
@@ -1530,6 +1782,14 @@ impl Render for AndroidPanel {
                             menu.entry(root.to_string_lossy().into_owned(), None, move |_, cx| {
                                 panel
                                     .update(cx, |panel, cx| {
+                                        if panel.running
+                                            || panel.syncing
+                                            || !panel.roots(cx).contains(&root)
+                                        {
+                                            return;
+                                        }
+                                        panel.kotlin_refresh_task = None;
+                                        panel.kotlin_refresh_pending = None;
                                         panel.root = Some(root.clone());
                                         panel.targets.clear();
                                         panel.selected_target = None;
@@ -1778,10 +2038,111 @@ fn java_settings(previous: String, root: &Path, cx: &App) -> Result<String> {
         })
 }
 
+fn android_model_input(path: &RelPath) -> bool {
+    let path = path.as_unix_str();
+    let components = path.split('/').collect::<Vec<_>>();
+    if components.iter().any(|component| {
+        matches!(
+            *component,
+            "build" | "generated" | ".gradle" | ".zed" | ".git"
+        )
+    }) {
+        return false;
+    }
+    let file_name = components.last().copied().unwrap_or_default();
+    let build_logic = components
+        .iter()
+        .any(|component| matches!(*component, "buildSrc" | "build-logic"));
+    path.ends_with(".gradle")
+        || path.ends_with(".gradle.kts")
+        || path.ends_with(".versions.toml")
+        || (path.ends_with(".toml") && components.contains(&"gradle"))
+        || (build_logic
+            && [".kt", ".kts", ".java", ".groovy", ".properties"]
+                .iter()
+                .any(|extension| path.ends_with(extension)))
+        || matches!(
+            file_name,
+            "buildSrc"
+                | "build-logic"
+                | "gradle.properties"
+                | "gradle-wrapper.properties"
+                | "local.properties"
+                | "gradle.lockfile"
+                | "AndroidManifest.xml"
+        )
+        || (components.contains(&"src") && components.contains(&"res"))
+}
+
+fn has_official_kotlin_system_path<'a>(
+    root: &Path,
+    arguments: impl IntoIterator<Item = &'a str>,
+) -> bool {
+    let expected = format!(
+        "--system-path={}",
+        root.join(".zed/android-kotlin-official/system").display()
+    );
+    let mut system_paths = arguments
+        .into_iter()
+        .filter(|argument| *argument == "--system-path" || argument.starts_with("--system-path="));
+    system_paths.next() == Some(expected.as_str()) && system_paths.next().is_none()
+}
+
+fn paused_official_kotlin_settings(previous: String, root: &Path, cx: &App) -> Result<String> {
+    let parsed: serde_json::Value = settings::parse_json_with_comments(&previous)?;
+    let servers = parsed
+        .pointer("/languages/Kotlin/language_servers")
+        .and_then(serde_json::Value::as_array);
+    let already_paused = parsed
+        .pointer("/lsp/kotlin-lsp/binary/env/ZED_ANDROID_VARIANT_UNAVAILABLE")
+        .and_then(serde_json::Value::as_str)
+        == Some("true");
+    ensure!(
+        parsed
+            .pointer("/languages/Kotlin/enable_language_server")
+            .and_then(serde_json::Value::as_bool)
+            != Some(false)
+            && servers.is_some_and(|servers| servers
+                .iter()
+                .any(|server| server.as_str() == Some("kotlin-lsp"))
+                || (servers.is_empty() && already_paused))
+            && parsed
+                .pointer("/lsp/kotlin-lsp/binary/arguments")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|arguments| has_official_kotlin_system_path(
+                    root,
+                    arguments.iter().filter_map(serde_json::Value::as_str)
+                )),
+        "The Kotlin backend changed while syncing; its settings were preserved"
+    );
+    cx.global::<settings::SettingsStore>()
+        .new_text_for_update(previous, |content| {
+            content
+                .project
+                .all_languages
+                .languages
+                .0
+                .entry("Kotlin".into())
+                .or_default()
+                .language_servers = Some(Vec::new());
+            content
+                .project
+                .lsp
+                .0
+                .entry("kotlin-lsp".into())
+                .or_default()
+                .binary
+                .get_or_insert_default()
+                .env
+                .get_or_insert_default()
+                .insert(UNAVAILABLE_ANDROID_VARIANT.into(), "true".into());
+        })
+}
+
 fn official_kotlin_settings(
     previous: String,
     root: &Path,
-    variant: &str,
+    target: &AndroidTarget,
     java_home: &Path,
     server_binary: &Path,
     cx: &App,
@@ -1881,7 +2242,11 @@ fn official_kotlin_settings(
             binary
                 .env
                 .get_or_insert_default()
-                .insert("LSP_ANDROID_VARIANT".into(), variant.into());
+                .remove(UNAVAILABLE_ANDROID_VARIANT);
+            binary.env.get_or_insert_default().extend([
+                ("LSP_ANDROID_MODULE".into(), target.module.clone()),
+                ("LSP_ANDROID_VARIANT".into(), target.variant.clone()),
+            ]);
         })
 }
 
@@ -2038,6 +2403,387 @@ mod tests {
     use serde_json::json;
     use workspace::AppState;
 
+    #[test]
+    fn android_model_inputs_include_build_logic_and_exclude_outputs() {
+        for path in [
+            "build.gradle.kts",
+            "settings.gradle",
+            "buildSrc/src/main/kotlin/AndroidPlugin.kt",
+            "build-logic/src/main/groovy/conventions.groovy",
+            "build-logic/src/main/resources/META-INF/gradle-plugins/android.properties",
+            "gradle/catalogs/custom.toml",
+            "libs.versions.toml",
+            "mobile/gradle/dependencies.toml",
+            "gradle.lockfile",
+            "mobile/gradle.lockfile",
+            "gradle/wrapper/gradle-wrapper.properties",
+            "mobile/src/main/AndroidManifest.xml",
+            "mobile/src/demo/res/values/strings.xml",
+            "src/main/res",
+        ] {
+            assert!(
+                android_model_input(
+                    &RelPath::new(Path::new(path), util::paths::PathStyle::Unix).unwrap()
+                ),
+                "{path}"
+            );
+        }
+        for path in [
+            "mobile/build/generated/res/values/values.xml",
+            "buildSrc/build/classes/AndroidPlugin.kt",
+            "build-logic/.gradle/state.gradle",
+            ".zed/settings.json",
+            ".zed/android-kotlin-official/system/gradle.properties",
+            ".git/config",
+            "generated/AndroidManifest.xml",
+            "mobile/src/main/kotlin/Main.kt",
+            "README.md",
+            "catalog.toml",
+        ] {
+            assert!(
+                !android_model_input(
+                    &RelPath::new(Path::new(path), util::paths::PathStyle::Unix).unwrap()
+                ),
+                "{path}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn official_kotlin_refresh_preserves_pending_work_and_rejects_stale_publication(
+        cx: &mut TestAppContext,
+    ) {
+        let _app_state = cx.update(AppState::test);
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let settings = json!({"languages": {"Kotlin": {"language_servers": ["kotlin-lsp"]}}, "lsp": {"kotlin-lsp": {"binary": {"arguments": [format!("--system-path={}", root.join(".zed/android-kotlin-official/system").display())]}}}}).to_string();
+        std::fs::create_dir(root.join(".zed")).unwrap();
+        std::fs::write(root.join(".zed/settings.json"), &settings).unwrap();
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            &root,
+            json!({".zed": {"settings.json": settings}, "main.kt": "fun main() {}"}),
+        )
+        .await;
+        let project = Project::test(fs, [root.as_path()], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let panel = cx.new(|cx| AndroidPanel::new(workspace.downgrade(), project.clone(), cx));
+        let target = AndroidTarget {
+            module: ":mobile".into(),
+            variant: "demoDebug".into(),
+            output_listing: root.join("output.json"),
+        };
+        panel.update(cx, |panel, cx| {
+            panel.root = Some(root.clone());
+            panel.targets = vec![target.clone()];
+            panel.selected_target = Some(target.clone());
+            panel.running = true;
+            assert!(panel.official_kotlin_state(cx).is_some());
+        });
+        panel.update_in(cx, |panel, window, cx| {
+            panel.queue_official_kotlin_refresh(window, cx)
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(300));
+        panel.update_in(cx, |panel, window, cx| {
+            panel.queue_official_kotlin_refresh(window, cx)
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(300));
+        cx.run_until_parked();
+        assert!(panel.read_with(cx, |panel, _| panel.kotlin_refresh_pending.is_none()));
+        cx.executor().advance_clock(Duration::from_millis(200));
+        cx.run_until_parked();
+        panel.update(cx, |panel, cx| {
+            assert_eq!(panel.kotlin_refresh_pending.as_ref(), Some(&root));
+            assert!(!panel.take_official_kotlin_refresh(cx));
+            panel.running = false;
+            panel.syncing = true;
+            assert!(!panel.take_official_kotlin_refresh(cx));
+            panel.syncing = false;
+            assert!(panel.take_official_kotlin_refresh(cx));
+            assert!(!panel.take_official_kotlin_refresh(cx));
+            panel.kotlin_refresh_pending = Some(root.join("closed-project"));
+            assert!(!panel.take_official_kotlin_refresh(cx));
+            assert!(panel.kotlin_refresh_pending.is_none());
+        });
+        let updated = "{\"published\":true}";
+        panel.update(cx, |panel, cx| {
+            panel.selected_target = Some(AndroidTarget {
+                variant: "fullRelease".into(),
+                ..target.clone()
+            });
+            assert!(
+                panel
+                    .publish_official_kotlin_settings(&root, &target, &settings, updated, cx)
+                    .is_err()
+            );
+            assert_eq!(
+                std::fs::read_to_string(root.join(".zed/settings.json")).unwrap(),
+                settings
+            );
+            panel.selected_target = Some(target.clone());
+            panel.targets.clear();
+            assert!(
+                panel
+                    .publish_official_kotlin_settings(&root, &target, &settings, updated, cx)
+                    .is_err()
+            );
+            panel.targets.push(target.clone());
+            panel
+                .publish_official_kotlin_settings(&root, &target, &settings, updated, cx)
+                .unwrap();
+            assert_eq!(
+                std::fs::read_to_string(root.join(".zed/settings.json")).unwrap(),
+                updated
+            );
+            assert!(
+                panel
+                    .publish_official_kotlin_settings(&root, &target, &settings, "{}", cx)
+                    .is_err()
+            );
+            assert_eq!(
+                std::fs::read_to_string(root.join(".zed/settings.json")).unwrap(),
+                updated
+            );
+        });
+        project.update(cx, |project, cx| {
+            let id = project.worktrees(cx).next().unwrap().read(cx).id();
+            project.remove_worktree(id, cx);
+        });
+        panel.update(cx, |panel, cx| {
+            assert!(
+                panel
+                    .publish_official_kotlin_settings(&root, &target, updated, "{}", cx)
+                    .is_err()
+            );
+            panel.kotlin_refresh_pending = Some(root.clone());
+            assert!(!panel.take_official_kotlin_refresh(cx));
+        });
+    }
+
+    #[gpui::test]
+    async fn official_kotlin_restart_preserves_other_roots_and_servers(cx: &mut TestAppContext) {
+        use futures::{FutureExt as _, StreamExt as _};
+        use language::{FakeLspAdapter, Language, LanguageConfig, LanguageMatcher};
+
+        let _app_state = cx.update(AppState::test);
+        let fs = FakeFs::new(cx.executor());
+        for root in ["/first", "/second", "/third"] {
+            fs.insert_tree(
+                root,
+                json!({"main.kt": "fun main() {}", "other.kt": "fun other() {}"}),
+            )
+            .await;
+        }
+        let project = Project::test(
+            fs,
+            [
+                Path::new("/first"),
+                Path::new("/second"),
+                Path::new("/third"),
+            ],
+            cx,
+        )
+        .await;
+        let languages = project.read_with(cx, |project, _| project.languages().clone());
+        languages.add(Arc::new(Language::new(
+            LanguageConfig {
+                name: "Kotlin".into(),
+                matcher: LanguageMatcher {
+                    path_suffixes: vec!["kt".into()],
+                    ..Default::default()
+                }
+                .into(),
+                ..Default::default()
+            },
+            None,
+        )));
+        let adapter = |name| FakeLspAdapter {
+            name,
+            initializer: Some(Box::new(|server| {
+                server.set_request_handler::<lsp::request::Shutdown, _, _>(|_, _| async { Ok(()) });
+            })),
+            ..Default::default()
+        };
+        let mut official_servers = languages.register_fake_lsp("Kotlin", adapter("kotlin-lsp"));
+        let mut other_servers = languages.register_fake_lsp("Kotlin", adapter("other-server"));
+        let mut buffers = Vec::new();
+        let mut old_official = Vec::new();
+        let mut unrelated = Vec::new();
+        for root in ["/first", "/second"] {
+            for filename in ["main.kt", "other.kt"] {
+                buffers.push(
+                    project
+                        .update(cx, |project, cx| {
+                            project.open_local_buffer_with_lsp(Path::new(root).join(filename), cx)
+                        })
+                        .await
+                        .unwrap(),
+                );
+            }
+            old_official.push(official_servers.next().await.unwrap());
+            unrelated.push(other_servers.next().await.unwrap());
+            cx.run_until_parked();
+        }
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let panel = cx.new(|cx| AndroidPanel::new(workspace.downgrade(), project.clone(), cx));
+        panel.update(cx, |panel, cx| {
+            panel.restart_official_kotlin(Path::new("/first"), cx)
+        });
+        cx.run_until_parked();
+        let mut restarted = official_servers
+            .next()
+            .now_or_never()
+            .flatten()
+            .expect("Selected root must restart by server ID");
+        cx.run_until_parked();
+        let store = project.read_with(cx, |project, _| project.lsp_store());
+        store.read_with(cx, |store, _| {
+            assert!(
+                store
+                    .language_server_for_id(old_official[0].server.server_id())
+                    .is_none()
+            );
+            assert!(
+                store
+                    .language_server_for_id(old_official[1].server.server_id())
+                    .is_some()
+            );
+            assert!(
+                store
+                    .language_server_for_id(restarted.server.server_id())
+                    .is_some()
+            );
+            for server in &unrelated {
+                assert!(
+                    store
+                        .language_server_for_id(server.server.server_id())
+                        .is_some()
+                );
+            }
+        });
+        let mut opened = Vec::new();
+        for _ in 0..2 {
+            let notification = restarted
+                .receive_notification::<lsp::notification::DidOpenTextDocument>()
+                .now_or_never()
+                .expect("Both source buffers must register after restart");
+            opened.push(notification.text_document.uri);
+        }
+        opened.sort();
+        assert_eq!(
+            opened,
+            vec![
+                lsp::Uri::from_file_path("/first/main.kt").unwrap(),
+                lsp::Uri::from_file_path("/first/other.kt").unwrap()
+            ]
+        );
+        assert!(official_servers.try_recv().is_err());
+        assert!(other_servers.try_recv().is_err());
+        let unopened = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer(Path::new("/third/main.kt"), cx)
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        store.update(cx, |store, cx| {
+            store.restart_language_servers_for_buffers(
+                vec![unopened],
+                collections::HashSet::from_iter([lsp::LanguageServerSelector::Id(
+                    old_official[0].server.server_id(),
+                )]),
+                true,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert!(
+            official_servers.try_recv().is_err(),
+            "A stale explicit restart ID must not start other owners"
+        );
+        assert!(
+            other_servers.try_recv().is_err(),
+            "A stale explicit restart ID must not start unrelated adapters"
+        );
+        let current = json!({"languages": {"Kotlin": {"language_servers": ["kotlin-lsp", "other-server"]}}, "lsp": {"kotlin-lsp": {"binary": {"arguments": ["--system-path=/first/.zed/android-kotlin-official/system"], "env": {"LSP_ANDROID_VARIANT": "demoDebug"}}}}}).to_string();
+        let paused = cx
+            .update(|_, cx| paused_official_kotlin_settings(current, Path::new("/first"), cx))
+            .unwrap();
+        let worktree_id = project.read_with(cx, |project, cx| {
+            project
+                .find_project_path(Path::new("/first/main.kt"), cx)
+                .unwrap()
+                .worktree_id
+        });
+        cx.update(|_, cx| {
+            cx.update_global::<settings::SettingsStore, _>(|settings, cx| {
+                settings
+                    .set_local_settings(
+                        worktree_id,
+                        settings::LocalSettingsPath::InWorktree(RelPath::empty_arc()),
+                        settings::LocalSettingsKind::Settings,
+                        Some(&paused),
+                        cx,
+                    )
+                    .unwrap();
+            })
+        });
+        cx.run_until_parked();
+        panel.update(cx, |panel, cx| {
+            panel.root = Some(PathBuf::from("/first"));
+            assert_eq!(
+                panel.official_kotlin_state(cx),
+                Some(OfficialKotlinState::Paused)
+            );
+        });
+        store.read_with(cx, |store, _| {
+            assert!(
+                store
+                    .language_server_for_id(restarted.server.server_id())
+                    .is_none(),
+                "Unavailable variant must stop the obsolete engine"
+            );
+            assert!(
+                store
+                    .language_server_for_id(old_official[1].server.server_id())
+                    .is_some(),
+                "Other root keeps its official server"
+            );
+            assert!(
+                store
+                    .language_server_for_id(unrelated[1].server.server_id())
+                    .is_some()
+            );
+        });
+        let fallback = cx
+            .update(|_, cx| kotlin_settings(paused, Path::new("/jdk"), &[], None, cx))
+            .unwrap();
+        cx.update(|_, cx| {
+            cx.update_global::<settings::SettingsStore, _>(|settings, cx| {
+                settings
+                    .set_local_settings(
+                        worktree_id,
+                        settings::LocalSettingsPath::InWorktree(RelPath::empty_arc()),
+                        settings::LocalSettingsKind::Settings,
+                        Some(&fallback),
+                        cx,
+                    )
+                    .unwrap();
+            })
+        });
+        panel.read_with(cx, |panel, cx| {
+            assert_eq!(
+                panel.official_kotlin_state(cx),
+                None,
+                "A deliberate community fallback must not auto-resume"
+            )
+        });
+    }
+
     #[gpui::test]
     fn official_kotlin_settings_preserve_preferences_and_allow_fallback(cx: &mut TestAppContext) {
         cx.update(|cx| {
@@ -2055,8 +2801,9 @@ mod tests {
                 }
             }"#;
             let root = Path::new("/android project");
+            let target = AndroidTarget { module: ":mobile".into(), variant: "demoDebug".into(), output_listing: PathBuf::new() };
             let server = Path::new("/official/bin/intellij-server");
-            let updated = official_kotlin_settings(previous.into(), root, "demoDebug", Path::new("/jdk 21"), server, cx).expect("Official settings should update");
+            let updated = official_kotlin_settings(previous.into(), root, &target, Path::new("/jdk 21"), server, cx).expect("Official settings should update");
             assert!(updated.contains("// keep Kotlin preferences"));
             let parsed: serde_json::Value = settings::parse_json_with_comments(&updated).expect("Valid settings");
             assert_eq!(parsed["tab_size"], 2);
@@ -2066,28 +2813,48 @@ mod tests {
             let official = &parsed["lsp"]["kotlin-lsp"];
             assert_eq!(official["binary"]["path"], "/official/bin/intellij-server");
             assert_eq!(official["binary"]["arguments"], json!(["--stdio", "--data-sharing=none", "--system-path=/android project/.zed/android-kotlin-official/system"]));
-            assert_eq!(official["binary"]["env"], json!({"CUSTOM": "kept", "LSP_ANDROID_VARIANT": "demoDebug"}));
+            assert_eq!(official["binary"]["env"], json!({"CUSTOM": "kept", "LSP_ANDROID_MODULE": ":mobile", "LSP_ANDROID_VARIANT": "demoDebug"}));
             assert_eq!(official["initialization_options"], json!({"custom": true, "defaultSdk": "/jdk 21", "projects": [
                 {"type": "gradle", "path": "file:///other", "java-home": "/other-jdk"},
                 {"type": "gradle", "path": "file:///android%20project", "java-home": "/jdk 21"}
             ]}));
             let mut directory_uri = parsed.clone();
             directory_uri["lsp"]["kotlin-lsp"]["initialization_options"]["projects"][1]["path"] = json!("file:///android%20project/");
-            let directory_uri = official_kotlin_settings(directory_uri.to_string(), root, "demoDebug", Path::new("/jdk 21"), server, cx).expect("Directory URI should update without a duplicate import");
+            let directory_uri = official_kotlin_settings(directory_uri.to_string(), root, &target, Path::new("/jdk 21"), server, cx).expect("Directory URI should update without a duplicate import");
             let directory_uri: serde_json::Value = settings::parse_json_with_comments(&directory_uri).expect("Valid directory URI settings");
             assert_eq!(directory_uri["lsp"]["kotlin-lsp"], *official);
-            let fallback = kotlin_settings(updated, Path::new("/jdk 21"), &[], None, cx).expect("Fallback settings should update");
+            let fallback = kotlin_settings(updated.clone(), Path::new("/jdk 21"), &[], None, cx).expect("Fallback settings should update");
             let fallback_parsed: serde_json::Value = settings::parse_json_with_comments(&fallback).expect("Valid fallback settings");
             assert_eq!(fallback_parsed["languages"]["Kotlin"]["language_servers"], json!(["kotlin-language-server"]));
             assert_eq!(fallback_parsed["lsp"]["kotlin-lsp"], *official);
-            let restarted = official_kotlin_settings(fallback, root, "fullRelease", Path::new("/jdk 21"), server, cx).expect("Repeated settings should update");
+            let paused = paused_official_kotlin_settings(updated, root, cx).expect("Pause the obsolete variant");
+            let parsed_paused: serde_json::Value = settings::parse_json_with_comments(&paused).unwrap();
+            assert_eq!(parsed_paused["languages"]["Kotlin"]["language_servers"], json!([]));
+            assert_eq!(parsed_paused["lsp"]["kotlin-lsp"]["binary"]["env"][UNAVAILABLE_ANDROID_VARIANT], "true");
+            assert_eq!(parsed_paused["lsp"]["kotlin-lsp"]["initialization_options"], official["initialization_options"]);
+            let resumed = official_kotlin_settings(paused, root, &target, Path::new("/jdk 21"), server, cx).unwrap();
+            let resumed: serde_json::Value = settings::parse_json_with_comments(&resumed).unwrap();
+            assert_eq!(resumed["lsp"]["kotlin-lsp"], *official);
+            assert!(paused_official_kotlin_settings(fallback.clone(), root, cx).is_err());
+            let mut disabled = parsed.clone();
+            disabled["languages"]["Kotlin"]["enable_language_server"] = json!(false);
+            assert!(paused_official_kotlin_settings(disabled.to_string(), root, cx).is_err());
+            for arguments in [
+                json!(["--stdio", "--system-path=/custom"]),
+                json!(["--system-path=/android project/.zed/android-kotlin-official/system", "--system-path", "/custom"]),
+            ] {
+                let mut unmanaged = parsed.clone();
+                unmanaged["lsp"]["kotlin-lsp"]["binary"]["arguments"] = arguments;
+                assert!(paused_official_kotlin_settings(unmanaged.to_string(), root, cx).is_err());
+            }
+            let restarted = official_kotlin_settings(fallback, root, &AndroidTarget { variant: "fullRelease".into(), ..target.clone() }, Path::new("/jdk 21"), server, cx).expect("Repeated settings should update");
             let restarted: serde_json::Value = settings::parse_json_with_comments(&restarted).expect("Valid restarted settings");
             assert_eq!(restarted["lsp"]["kotlin-lsp"]["initialization_options"], official["initialization_options"]);
             assert_eq!(restarted["lsp"]["kotlin-lsp"]["binary"]["arguments"], official["binary"]["arguments"]);
             assert_eq!(restarted["lsp"]["kotlin-lsp"]["binary"]["env"]["LSP_ANDROID_VARIANT"], "fullRelease");
             for options in [json!([]), json!({"projects": {}}), json!({"projects": [{"type": "json", "path": "file:///android%20project"}]})] {
                 let previous = json!({"lsp": {"kotlin-lsp": {"initialization_options": options}}}).to_string();
-                assert!(official_kotlin_settings(previous, root, "demoDebug", Path::new("/jdk 21"), server, cx).is_err());
+                assert!(official_kotlin_settings(previous, root, &target, Path::new("/jdk 21"), server, cx).is_err());
             }
             cx.update_global(|store: &mut settings::SettingsStore, cx| {
                 store.set_user_settings(r#"{"lsp":{"kotlin-lsp":{
@@ -2096,7 +2863,7 @@ mod tests {
                 }}}"#, cx).expect("Inherited settings should load");
             });
             for previous in ["", r#"{"lsp":{"kotlin-lsp":{"initialization_options":null}}}"#] {
-                let updated = official_kotlin_settings(previous.into(), root, "demoDebug", Path::new("/jdk 21"), server, cx).expect("Unset local settings should inherit user preferences");
+                let updated = official_kotlin_settings(previous.into(), root, &target, Path::new("/jdk 21"), server, cx).expect("Unset local settings should inherit user preferences");
                 let updated: serde_json::Value = settings::parse_json_with_comments(&updated).expect("Valid inherited settings");
                 assert_eq!(updated["lsp"]["kotlin-lsp"]["binary"]["arguments"], official["binary"]["arguments"]);
                 assert_eq!(updated["lsp"]["kotlin-lsp"]["initialization_options"]["projects"], official["initialization_options"]["projects"]);
@@ -2104,7 +2871,7 @@ mod tests {
             cx.update_global(|store: &mut settings::SettingsStore, cx| {
                 store.set_user_settings(r#"{"lsp":{"kotlin-lsp":{"initialization_options":{"projects":[{"type":"json","path":"file:///android%20project/"}]}}}}"#, cx).expect("Inherited importer should load");
             });
-            assert!(official_kotlin_settings("{}".into(), root, "demoDebug", Path::new("/jdk 21"), server, cx).is_err());
+            assert!(official_kotlin_settings("{}".into(), root, &target, Path::new("/jdk 21"), server, cx).is_err());
         });
     }
 

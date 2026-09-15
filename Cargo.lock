@@ -730,6 +730,7 @@ dependencies = [
  "db",
  "futures 0.3.34",
  "gpui",
+ "language",
  "lsp",
  "project",
  "serde_json",
