@@ -402,7 +402,10 @@ clicks to find usages at the clicked location. It uses the existing references
 picker, including one-result and repeated-query cases. It also adds read-only
 JAR/ZIP entry support to the existing filesystem, preserving Gradle source paths
 across restarts. Reused language-server nodes retain project settings for library
-buffer requests. Filesystem and project-LSP regressions cover these paths.
+buffer requests. New archive servers use the sole visible project's settings
+and working directory, including replacements after settings changes; source
+ownership for multi-root startup remains a limit.
+Filesystem and project-LSP regressions cover these paths.
 
 Layer 17 combines existing file, workspace-symbol and action search in Search
 Everywhere. It includes category tabs and Double Shift/Go to Class shortcuts.

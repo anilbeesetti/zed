@@ -68,8 +68,16 @@ settings. Those settings can select a different Kotlin server. Reused server
 nodes now retain the project's server during lookup. The regression reproduces
 an empty definition result with different project/global server selections,
 then verifies navigation and worktree cleanup after the fix. Virtual archive
-paths also skip shell-environment loading because they cannot be process working
-directories.
+paths inherit the default project environment to preserve JDK and PATH discovery.
+If the library needs a language server that is not running yet, it starts with
+the sole visible project's settings and physical working directory, then binds
+the archive buffer to that server. Both initial buffer registration and settings
+refresh use the same project-root selection. A first-server regression verifies
+the project root, a definition request and a replacement server after changing
+initialization settings. Standalone archive viewing
+remains available; new-server startup is skipped when multiple project roots are
+possible, until explicit source ownership is implemented. Existing server reuse
+continues to work.
 
 Studio also has persistent semantic indexes and serialized declaration stubs;
 these are separate from archive file loading. Its
@@ -108,6 +116,16 @@ Validation evidence (local files under `target/android-ide/validation/`):
 - `archive-reused-lsp-registered-before.log`, `archive-reused-lsp-final.log`:
   reproduced external-buffer routing failure and all 19 project LSP integration
   tests passing after the fix.
+- `archive-first-server-root-before.log`, `archive-first-server-final.log`:
+  reproduced the archive worktree being used as the process root; all 20 project
+  LSP tests pass after starting new archive servers in the real project context.
+- `archive-first-server-clippy.log`: the final project startup correction passes
+  the required Clippy wrapper.
+- `archive-refresh-root-before.log`, `archive-refresh-root-final.log`,
+  `archive-refresh-root-clippy.log`: native restart exposed settings refresh
+  bypassing initial startup routing. The expanded regression reproduces the
+  wrong worktree on replacement; all 20 LSP tests and Clippy pass after sharing
+  project-root selection between both startup paths.
 - `archive-latency-comparison.json`, `archive-navigation-ready-v8.log`:
   alternating cold-request comparison and final installed-runtime readiness probe.
 - `cold-definition-race-before.log`, `cold-definition-race-after.log`: reproduced
@@ -122,6 +140,39 @@ Validation evidence (local files under `target/android-ide/validation/`):
 - `archive-final-clippy.log`, `archive-android-ui-tests.log`: the repository
   Clippy wrapper passes for filesystem, project and Android UI crates; all five
   Android UI tests pass.
+
+Native archive checks passed on the optimized build at
+`780b82a1987a61c89380951247084812311d01f9` (`archive-final-build.log`, 20m 53s):
+
+- `headlineSmall` opens the exact Material3 Android sources JAR and declaration
+  at Typography.kt:94, with a locked tab and the original file name.
+- Editing/saving the archive tab is blocked, and the physical JAR checksum stays
+  unchanged. The tab reopens at the original archive path after a full restart.
+- After restart, Typography's `TextStyle` reference opens TextStyle.kt:57 from
+  the UI text Android sources JAR. `archive-native-textstyle.png` records it.
+- `ComponentActivity` opens ComponentActivity.java:119 from the original activity
+  sources JAR. That check exposed the first-Java-server environment/startup gap
+  addressed by the startup and settings-refresh follow-ups above.
+
+Final native verification passes on the optimized build at
+`0a3893568f2d91ecff509fa922cd8ec098fb4bf8` (`archive-refresh-build.log`, 18m 02s).
+The app restores ComponentActivity.java from its original archive. Both the Java
+proxy and JDT JVM run with the real test project as their working directory
+(`archive-refresh-native-java.json`), and the fresh session logs no errors.
+`headlineSmall` again opens Typography.kt:94 at the exact Material3 Android
+archive path; navigation from there opens TextStyle.kt:57 in its original UI
+text archive. `archive-native-final.png` and `archive-native-final-textstyle.png`
+record these checks. The Material3 JAR checksum remains unchanged.
+
+The final managed build caches total 18.5 GiB, below the 30 GiB cleanup threshold
+(`archive-native-final-result.json`). The existing scheduled cleanup remains
+configured. All checks reported here ran locally; GitHub reported no checks for
+the navigation draft PR at this checkpoint.
+
+Native keyboard checks used **Cmd+B**, which reaches the same definition flow
+as Cmd+click. The modifier-plus-mouse gesture was not directly automated in this
+pass. The fixture's existing **Android: Configure Java** action also completes
+successfully for `demoDebug`.
 
 To update an existing project, relaunch the rebuilt app, run **Android: Configure
 Kotlin** for the selected variant, and restart the IDE once so the runtime and
