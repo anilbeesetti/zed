@@ -3085,6 +3085,24 @@ impl LocalLspStore {
             .then_some((longest_line_length, maximum_line_length))
     }
 
+    fn language_server_startup_worktree(
+        &self,
+        worktree: &Entity<Worktree>,
+        abs_path: &Path,
+        cx: &App,
+    ) -> Option<Entity<Worktree>> {
+        if !fs::is_archive_path(abs_path) {
+            return Some(worktree.clone());
+        }
+        // ponytail: new archive servers need one real project; track source ownership for multi-root startup.
+        let worktree_store = self.worktree_store.read(cx);
+        let mut projects = worktree_store
+            .visible_worktrees(cx)
+            .filter(|worktree| !fs::is_archive_path(&worktree.read(cx).abs_path()));
+        let project = projects.next()?;
+        projects.next().is_none().then_some(project)
+    }
+
     fn register_buffer_with_language_servers(
         &mut self,
         buffer_handle: &Entity<Buffer>,
@@ -3143,21 +3161,10 @@ impl LocalLspStore {
         {
             (true, delegate, apply(&mut self.lsp_tree), worktree.clone())
         } else {
-            let startup_worktree = if fs::is_archive_path(&abs_path) {
-                // ponytail: new archive servers need one real project; track source ownership for multi-root startup.
-                let worktree_store = self.worktree_store.read(cx);
-                let mut projects = worktree_store
-                    .visible_worktrees(cx)
-                    .filter(|worktree| !fs::is_archive_path(&worktree.read(cx).abs_path()));
-                let Some(project) = projects.next() else {
-                    return;
-                };
-                if projects.next().is_some() {
-                    return;
-                }
-                project
-            } else {
-                worktree.clone()
+            let Some(startup_worktree) =
+                self.language_server_startup_worktree(&worktree, &abs_path, cx)
+            else {
+                return;
             };
             let startup_worktree_id = startup_worktree.read(cx).id();
             let path = if startup_worktree_id == worktree_id {
@@ -6419,20 +6426,36 @@ impl LspStore {
                     cx,
                 ) {
                     (apply)(rebase.server_tree());
-                } else if let Some(lsp_delegate) = adapters
-                    .entry(worktree_id)
-                    .or_insert_with(|| get_adapter(worktree_id, cx))
-                    .clone()
-                {
-                    let delegate =
-                        Arc::new(ManifestQueryDelegate::new(worktree.read(cx).snapshot()));
-                    let path = file
-                        .path()
-                        .parent()
-                        .map(Arc::from)
-                        .unwrap_or_else(|| file.path().clone());
-                    let worktree_path = ProjectPath { worktree_id, path };
+                } else {
                     let abs_path = file.abs_path(cx);
+                    let Some(startup_worktree) =
+                        local.language_server_startup_worktree(&worktree, &abs_path, cx)
+                    else {
+                        continue;
+                    };
+                    let startup_worktree_id = startup_worktree.read(cx).id();
+                    let Some(lsp_delegate) = adapters
+                        .entry(startup_worktree_id)
+                        .or_insert_with(|| get_adapter(startup_worktree_id, cx))
+                        .clone()
+                    else {
+                        continue;
+                    };
+                    let delegate = Arc::new(ManifestQueryDelegate::new(
+                        startup_worktree.read(cx).snapshot(),
+                    ));
+                    let path = if startup_worktree_id == worktree_id {
+                        file.path()
+                            .parent()
+                            .map(Arc::from)
+                            .unwrap_or_else(|| file.path().clone())
+                    } else {
+                        RelPath::empty_arc()
+                    };
+                    let worktree_path = ProjectPath {
+                        worktree_id: startup_worktree_id,
+                        path,
+                    };
                     let nodes = rebase
                         .walk(
                             worktree_path,
@@ -6450,9 +6473,11 @@ impl LspStore {
                         }
                         let server_id = node.server_id_or_init(|disposition| {
                             let path = &disposition.path;
-                            let uri = Uri::from_file_path(worktree.read(cx).absolutize(&path.path));
+                            let uri = Uri::from_file_path(
+                                startup_worktree.read(cx).absolutize(&path.path),
+                            );
                             let key = LanguageServerSeed {
-                                worktree_id,
+                                worktree_id: startup_worktree_id,
                                 name: disposition.server_name.clone(),
                                 settings: LanguageServerSeedSettings {
                                     binary: disposition.settings.binary.clone(),
@@ -6470,7 +6495,7 @@ impl LspStore {
                             local.language_server_ids.remove(&key);
 
                             let server_id = local.get_or_insert_language_server(
-                                &worktree,
+                                &startup_worktree,
                                 lsp_delegate.clone(),
                                 disposition,
                                 &language.name(),
@@ -6485,6 +6510,20 @@ impl LspStore {
                         });
 
                         if let Some(language_server_id) = server_id {
+                            if startup_worktree_id != worktree_id {
+                                rebase.server_tree().register_reused(
+                                    worktree_id,
+                                    language.name(),
+                                    node.clone(),
+                                );
+                                if !worktree.read(cx).is_visible() {
+                                    local.register_language_server_for_invisible_worktree(
+                                        &worktree,
+                                        language_server_id,
+                                        cx,
+                                    );
+                                }
+                            }
                             messages_to_report.push(LspStoreEvent::LanguageServerUpdate {
                                 language_server_id,
                                 name: node.name(),
@@ -6500,8 +6539,6 @@ impl LspStore {
                             });
                         }
                     }
-                } else {
-                    continue;
                 }
             }
             rebase.finish()

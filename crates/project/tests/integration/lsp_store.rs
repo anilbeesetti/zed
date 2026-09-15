@@ -354,6 +354,37 @@ async fn test_first_archive_language_server_starts_in_project(cx: &mut TestAppCo
         .unwrap()
         .unwrap();
     assert_eq!(definitions.len(), 1);
+
+    cx.update_global::<settings::SettingsStore, _>(|store, cx| {
+        store
+            .set_user_settings(
+                &json!({"lsp": {"project-rust": {
+                    "initialization_options": {"refresh": true}
+                }}})
+                .to_string(),
+                cx,
+            )
+            .unwrap();
+    });
+    let refreshed_server = servers.next().await.unwrap();
+    assert_ne!(
+        refreshed_server.server.server_id(),
+        server.server.server_id()
+    );
+    cx.run_until_parked();
+    project.read_with(cx, |project, cx| {
+        let lsp_store = project.lsp_store().read(cx);
+        assert_eq!(lsp_store.language_server_statuses().count(), 1);
+        assert_eq!(
+            lsp_store
+                .language_server_statuses()
+                .next()
+                .unwrap()
+                .1
+                .worktree,
+            Some(project_worktree)
+        );
+    });
 }
 
 #[gpui::test]
