@@ -1,25 +1,42 @@
 --- a/server/src/main/kotlin/org/javacs/kt/Configuration.kt
 +++ b/server/src/main/kotlin/org/javacs/kt/Configuration.kt
-@@ -53,7 +53,8 @@
+@@ -53,7 +53,9 @@
      /** Whether kls-URIs should be sent to the client to describe classes in JARs. */
      var useKlsScheme: Boolean = false,
      /** Whether external classes should be automatically converted to Kotlin. */
 -    var autoConvertToKotlin: Boolean = false
 +    var autoConvertToKotlin: Boolean = false,
-+    var sourceArchives: List<String> = emptyList()
++    var sourceArchives: List<String> = emptyList(),
++    var useArchiveUris: Boolean = false
  )
 
  data class InlayHintsConfiguration(
 --- a/server/src/main/kotlin/org/javacs/kt/KotlinWorkspaceService.kt
 +++ b/server/src/main/kotlin/org/javacs/kt/KotlinWorkspaceService.kt
-@@ -187,6 +187,7 @@
+@@ -186,7 +186,9 @@
+             get("externalSources")?.asJsonObject?.apply {
                  val externalSources = config.externalSources
                  get("useKlsScheme")?.asBoolean?.let { externalSources.useKlsScheme = it }
++                get("useArchiveUris")?.asBoolean?.let { externalSources.useArchiveUris = it }
                  get("autoConvertToKotlin")?.asBoolean?.let { externalSources.autoConvertToKotlin = it }
 +                get("sourceArchives")?.asJsonArray?.let { externalSources.sourceArchives = it.map { path -> path.asString } }
              }
          }
 
+--- a/server/src/main/kotlin/org/javacs/kt/URIContentProvider.kt
++++ b/server/src/main/kotlin/org/javacs/kt/URIContentProvider.kt
+@@ -13,7 +13,10 @@
+     val classContentProvider: ClassContentProvider
+ ) {
+     fun contentOf(uri: URI): String = when (uri.scheme) {
+-        "file" -> Paths.get(uri).toFile().readText()
++        "file" -> if ("!/" in uri.path) {
++            uri.toKlsURI()?.withSource(true)?.readContents()
++                ?: throw KotlinLSException("Could not find $uri")
++        } else Paths.get(uri).toFile().readText()
+         "kls" -> uri.toKlsURI()?.let { classContentProvider.contentOf(it).second }
+             ?: throw KotlinLSException("Could not find $uri")
+         else -> throw KotlinLSException("Unrecognized scheme ${uri.scheme}")
 --- a/server/src/main/kotlin/org/javacs/kt/definition/GoToDefinition.kt
 +++ b/server/src/main/kotlin/org/javacs/kt/definition/GoToDefinition.kt
 @@ -21,6 +21,18 @@
@@ -63,7 +80,7 @@
      val psi = target.findPsi()
 
      if (psi is KtNamedDeclaration) {
-@@ -48,7 +69,13 @@
+@@ -48,9 +69,17 @@
 
          if (isInsideArchive(rawClassURI, cp)) {
              parseURI(rawClassURI).toKlsURI()?.let { klsURI ->
@@ -76,9 +93,14 @@
 +                    sourceFile
 +                })
 
-                 if (config.useKlsScheme) {
+-                if (config.useKlsScheme) {
++                if (config.useArchiveUris && klsSourceURI.source) {
++                    destination.uri = klsSourceURI.fileUri.rawSchemeSpecificPart
++                } else if (config.useKlsScheme) {
                      // Defer decompilation until a jarClassContents request is sent
-@@ -71,17 +98,20 @@
+                     destination.uri = klsSourceURI.toString()
+                 } else {
+@@ -71,17 +100,20 @@
                      destination.uri = tmpFile.toUri().toString()
                  }
 
@@ -104,7 +126,7 @@
                  }
              }
          }
-@@ -94,3 +124,32 @@
+@@ -94,3 +126,32 @@
      uri.contains(".jar!") || uri.contains(".zip!") || cp.javaHome?.let {
          Paths.get(parseURI(uri)).toString().startsWith(File(it).path)
      } ?: false
@@ -157,7 +179,7 @@
 +    fun contentOf(uri: KlsURI, sourceFile: String? = null): Pair<KlsURI, String> {
          LOG.info("Resolving {} for contents", uri)
 -        val resolvedUri = sourceArchiveProvider.fetchSourceArchive(uri.archivePath)?.let(uri.withSource(true)::withArchivePath) ?: uri
-+        val resolvedUri = attachedSource(uri, config.sourceArchives, sourceFile) ?: sourceArchiveProvider.fetchSourceArchive(uri.archivePath)?.let(uri.withSource(true)::withArchivePath) ?: uri
++        val resolvedUri = if (uri.source || uri.fileExtension in listOf("kt", "java")) uri.withSource(true) else attachedSource(uri, config.sourceArchives, sourceFile) ?: sourceArchiveProvider.fetchSourceArchive(uri.archivePath)?.let(uri.withSource(true)::withArchivePath) ?: uri
          val key = resolvedUri.toString()
          val (contents, extension) = cachedContents[key] ?: run {
                  LOG.info("Reading contents of {}", describeURI(resolvedUri.fileUri))
@@ -271,7 +293,7 @@
 +}
 --- a/server/src/test/kotlin/org/javacs/kt/DefinitionTest.kt
 +++ b/server/src/test/kotlin/org/javacs/kt/DefinitionTest.kt
-@@ -75,3 +75,87 @@
+@@ -75,3 +75,89 @@
          assertThat(ranges, hasItem(equalTo(expect)))
      }
  }
@@ -342,12 +364,14 @@
 +                "dp" to "val Int.dp"
 +            )
 +            for ((reference, declaration) in checks + checks) {
++                server.config.externalSources.useArchiveUris = true
 +                val offset = text.indexOf(reference) + 1
 +                val result = server.textDocumentService.definition(org.eclipse.lsp4j.DefinitionParams(
 +                    org.eclipse.lsp4j.TextDocumentIdentifier(uri), org.javacs.kt.position.position(text, offset))).get().left
 +                org.junit.Assert.assertEquals(reference, 1, result.size)
 +                val destination = result.single()
-+                val contents = java.nio.file.Files.readString(java.nio.file.Paths.get(java.net.URI(destination.uri)))
++                org.junit.Assert.assertEquals(archive.toUri().toString() + "!/commonMain/external/Symbols.android.kt", destination.uri)
++                val contents = server.getProtocolExtensionService().jarClassContents(org.eclipse.lsp4j.TextDocumentIdentifier(destination.uri)).get()!!
 +                org.junit.Assert.assertEquals(library, contents)
 +                val targetOffset = org.javacs.kt.position.offset(contents, destination.range.start)
 +                org.junit.Assert.assertTrue("$reference should resolve to $declaration at $targetOffset", targetOffset in library.indexOf(declaration) until library.indexOf(declaration) + declaration.length)

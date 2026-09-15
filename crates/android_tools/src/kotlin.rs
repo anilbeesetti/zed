@@ -26,8 +26,9 @@ const GRADLE_INIT: &str = r#"gradle.projectsEvaluated {
             def configuration = project.configurations.findByName(variant + 'CompileClasspath')
             def sources = []
             if (configuration != null) {
-                def components = configuration.incoming.resolutionResult.allComponents.collect { it.id }
-                    .findAll { it instanceof org.gradle.api.artifacts.component.ModuleComponentIdentifier }
+                def components = configuration.incoming.artifactView { view ->
+                    view.componentFilter { it instanceof org.gradle.api.artifacts.component.ModuleComponentIdentifier }
+                }.artifacts.artifacts.collect { it.id.componentIdentifier }.unique()
                 def result = project.dependencies.createArtifactResolutionQuery().forComponents(components)
                     .withArtifacts(org.gradle.jvm.JvmLibrary, org.gradle.language.base.artifact.SourcesArtifact).execute()
                 sources = result.resolvedComponents.collectMany { component ->
