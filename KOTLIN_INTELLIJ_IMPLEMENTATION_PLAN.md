@@ -533,3 +533,44 @@ Reproduction instructions are in
 - `49471fc0f2` — Automatic managed Android model refresh and settings preservation.
 
 The README review notice remains for the human author's manual confirmation.
+
+### Restart regression reported during review
+
+The user reported project-file Cmd-click failing after reopening the app, then
+working after another restart and approximately ten seconds. The attached log
+showed one Kotlin server finishing import with an empty `folders` array and
+library restoration receiving no document. This is a real startup-order failure,
+separate from the previously measured steady-state navigation behavior.
+
+Restoring a library tab could initialize the shared server before a project-file
+tab. That path recorded the root internally but omitted the LSP workspace-folder
+registration that the normal buffer path performed. Subsequent files reused the
+already initialized node and did not repair it. Workspace-folder registration now
+lives in the shared server creation/reuse function, replacing both caller copies.
+
+A real-server reproduction also found that `decompile` can return null between
+LSP initialization and project import completion, even with the correct root.
+Restoration now waits for the pinned engine's
+`intellij/workspaceImportState` `FINISHED` notification with successful folders.
+It reports failed/empty imports, uses the configured LSP request timeout, and ends
+the wait when the server stops. It does not add a fixed delay or retry requests.
+
+The existing restart/history regression reproduced the empty-root failure before
+the fix and passes seeds 0–19 with root registration, delayed import completion,
+failed/empty imports, timeout, and shutdown coverage. Real protocol checks on the
+temporary larger-project copy returned empty definitions and library content with
+no workspace; with the owning root both succeeded after import/index completion.
+Those checks overlapped compilation and are correctness evidence, not new latency
+measurements. Reports are in `target/kotlin-restart-root` and
+`target/kotlin-completion-validation/restart-{root-before,import-after}.log`.
+Four shared registration/settings/library tests also pass seeds 0–19 (80 runs).
+The updated real-editor smoke test passes all five first-request scenarios plus
+Compose command acceptance. Clippy for `project`/`editor` and workspace formatting
+pass. These follow-up logs are under `target/kotlin-restart-root`.
+
+The user's `android:r:null` and `compile_app_classes_jar/.../classes.jar` warnings
+also occurred in the successful larger-project probe. They refer to generated
+resource and application class outputs that were absent; they do not explain an
+empty workspace list. Generated-symbol support and cold navigation readiness
+remain open gates. The implementation is under review in
+[PR #21](https://github.com/anilbeesetti/zed/pull/21).

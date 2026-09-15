@@ -2943,10 +2943,20 @@ mod tests {
 
     #[gpui::test]
     async fn test_kotlin_library_history_and_restart_restoration(cx: &mut gpui::TestAppContext) {
-        use futures::StreamExt as _;
+        use futures::{FutureExt as _, StreamExt as _};
         use gpui::UpdateGlobal as _;
         use language::FakeLspAdapter;
         use workspace::ItemHandle as _;
+
+        enum ImportState {}
+        impl lsp::notification::Notification for ImportState {
+            type Params = serde_json::Value;
+            const METHOD: &'static str = "intellij/workspaceImportState";
+        }
+        let imported = json!({"phase": "FINISHED", "folders": [{
+            "folderUri": lsp::Uri::from_file_path(path!("/project")).unwrap(),
+            "tool": "gradle", "status": "SUCCESS"
+        }]});
 
         init_test(cx, |_| {});
         let fs = FakeFs::new(cx.executor());
@@ -2976,6 +2986,7 @@ mod tests {
             .unwrap();
         let server = servers.next().await.unwrap();
         cx.run_until_parked();
+        server.notify::<ImportState>(imported.clone());
         let uri: lsp::Uri = "jar:///cache%20directory/library-1.0.jar!/example/Library.class"
             .parse()
             .unwrap();
@@ -3184,7 +3195,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let restore = workspace.update_in(cx, |_, window, cx| {
+        let mut restore = workspace.update_in(cx, |_, window, cx| {
             Editor::deserialize(
                 restarted_project.clone(),
                 workspace.downgrade(),
@@ -3195,11 +3206,26 @@ mod tests {
             )
         });
         let restarted_server = restarted_servers.next().await.unwrap();
+        cx.run_until_parked();
+        assert!(
+            (&mut restore).now_or_never().is_none(),
+            "Library restoration must wait for the project import"
+        );
+        restarted_server.notify::<ImportState>(imported);
         assert_ne!(
             restarted_project.read_with(cx, |project, _| project.lsp_store().entity_id()),
             project.read_with(cx, |project, _| project.lsp_store().entity_id())
         );
         let restored = restore.await.unwrap();
+        assert_eq!(
+            restarted_server
+                .server
+                .workspace_folders()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![lsp::Uri::from_file_path(path!("/project")).unwrap()],
+            "Restoring a library tab before a source tab must initialize the owning workspace"
+        );
         restored.read_with(cx, |editor, cx| {
             assert_eq!(editor.text(cx), "pub fn fresh() {}");
             let buffer = editor.buffer.read(cx).as_singleton().unwrap();
@@ -3253,6 +3279,36 @@ mod tests {
         );
 
         let location = saved.language_server_document.unwrap();
+        for folders in [json!([]), json!([{"status": "FAILED"}])] {
+            restarted_server
+                .notify::<ImportState>(json!({"phase": "FINISHED", "folders": folders}));
+            cx.run_until_parked();
+            let error = store
+                .update(cx, |store, cx| {
+                    store.restore_language_server_document(location.clone(), cx)
+                })
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("did not successfully import"));
+        }
+        restarted_server.notify::<ImportLog>(json!({"started": true}));
+        cx.run_until_parked();
+        let error = store
+            .update(cx, |store, cx| {
+                store.restore_language_server_document(location.clone(), cx)
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Timed out waiting for Kotlin project import")
+        );
+        let mut pending_restore = store.update(cx, |store, cx| {
+            store.restore_language_server_document(location.clone(), cx)
+        });
+        cx.run_until_parked();
+        assert!((&mut pending_restore).now_or_never().is_none());
         cx.update(|_, cx| {
             settings::SettingsStore::update_global(cx, |settings, cx| {
                 settings.set_user_settings(&json!({"lsp": {"kotlin-lsp": {"binary": {"env": {"LSP_ANDROID_VARIANT": "fullRelease"}}}}}).to_string(), cx).unwrap();
@@ -3271,6 +3327,13 @@ mod tests {
             let worktree_id = project.worktrees(cx).next().unwrap().read(cx).id();
             project.remove_worktree(worktree_id, cx);
         });
+        assert!(
+            pending_restore
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("stopped")
+        );
         assert!(
             store
                 .update(cx, |store, cx| store

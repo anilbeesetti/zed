@@ -406,6 +406,13 @@ impl lsp::notification::Notification for KotlinImportLog {
     const METHOD: &'static str = "intellij/importLog";
 }
 
+enum KotlinWorkspaceImportState {}
+
+impl lsp::notification::Notification for KotlinWorkspaceImportState {
+    type Params = Value;
+    const METHOD: &'static str = "intellij/workspaceImportState";
+}
+
 pub struct LocalLspStore {
     weak: WeakEntity<LspStore>,
     pub worktree_store: Entity<WorktreeStore>,
@@ -449,6 +456,7 @@ pub struct LocalLspStore {
     virtual_buffer_loads:
         HashMap<VirtualDocumentId, Shared<Task<Result<Entity<Buffer>, Arc<anyhow::Error>>>>>,
     virtual_document_versions: HashMap<LanguageServerId, u64>,
+    kotlin_workspace_imports: HashMap<LanguageServerId, watch::Sender<Option<Result<(), String>>>>,
     next_completion_session_id: u64,
     completion_sessions: HashMap<LanguageServerId, CompletionSession>,
     completion_request_locks: HashMap<LanguageServerId, Arc<futures::lock::Mutex<()>>>,
@@ -535,7 +543,7 @@ impl LocalLspStore {
             },
             toolchain: disposition.toolchain.clone(),
         };
-        if let Some(state) = self.language_server_ids.get_mut(&key) {
+        let server_id = if let Some(state) = self.language_server_ids.get_mut(&key) {
             state.project_roots.insert(disposition.path.path.clone());
             state.id
         } else {
@@ -563,7 +571,15 @@ impl LocalLspStore {
                 );
             }
             new_language_server_id
+        };
+        if let Some(state) = self.language_servers.get(&server_id)
+            && let Some(uri) =
+                file_path_to_lsp_url(&worktree_handle.read(cx).absolutize(&disposition.path.path))
+                    .log_err()
+        {
+            state.add_workspace_folder(uri);
         }
+        server_id
     }
 
     fn update_binary_status(&self, server_name: LanguageServerName, status: BinaryStatus) {
@@ -594,6 +610,10 @@ impl LocalLspStore {
         let stderr_capture = Arc::new(Mutex::new(Some(String::new())));
 
         let server_id = self.languages.next_language_server_id();
+        if adapter.name.0.as_ref() == "kotlin-lsp" {
+            self.kotlin_workspace_imports
+                .insert(server_id, watch::channel().0);
+        }
         log::trace!(
             "attempting to start language server {:?}, path: {worktree_abs_path:?}, id: {server_id}",
             adapter.name.0
@@ -1042,10 +1062,36 @@ impl LocalLspStore {
                                 .update(cx, |store, cx| {
                                     if let Some(local) = store.as_local_mut() {
                                         local.invalidate_virtual_documents(server_id, cx);
+                                        if let Some(import) =
+                                            local.kotlin_workspace_imports.get_mut(&server_id)
+                                        {
+                                            *import.borrow_mut() = None;
+                                        }
                                     }
                                 })
                                 .log_err();
                         }
+                    }
+                })
+                .detach();
+            language_server
+                .on_notification::<KotlinWorkspaceImportState, _>({
+                    let lsp_store = lsp_store.clone();
+                    move |params, cx| {
+                        if params["phase"] != "FINISHED" {
+                            return;
+                        }
+                        lsp_store.update(cx, |store, _| {
+                            if let Some(import) = store.as_local_mut()
+                                .and_then(|local| local.kotlin_workspace_imports.get_mut(&server_id)) {
+                                let succeeded = params["folders"].as_array().is_some_and(|folders| {
+                                    !folders.is_empty() && folders.iter().all(|folder| folder["status"] == "SUCCESS")
+                                });
+                                *import.borrow_mut() = Some(if succeeded { Ok(()) } else {
+                                    Err(format!("Kotlin did not successfully import its workspace folders: {}", params["folders"]))
+                                });
+                            }
+                        }).log_err();
                     }
                 })
                 .detach();
@@ -3438,27 +3484,13 @@ impl LocalLspStore {
                 }
 
                 let server_id = server_node.server_id_or_init(|disposition| {
-                    let path = &disposition.path;
-
-                    {
-                        let uri =
-                            Uri::from_file_path(startup_worktree.read(cx).absolutize(&path.path));
-
-                        let server_id = self.get_or_insert_language_server(
-                            &startup_worktree,
-                            delegate.clone(),
-                            disposition,
-                            &language_name,
-                            cx,
-                        );
-
-                        if let Some(state) = self.language_servers.get(&server_id)
-                            && let Ok(uri) = uri
-                        {
-                            state.add_workspace_folder(uri);
-                        };
-                        server_id
-                    }
+                    self.get_or_insert_language_server(
+                        &startup_worktree,
+                        delegate.clone(),
+                        disposition,
+                        &language_name,
+                        cx,
+                    )
                 })?;
                 if startup_worktree.read(cx).id() != worktree_id {
                     self.lsp_tree
@@ -5252,6 +5284,7 @@ impl LspStore {
                 virtual_buffers: HashMap::default(),
                 virtual_buffer_loads: HashMap::default(),
                 virtual_document_versions: HashMap::default(),
+                kotlin_workspace_imports: HashMap::default(),
                 next_completion_session_id: 0,
                 completion_sessions: HashMap::default(),
                 completion_request_locks: HashMap::default(),
@@ -6850,9 +6883,6 @@ impl LspStore {
                         }
                         let server_id = node.server_id_or_init(|disposition| {
                             let path = &disposition.path;
-                            let uri = Uri::from_file_path(
-                                startup_worktree.read(cx).absolutize(&path.path),
-                            );
                             let key = LanguageServerSeed {
                                 worktree_id: startup_worktree_id,
                                 name: disposition.server_name.clone(),
@@ -6871,19 +6901,13 @@ impl LspStore {
                             };
                             local.language_server_ids.remove(&key);
 
-                            let server_id = local.get_or_insert_language_server(
+                            local.get_or_insert_language_server(
                                 &startup_worktree,
                                 lsp_delegate.clone(),
                                 disposition,
                                 &language.name(),
                                 cx,
-                            );
-                            if let Some(state) = local.language_servers.get(&server_id)
-                                && let Ok(uri) = uri
-                            {
-                                state.add_workspace_folder(uri);
-                            };
-                            server_id
+                            )
                         });
 
                         if let Some(language_server_id) = server_id {
@@ -11273,6 +11297,29 @@ impl LspStore {
                     server = ready.fuse() => { server.context("The library document's language server failed to start")?; }
                 }
             }
+            let (mut import, timeout) = this.update(cx, |store, cx| {
+                let import = store.as_local_mut()
+                    .and_then(|local| local.kotlin_workspace_imports.get_mut(&server_id))
+                    .context("The library document's language server was stopped")?
+                    .subscribe();
+                anyhow::Ok((import, ProjectSettings::get_global(cx).global_lsp_settings.get_request_timeout()))
+            })??;
+            // Initialization precedes Gradle import. Decompile returns null until the
+            // imported project has made its library roots available.
+            let imported = async {
+                while let Some(state) = import.recv().await {
+                    if let Some(result) = state {
+                        return result.map_err(anyhow::Error::msg);
+                    }
+                }
+                anyhow::bail!("The library document's language server stopped during import")
+            }.fuse();
+            let timeout = cx.background_executor().timer(timeout).fuse();
+            futures::pin_mut!(imported, timeout);
+            select_biased! {
+                result = imported => result?,
+                _ = timeout => anyhow::bail!("Timed out waiting for Kotlin project import before restoring a library document"),
+            }
             let buffer = this.update(cx, |store, cx| {
                 let local = store.as_local().context("Library document owner is unavailable")?;
                 anyhow::ensure!(local.language_server_ids.values().any(|server| server.id == server_id)
@@ -15239,6 +15286,7 @@ impl LspStore {
                 .virtual_buffer_loads
                 .retain(|document, _| document.server_id != for_server);
             local.virtual_document_versions.remove(&for_server);
+            local.kotlin_workspace_imports.remove(&for_server);
             local.completion_sessions.remove(&for_server);
             local.completion_request_locks.remove(&for_server);
             local.active_completion_commands.remove(&for_server);
