@@ -3216,6 +3216,21 @@ mod tests {
         let restarted_languages =
             restarted_project.read_with(cx, |project, _| project.languages().clone());
         restarted_languages.add(languages::rust_lang());
+        let mut restore = workspace.update_in(cx, |_, window, cx| {
+            Editor::deserialize(
+                restarted_project.clone(),
+                workspace.downgrade(),
+                workspace_id,
+                item_id,
+                window,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        assert!(
+            (&mut restore).now_or_never().is_none(),
+            "Library restoration must wait for the extension adapter to finish loading"
+        );
         let mut restarted_servers = restarted_languages.register_fake_lsp(
             "Rust",
             FakeLspAdapter {
@@ -3240,16 +3255,6 @@ mod tests {
                 ..Default::default()
             },
         );
-        let mut restore = workspace.update_in(cx, |_, window, cx| {
-            Editor::deserialize(
-                restarted_project.clone(),
-                workspace.downgrade(),
-                workspace_id,
-                item_id,
-                window,
-                cx,
-            )
-        });
         let restarted_server = restarted_servers.next().await.unwrap();
         cx.run_until_parked();
         assert!(

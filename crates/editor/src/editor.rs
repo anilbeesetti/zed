@@ -1791,7 +1791,7 @@ impl Render for GutterButtonTooltip {
 }
 
 impl Editor {
-    fn trace_interaction_latency(action: &'static str, started: Instant, window: &mut Window) {
+    pub fn trace_interaction_latency(action: &'static str, started: Instant, window: &mut Window) {
         const LOGGER: zlog::Logger = zlog::scoped!("interaction_latency");
         if zlog::filter::is_scope_enabled(&LOGGER.scope, None, log::Level::Debug) {
             // The second callback runs after a frame with the changed editor; compositor latency is excluded.

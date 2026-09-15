@@ -11298,6 +11298,24 @@ impl LspStore {
             anyhow::ensure!(matches!(location.uri.scheme(), "jar" | "jrt") && location.server_name == "kotlin-lsp",
                 "Unsupported library document location");
             let language = languages.language_for_name(&location.language).await?;
+            if location.session.is_none() {
+                let name = LanguageServerName::from(location.server_name.as_str());
+                let mut registrations = languages.subscribe();
+                let timeout = this.read_with(cx, |_, cx| ProjectSettings::get_global(cx).global_lsp_settings.get_request_timeout())?;
+                // Extension language definitions are registered before their Wasm adapters finish loading.
+                let registered = async {
+                    while languages.adapter_for_name(&name).is_none() && !languages.is_lsp_adapter_available(&name) {
+                        registrations.next().await.context("The language registry stopped while restoring a library document")?;
+                    }
+                    anyhow::Ok(())
+                }.fuse();
+                let timeout = cx.background_executor().timer(timeout).fuse();
+                futures::pin_mut!(registered, timeout);
+                select_biased! {
+                    result = registered => result?,
+                    _ = timeout => anyhow::bail!("Timed out waiting for the Kotlin extension adapter before restoring a library document"),
+                }
+            }
             let (server_id, ready) = this.update(cx, |store, cx| {
                 let local = store.as_local_mut().context("Library document restoration requires its local workspace")?;
                 if let Some((session, document)) = &location.session {

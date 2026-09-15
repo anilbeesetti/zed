@@ -1,5 +1,6 @@
 use std::ops::Range;
 use std::sync::Arc;
+use std::time::Instant;
 
 use collections::HashMap;
 use editor::actions::{
@@ -247,6 +248,7 @@ impl LspLocationsPicker {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
+        let started = Instant::now();
         let project = workspace.project().clone();
         let fallback = EditorSettings::get_global(cx).go_to_definition_fallback;
         let editor = editor.downgrade();
@@ -291,10 +293,18 @@ impl LspLocationsPicker {
                         buffer: location_match.buffer,
                         range: location_match.anchor_range,
                     };
-                    if let Ok(task) = editor.update_in(cx, |editor, window, cx| {
-                        editor.open_location(location, false, window, cx)
-                    }) {
-                        task.await.log_err();
+                    if let Some(task) = editor
+                        .update_in(cx, |editor, window, cx| {
+                            editor.open_location(location, false, window, cx)
+                        })
+                        .log_err()
+                        && task.await.log_err().is_some()
+                        && kind == LspPickerKind::Definition
+                    {
+                        cx.update(|window, _| {
+                            Editor::trace_interaction_latency("definition", started, window)
+                        })
+                        .log_err();
                     }
                 }
                 return;

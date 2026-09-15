@@ -669,3 +669,23 @@ these build-overlapping checks.
 
 Community remains the default. Final release UI timings and complete-process
 memory results will be recorded separately from these protocol checks.
+
+### Release restart and timing follow-up
+
+The release build at source commit `4f1095e8ce` confirms direct Java-to-Kotlin
+navigation without JDT's duplicate decompiled result. A full app restart exposed
+a library restoration race: extension language definitions were available before
+their Wasm adapters registered. Restoration now waits for registration using the
+configured request timeout. The expanded history/restart regression fails before
+this change and passes 100 scheduler runs afterward; focused Clippy passes.
+
+A separate close/reopen of the workspace inside the running app rejected a
+library restore at the settings-fingerprint check. That restoration readiness/
+identity case remains open, and the ownership guard is retained. Project-file
+Kotlin navigation works after analysis.
+
+Default keyboard navigation uses the picker handler, bypassing the initial
+editor-only trace. Its direct-jump path now uses the same rendered-frame logger.
+Completion tracing is confirmed active; the one 5,312 ms sample collected while
+compilation ran is excluded. No cold-navigation timing is claimed from that run.
+The final follow-up binary and controlled UI/memory results are recorded below.
