@@ -9,7 +9,7 @@
 +    var sourceArchives: List<String> = emptyList(),
 +    var useArchiveUris: Boolean = false
  )
-
+ 
  data class InlayHintsConfiguration(
 --- a/server/src/main/kotlin/org/javacs/kt/KotlinTextDocumentService.kt
 +++ b/server/src/main/kotlin/org/javacs/kt/KotlinTextDocumentService.kt
@@ -18,12 +18,12 @@
      val lintTodo = mutableSetOf<URI>()
      var lintCount = 0
 +    private var workspaceIndexPending = false
-
+ 
      var lintRecompilationCallback: () -> Unit
          get() = sp.beforeCompileCallback
 @@ -276,7 +277,14 @@
      }
-
+ 
      fun lintAll() {
 -        debounceLint.submitImmediately {
 +        workspaceIndexPending = true
@@ -43,7 +43,7 @@
          lintCount++
 +        if (!cancelCallback()) indexWorkspaceIfPending()
      }
-
+ 
      private fun reportDiagnostics(compiled: Collection<URI>, kotlinDiagnostics: Diagnostics) {
 --- a/server/src/main/kotlin/org/javacs/kt/KotlinWorkspaceService.kt
 +++ b/server/src/main/kotlin/org/javacs/kt/KotlinWorkspaceService.kt
@@ -56,18 +56,30 @@
 +                get("sourceArchives")?.asJsonArray?.let { externalSources.sourceArchives = it.map { path -> path.asString } }
              }
          }
-
+ 
 --- a/server/src/main/kotlin/org/javacs/kt/SourceFiles.kt
 +++ b/server/src/main/kotlin/org/javacs/kt/SourceFiles.kt
-@@ -75,7 +75,7 @@
-
+@@ -74,8 +74,9 @@
+     private val open = mutableSetOf<URI>()
+ 
      fun open(uri: URI, content: String, version: Int) {
-         if (isIncluded(uri)) {
+-        if (isIncluded(uri)) {
 -            files[uri] = SourceVersion(content, version, languageOf(uri), isTemporary = false)
-+            files[uri] = SourceVersion(content, version, languageOf(uri), isTemporary = uri.scheme == "kls" || uri.path?.contains("!/") == true)
++        val external = uri.scheme == "kls" || uri.path?.contains("!/") == true
++        if (external || isIncluded(uri)) {
++            files[uri] = SourceVersion(content, version, languageOf(uri), isTemporary = external)
              open.add(uri)
          }
      }
+@@ -195,7 +196,7 @@
+ 
+     fun isOpen(uri: URI): Boolean = (uri in open)
+ 
+-    fun isIncluded(uri: URI): Boolean = exclusions.isURIIncluded(uri)
++    fun isIncluded(uri: URI): Boolean = uri in open || exclusions.isURIIncluded(uri)
+ }
+ 
+ private fun patch(sourceText: String, change: TextDocumentContentChangeEvent): String {
 --- a/server/src/main/kotlin/org/javacs/kt/SourcePath.kt
 +++ b/server/src/main/kotlin/org/javacs/kt/SourcePath.kt
 @@ -28,6 +28,8 @@
@@ -76,13 +88,13 @@
      private val parseDataWriteLock = ReentrantLock()
 +    // Navigation must get a turn between background indexing batches.
 +    private val compilationLock = ReentrantLock(true)
-
+ 
      private val indexAsync = AsyncExecutor()
      var indexEnabled: Boolean by indexingConfig::enabled
 @@ -98,6 +100,7 @@
-
+ 
              val oldFile = clone()
-
+ 
 +            beforeCompileCallback.invoke()
              val (context, module) = cp.compiler.compileKtFile(parsed!!, allIncludingThis(), kind)
              parseDataWriteLock.withLock {
@@ -90,7 +102,7 @@
 @@ -108,7 +111,8 @@
              refreshWorkspaceIndexes(listOfNotNull(oldFile), listOfNotNull(this))
          }
-
+ 
 -        private fun doCompileIfChanged() {
 +        // Diagnostics and first navigation must share the result of an in-flight compilation.
 +        private fun doCompileIfChanged() = compilationLock.withLock {
@@ -147,7 +159,7 @@
 +import org.jetbrains.org.objectweb.asm.ClassReader
 +import org.jetbrains.org.objectweb.asm.ClassVisitor
 +import org.jetbrains.org.objectweb.asm.Opcodes
-
+ 
  private val cachedTempFiles = mutableMapOf<KlsURI, Path>()
  private val definitionPattern = Regex("(?:class|interface|object|fun)\\s+(\\w+)")
 @@ -33,10 +45,19 @@
@@ -163,17 +175,17 @@
 +        ((it as? DeclarationDescriptorWithSource)?.source as? KotlinJvmBinarySourceElement)?.binaryClass
 +            ?: ((it as? DeserializedMemberDescriptor)?.containerSource as? JvmPackagePartSource)?.knownJvmBinaryClass
 +    }.firstOrNull()
-
+ 
      LOG.info("Found declaration descriptor {}", target)
 -    var destination = location(target)
 +    var destination = location(target) ?: binary?.location?.takeIf { "!/" in it }?.let {
 +        Location(Paths.get(it).toUri().toString(), Range(Position(0, 0), Position(0, 0)))
 +    }
      val psi = target.findPsi()
-
+ 
      if (psi is KtNamedDeclaration) {
 @@ -48,9 +69,17 @@
-
+ 
          if (isInsideArchive(rawClassURI, cp)) {
              parseURI(rawClassURI).toKlsURI()?.let { klsURI ->
 -                val (klsSourceURI, content) = classContentProvider.contentOf(klsURI)
@@ -184,7 +196,7 @@
 +                    }, ClassReader.SKIP_CODE or ClassReader.SKIP_FRAMES)
 +                    sourceFile
 +                })
-
+ 
 -                if (config.useKlsScheme) {
 +                if (config.useArchiveUris && klsSourceURI.source) {
 +                    destination.uri = klsSourceURI.fileUri.rawSchemeSpecificPart
@@ -195,7 +207,7 @@
 @@ -71,17 +100,20 @@
                      destination.uri = tmpFile.toUri().toString()
                  }
-
+ 
 -                if (destination.range.isZero) {
 +                if (klsSourceURI.source || destination.range.isZero) {
                      // Try to find the definition inside the source directly
@@ -260,7 +272,7 @@
 +import java.net.URI
 +import java.nio.file.Paths
 +import java.util.zip.ZipFile
-
+ 
  /**
   * Provides the source code for classes located inside
 @@ -34,9 +37,9 @@
@@ -305,7 +317,7 @@
 --- a/server/src/main/kotlin/org/javacs/kt/externalsources/FernFlowerDecompiler.kt
 +++ b/server/src/main/kotlin/org/javacs/kt/externalsources/FernFlowerDecompiler.kt
 @@ -17,6 +17,7 @@
-
+ 
      private val decompilerOptions =
          arrayOf(
 +            "-log=WARN", // Per-class INFO messages can block the LSP output pipe.
@@ -315,14 +327,14 @@
 --- a/server/src/main/kotlin/org/javacs/kt/externalsources/KlsURI.kt
 +++ b/server/src/main/kotlin/org/javacs/kt/externalsources/KlsURI.kt
 @@ -86,7 +86,7 @@
-
+ 
      fun withFileExtension(newExtension: String): KlsURI {
          val (parentUri, fileName) = fileUri.toString().partitionAroundLast("/")
 -        val newUri = URI("$parentUri${fileName.split(".").first()}.$newExtension")
 +        val newUri = URI("$parentUri${fileName.substringBeforeLast(".")}.$newExtension")
          return KlsURI(newUri, query)
      }
-
+ 
 --- a/server/src/main/kotlin/org/javacs/kt/symbols/Symbols.kt
 +++ b/server/src/main/kotlin/org/javacs/kt/symbols/Symbols.kt
 @@ -7,7 +7,7 @@
@@ -337,25 +349,25 @@
 @@ -59,7 +59,7 @@
  private fun workspaceSymbol(d: KtNamedDeclaration): WorkspaceSymbol? {
      val name = d.name ?: return null
-
+ 
 -    return WorkspaceSymbol(name, symbolKind(d), Either.forRight(workspaceLocation(d)), symbolContainer(d))
 +    return WorkspaceSymbol(name, symbolKind(d), Either.forLeft(workspaceLocation(d)), symbolContainer(d))
  }
-
+ 
  private fun symbolKind(d: KtNamedDeclaration): SymbolKind =
 @@ -73,11 +73,11 @@
              else -> throw IllegalArgumentException("Unexpected symbol $d")
          }
-
+ 
 -private fun workspaceLocation(d: KtNamedDeclaration): WorkspaceSymbolLocation {
 +private fun workspaceLocation(d: KtNamedDeclaration): Location {
      val file = d.containingFile
      val uri = file.toPath().toUri().toString()
-
+ 
 -    return WorkspaceSymbolLocation(uri)
 +    return Location(uri, range(file.text, d.nameIdentifier?.textRange ?: d.textRange))
  }
-
+ 
  private fun symbolContainer(d: KtNamedDeclaration): String? =
 --- a/server/src/test/kotlin/org/javacs/kt/ClassPathTest.kt
 +++ b/server/src/test/kotlin/org/javacs/kt/ClassPathTest.kt
@@ -385,7 +397,7 @@
 +}
 --- a/server/src/test/kotlin/org/javacs/kt/DefinitionTest.kt
 +++ b/server/src/test/kotlin/org/javacs/kt/DefinitionTest.kt
-@@ -75,3 +75,141 @@
+@@ -75,3 +75,149 @@
          assertThat(ranges, hasItem(equalTo(expect)))
      }
  }
@@ -470,7 +482,15 @@
 +                org.junit.Assert.assertTrue(destination.range.end.character > destination.range.start.character)
 +            }
 +            val archiveUri = java.net.URI(archive.toUri().toString() + "!/commonMain/external/Symbols.android.kt")
-+            server.sourceFiles.open(archiveUri, library, 1)
++            server.textDocumentService.didOpen(org.eclipse.lsp4j.DidOpenTextDocumentParams(
++                org.eclipse.lsp4j.TextDocumentItem(archiveUri.toString(), "kotlin", 1, library)))
++            org.junit.Assert.assertTrue(server.sourceFiles.isOpen(archiveUri))
++            org.junit.Assert.assertTrue(server.sourceFiles.isIncluded(archiveUri))
++            val nested = server.textDocumentService.definition(org.eclipse.lsp4j.DefinitionParams(
++                org.eclipse.lsp4j.TextDocumentIdentifier(archiveUri.toString()),
++                org.javacs.kt.position.position(library, library.indexOf("Typography(\"Title\")") + 2))).get().left.single()
++            org.junit.Assert.assertEquals(archiveUri.toString(), nested.uri)
++            org.junit.Assert.assertEquals(2, nested.range.start.line)
 +            org.junit.Assert.assertFalse(server.sourcePath.all().any { it.text == library })
 +            org.junit.Assert.assertEquals(library, server.sourcePath.content(archiveUri))
 +            server.sourceFiles.close(archiveUri)
@@ -538,7 +558,7 @@
 +        org.junit.Assert.assertTrue(found.all { it.location.left.range.end.line > it.location.left.range.start.line || it.location.left.range.end.character > it.location.left.range.start.character })
          val byKind = found.groupBy({ it.kind }, { it.name })
          val all = found.map { it.name }.toList()
-
+ 
 --- a/server/src/test/kotlin/org/javacs/kt/externalsources/AttachedSourcesTest.kt
 +++ b/server/src/test/kotlin/org/javacs/kt/externalsources/AttachedSourcesTest.kt
 @@ -0,0 +1,40 @@
@@ -585,7 +605,7 @@
 --- a/shared/src/main/kotlin/org/javacs/kt/classpath/DefaultClassPathResolver.kt
 +++ b/shared/src/main/kotlin/org/javacs/kt/classpath/DefaultClassPathResolver.kt
 @@ -17,6 +17,12 @@
-
+ 
  /** Searches the workspace for all files that could provide classpath info. */
  private fun workspaceResolvers(workspaceRoot: Path): Sequence<ClassPathResolver> {
 +    // An explicit root hook already supplies the project model; rediscovering each
