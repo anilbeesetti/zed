@@ -6717,6 +6717,7 @@ dependencies = [
  "async-std",
  "async-tar",
  "async-trait",
+ "async_zip",
  "collections",
  "dunce",
  "fs",
