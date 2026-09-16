@@ -815,73 +815,135 @@ coverage, and packaged-platform/distribution validation remain open promotion ga
 
 ### First navigation immediately after readiness — 2026-09-16
 
-**Step 8 remains open. No production latency fix was established.** Starting from
-merged restoration baseline `14f42531ebacdf45bb2ab4a80fb9895ca729f6e4`, this
-investigation reproduced the first-request delay in the unchanged official
-`263.4702.0+android-2` engine. The skipped completion task/PR #24 was not used or
-integrated, and its latency gate remains open. Community remains the default.
+**Step 8 remains open: the candidate improves first navigation, but does not meet
+500 ms on every recorded lifecycle or on the larger fixture's fresh import.**
+The implementation starts from merged restoration baseline
+`14f42531ebacdf45bb2ab4a80fb9895ca729f6e4`. The skipped completion task/PR #24 was
+not used or integrated; its latency gate remains open. Community remains the
+default and the official backend remains opt-in.
 
-`script/test-kotlin-lsp --navigation-only` now issues a definition immediately
-after import success and the original Indexing progress completion, before model
-export, memory sampling, any other semantic request, or a sleep. It supports an
-isolated larger project's active Kotlin file, separate result directories with
-shared persisted indexes, in-memory wire logging, first definition/content/launch
-timing, exact source-archive text and range verification, and separate warm
-samples. The self-test asserts request ordering and the 30-sample warm boundary.
-Normal full-suite and explicit warmup behavior are preserved.
+The pinned `263.4702.0+android-3` candidate adds active-file preparation and fixes
+three causes of lost analysis work:
 
-On the Apple M4 / 16 GiB / macOS 26.6.2 machine, 30 fresh native processes per
-fixture produced these results, with no concurrent builds, tests, or profiler:
+- The editor sends `zed.prepareKotlinFile` after the focused Kotlin document is
+  registered with a capable server, including late server attachment. A generation
+  prevents stale focus/stop commands from replacing newer work. Blur, window
+  deactivation and editor release stop preparation.
+- The server resolves references in that open file against native analysis
+  snapshots. Document changes cancel stale work; index publications are conflated.
+  The command acknowledges scheduling without waiting for preparation. No target
+  name or measured position is sent to it.
+- Empty file invalidations retain the existing FIR session storage, including
+  entries being populated by concurrent readers. Real invalidations and low-memory
+  eviction retain native behavior.
+- Native Gradle dependency/source archives are ordered deterministically. Re-import
+  otherwise reordered identical source roots, discarding Kotlin model caches.
+  Model-cache reuse additionally requires equality of the complete entity graph;
+  actual model changes still rebuild the caches.
 
-| Persisted indexes | First definition p50 / p95 | First + content p95 | Launch to first content p50 / p95 | Warm protocol p95 |
-| --- | ---: | ---: | ---: | ---: |
-| Android sample, `headlineSmall` | 1000.82 / 1101.50 ms | 1104.36 ms | 3.787 / 3.897 s | 1.52 ms |
-| nav3-recipes, original `Text` | 1785.73 / 1832.24 ms | 1835.08 ms | 5.248 / 5.449 s | 1.94 ms |
+The installer builds these changes from the pinned public source and checksums
+both the preparation source and patched runtime modules. It does not change the
+upstream import/index readiness boundary, definition providers, source ownership,
+read-only behavior, completion semantics, or JVM options.
 
-All 60 first results and all 1,800 warm results were retained and passed target
-checks; **none of the first requests met 500 ms**. Each lifecycle contributed 30
-warm requests; maximum per-lifecycle warm p95 was 1.67 / 2.48 ms. Original source
-text matched the exact archive entry and selected the expected symbol. Wire-log
-overhead p95 was 0.093 / 0.112 ms, too small to explain the semantic delay.
+`script/test-kotlin-lsp --navigation-only --prepare-active-file` sends preparation
+after didOpen, then issues the first definition immediately after import success
+and the original Indexing completion. It performs no model export, other semantic
+request or sleep before that definition. First definition, original content,
+launch time and separate warm samples are recorded. Every original target is
+checked against the exact source-archive bytes and declaration range.
 
-Individual first-import observations with fresh indexes were 19.659 / 36.451 s
-to readiness, 1473.27 / 2354.47 ms for the first definition, and 2.47 / 5.80 ms
-for original content. Engine/dependency downloads were already cached; these are
-not first-install benchmarks. Launch timing starts at subprocess creation, not
-editor project-open or worktree scanning. The prior release UI warm navigation
-p95 of 26.06 ms remains the UI baseline; this protocol series does not replace
-it or establish a new first-action/rendering budget pass.
+On Apple M4 / 16 GiB / macOS 26.6.2, the final packaged candidate's protocol series
+used 30 fresh native processes per fixture and 30 subsequent warm requests per
+process, with no concurrent build or profiler. All results, including the miss,
+are retained; percentiles use nearest rank.
 
-A separate JFR run shows lazy class/lambda initialization, FIR dependency-symbol
-resolution, persistent stub/content reads, and source PSI parsing in the first
-request. Existing CMD-hover/CMD-click and Cmd+B paths already share definition
-resolution, session/model-aware virtual content loading, and buffer/editor reuse.
-Source fetch is only a few milliseconds. The existing debug GPUI harness still
-adds wrapping invariant checks and synchronous wire logging, so it remains a
-correctness harness rather than evidence for release UI percentiles.
+| Persisted indexes | Baseline first p95 | Candidate first p50 / p95 / max | First + content p95 | Warm protocol p95 | First requests <500 ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Android sample, `headlineSmall` | 1101.50 ms | 413.78 / 443.15 / 445.47 ms | 445.35 ms | 1.62 ms | 30/30 |
+| nav3-recipes, original `Text` | 1832.24 ms | 356.40 / 443.39 / 686.22 ms | 445.28 ms | 2.60 ms | 29/30 |
 
-Early diagnostics immediately after didOpen or at indexing start returned empty
-and left first definitions at 1190.65 / 1131.67 ms. A private single-resolution
-provider prototype took 1287.98 ms; a separate JVM tier-1 compilation experiment
-took 1098.47 ms. These are individual negative experiments, not statistical
-comparisons or shipped changes. No production preparation, readiness-marker
-change, target suppression, settings/ownership relaxation, or JVM tuning was
-added. A supported engine improvement that makes current active-file analysis
-available before the original readiness boundary is still needed; this session
-has not established such an implementation.
+All 60 first results and all 1,800 warm results passed original-target checks.
+The nav3 miss is run `00`, not discarded or replaced. Baseline first requests
+passed the same correctness checks but met 500 ms in 0/60 lifecycles.
 
-Commands, raw lifecycle reports, profiling, experiment provenance, test results,
-and limits are retained in this checkout's
-`target/kotlin-first-navigation/VALIDATION.md` and `summary.json`. First-install
-download timing, actual project-open-to-rendered-first-jump measurements, packaging,
-and all other previously open rollout gates remain unverified by this change.
+Preparation has a startup cost. Median readiness changed from 2.788 to 2.887 s
+(sample) and 3.463 to 3.585 s (nav3). Median launch-to-original-content improved
+from 3.787 to 3.278 s and 5.248 to 3.941 s. Median server lifecycle CPU, including
+startup and all 31 definitions but excluding the shared Gradle daemon, changed
+from 12.15 to 12.78 CPU-seconds and 17.23 to 16.06 CPU-seconds.
 
-Final regression validation passes the protocol self-test, 117/117 required native
-compatibility checks, the native GPUI navigation/acceptance and fresh-process
-restoration probe, 100 restoration scheduler seeds plus 400 Android lifecycle
-runs, CMD-hover/click and seven keyboard-navigation regressions, all 27 LSP-store
-tests, and focused `./script/clippy -p android_tools --offline`. Rust source is
-unchanged: the GPUI/LSP binaries were cloned from the identical integrated
-restoration tree, and their hashes/provenance are recorded in `source.json`.
-No newly built editor, production performance fix, or completion improvement is
-claimed. The README review notice is preserved.
+Individual fresh-index candidate observations were 25.541 / 26.225 s to readiness
+and 331.62 / 804.62 ms for first definition (sample / nav3). These are single
+observations, not percentile claims. The corresponding baseline observations were
+19.659 / 36.451 s and 1473.27 / 2354.47 ms. Dependencies were cached; these are not
+first-install measurements. Launch timing starts at subprocess creation rather
+than editor project-open or worktree scanning.
+
+A source trace established that public diagnostics intentionally return empty
+before diagnostics are enabled, so early diagnostic requests cannot do this work.
+An instrumented import also confirmed identical full entity graphs were republished
+as model changes. The retained failed experiments include provider consolidation,
+JVM tier-1 compilation, full diagnostics, semantic-token preparation, and
+cancellation on actual snapshot replacement (fresh nav3: 762.99 ms). Eager source
+mapping did not remove the remaining target-resolution work in a diagnostic run;
+that run overlapped a build and is excluded from performance claims.
+
+The current Rust source passes 100 focus-lifecycle scheduler seeds, 100 library
+history/restoration seeds, 29 hover-link tests, seven Go to Definition tests and
+focused release/all-targets/all-features Clippy for editor and android_tools. The
+packaged runtime passes 126/126 required native compatibility checks; three
+unadvertised prepareRename checks remain optional/unsupported. Protocol self-test,
+Python compilation, launcher syntax, Rust formatting and diff checks pass.
+
+The newly built optimized GPUI editor probe opens and focuses the file before
+readiness, invokes Go to Definition immediately afterward, and includes drawing
+in the measured action. All 30 independent processes per fixture passed exact
+read-only original-source selection and all 1,800 warm actions:
+
+| Persisted indexes, optimized GPUI | First p50 / p95 / max | Warm p95 | First actions <500 ms |
+| --- | ---: | ---: | ---: |
+| Android sample | 251.80 / 421.37 / 427.73 ms | 18.04 ms | 30/30 |
+| nav3-recipes | 375.58 / 429.32 / 438.54 ms | 24.92 ms | 30/30 |
+
+The maximum time from the original readiness wire notification to the first
+outbound definition was 8.56 / 11.08 ms. These are optimized GPUI test-window
+measurements, including test invariants, rather than a packaged application's
+GPU presentation timing. The earlier debug run took 2218 ms for a sample jump
+whose definition request took 219 ms; it is retained as correctness evidence only.
+
+Fresh-index native actions took 442.68 ms (sample) and 1450.06 ms (nav3). The
+latter spent 1208.04 ms in the definition request and 6.40 ms fetching original
+content, so server analysis remains the main fresh-import bottleneck. The first
+native nav3 attempt exhausted disk during RocksDB writes and failed navigation;
+its logs and failure report are retained separately from the successful retry.
+Only this task's generated indexes/build files were removed to make room.
+
+Native startup costs are also retained. Probe-start-to-readiness p50 / p95 / max
+was 3.324 / 3.764 / 9.542 s for the sample and 4.914 / 11.261 / 102.662 s for nav3.
+In nav3 run `29`, import succeeded at 3.345 s, but the first Indexing progress
+began at 102.589 s. The cause of that gap is unresolved; no startup-latency pass
+is claimed or outlier discarded. Probe-start timing includes test initialization
+and is not an editor project-open benchmark.
+
+The full optimized native compatibility/restoration probe also passes (33.96 s),
+including Compose acceptance and two source restorations through new server
+processes. All seven android_tools release tests pass. The final preparation
+experiment, excluding import directives, still took 858.41 ms for fresh nav3 and
+was not shipped.
+
+A final diagnostic trace confirms the active file is available and two preparation
+passes complete before the last fresh-index batch. That batch invalidates 27,917
+files and replaces the FIR storage. Further work must examine real first-index
+invalidation and subsequent analysis costs, rather than merely moving the focus
+hook earlier. The instrumented run later failed a RocksDB write due to disk
+exhaustion; its event ordering is retained, but its timings are excluded.
+
+Commands, raw reports (large wire logs compressed), source/runtime hashes and
+failed experiments are retained in this checkout's
+`target/kotlin-first-navigation/VALIDATION.md`, `summary.json` and
+`candidate-v2-summary.json`. Fresh-import nav3 latency, the persisted-index miss,
+the native startup outlier, installation/project-open timing and previously open
+rollout gates remain unverified or unmet. Persisted-index native action budgets
+pass; the fresh-import gate remains open. No PR is merged and no successor task
+is created. The README review notice is preserved.

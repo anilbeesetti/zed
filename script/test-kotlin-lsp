@@ -105,6 +105,7 @@ class Probe:
         self.results["started_at_unix_seconds"] = time.time()
         self.progress, self.index_finished, self.import_finished = {}, False, False
         self.wire_seconds = 0
+        self.preparation_request_id = None
 
         def reader():
             try:
@@ -192,6 +193,8 @@ class Probe:
             raise ProbeError("transport_error", str(message))
         self.record("server", message)
         method, params = message.get("method"), message.get("params", {})
+        if method is None and message.get("id") is not None and message.get("id") == getattr(self, "preparation_request_id", None):
+            self.results["preparation_response"] = message
         if method in ("$/progress", "intellij/importLog", "intellij/workspaceImportStatus", "window/showMessage", "window/logMessage"):
             self.results["events"].append({"seconds": round(time.monotonic() - self.started, 3), "method": method, "params": params})
         if method == "$/progress":
@@ -651,12 +654,32 @@ def run(probe, args, source):
     probe.notify("initialized", {})
     if not args.model_only:
         probe.notify("textDocument/didOpen", {"textDocument": {"uri": probe.uri, "languageId": "kotlin", "version": probe.version, "text": source}})
+    if getattr(args, "prepare_active_file", False):
+        command = "zed.prepareKotlinFile"
+        if command not in capabilities.get("executeCommandProvider", {}).get("commands", []):
+            raise ProbeError("unsupported_protocol", "The server does not advertise active-file preparation")
+        probe.identifier += 1
+        probe.preparation_request_id = probe.identifier
+        probe.results["preparation_dispatch_seconds"] = time.monotonic() - probe.started
+        probe.send(id=probe.identifier, method="workspace/executeCommand", params={"command": command, "arguments": [1, probe.uri]})
     probe.ready(args.timeout)
     if args.navigation_only:
         first_navigation(probe, args.navigation_symbol, args.navigation_samples, args.require_original_sources)
+    if getattr(args, "prepare_active_file", False):
+        response = probe.results.get("preparation_response", {})
+        probe.check("active_file_preparation_accepted", "result" in response and "error" not in response, response)
+    if args.navigation_only:
         probe.check("import_and_indexing_completed", True)
         return
     probe.check("import_and_indexing_completed", True)
+    if getattr(args, "prepare_active_file", False):
+        for name, arguments in (("arity", []), ("generation", [0, None]), ("string_generation", ["1", probe.uri]),
+                                ("closed_document", [2, probe.uri + ".closed"]), ("document_type", [2, {}])):
+            response = probe.request("workspace/executeCommand", {"command": "zed.prepareKotlinFile", "arguments": arguments})
+            probe.check("preparation_rejects_" + name, response.get("error", {}).get("code") == -32602, response)
+        for name, arguments in (("stop", [1, None]), ("refocus", [2, probe.uri]), ("stale_stop", [1, None])):
+            response = probe.request("workspace/executeCommand", {"command": "zed.prepareKotlinFile", "arguments": arguments})
+            probe.check("preparation_accepts_" + name, "result" in response and "error" not in response, response)
     if args.performance_samples:
         process_memory(probe, "after_readiness")
     probe.results["import_status"] = probe.request("intellij/workspaceImportStatus", {})
@@ -846,7 +869,7 @@ def self_test():
         operations.append(method)
         probe.results["requests"].append({"method": method, "milliseconds": 1})
         if method == "initialize":
-            return {"result": {"serverInfo": {"version": "ILS-test"}, "capabilities": {"textDocumentSync": 2}}}
+            return {"result": {"serverInfo": {"version": "ILS-test"}, "capabilities": {"textDocumentSync": 2, "executeCommandProvider": {"commands": ["zed.prepareKotlinFile"]}}}}
         assert method == "textDocument/definition"
         return {"result": [{"uri": "file:///target.kt"}]}
     probe.request = request
@@ -855,6 +878,18 @@ def self_test():
                               require_original_sources=False), probe.text)
     assert operations[:5] == ["initialize", "initialized", "textDocument/didOpen", "ready", "textDocument/definition"]
     assert len(probe.results["first_navigation"]["warm"]["milliseconds"]) == 30
+    assert all(passed for _, passed in probe.results["checks"])
+    operations.clear()
+    probe.identifier = 0
+    def send(**message):
+        operations.append(message["method"])
+        assert message["params"] == {"command": "zed.prepareKotlinFile", "arguments": [1, probe.uri]}
+        probe.results["preparation_response"] = {"id": message["id"], "result": None}
+    probe.send = send
+    run(probe, SimpleNamespace(java_home="/jdk", expected_release="test", model_only=False, timeout=1,
+                              navigation_only=True, navigation_symbol="target", navigation_samples=30,
+                              require_original_sources=False, prepare_active_file=True), probe.text)
+    assert operations[:6] == ["initialize", "initialized", "textDocument/didOpen", "workspace/executeCommand", "ready", "textDocument/definition"]
     assert all(passed for _, passed in probe.results["checks"])
     print("PASS protocol self-test")
 
@@ -883,6 +918,7 @@ def main():
     parser.add_argument("--navigation-samples", type=int, default=0, help="Additional warm definitions (0 or at least 30), separate from the first request")
     parser.add_argument("--system-path", type=Path, help="Reuse these indexes across fresh server processes, keeping a separate --output for every lifecycle")
     parser.add_argument("--buffer-wire", action="store_true", help="Keep wire logs in memory until process exit; report serialization overhead separately")
+    parser.add_argument("--prepare-active-file", action="store_true", help="Request the editor's bounded active-file preparation immediately after didOpen, without waiting before first navigation")
     parser.add_argument("--plugins", type=Path, help="Isolated IntelliJ plugin directory for engine compatibility experiments")
     parser.add_argument("--warmup", choices=("none", "diagnostics", "document-symbols", "hover"), default="none", help="One bounded active-file request after indexing, before navigation; measured separately")
     parser.add_argument("--jfr", action="store_true", help="Capture a bounded server Java Flight Recorder profile; adds profiling overhead")
@@ -902,6 +938,8 @@ def main():
         parser.error("--navigation-samples must be 0 or at least 30")
     if args.navigation_samples and not args.navigation_only:
         parser.error("--navigation-samples requires --navigation-only")
+    if args.prepare_active_file and args.model_only:
+        parser.error("--prepare-active-file requires an open source document")
     if args.navigation_only and (args.model_only or args.extended or args.performance_samples or args.warmup != "none"):
         parser.error("--navigation-only cannot run model, completion or warmup checks")
     if not args.model_only and not args.navigation_only and not args.variant.endswith(("Debug", "Release")) and not args.expected_library_variant:

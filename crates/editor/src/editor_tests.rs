@@ -22001,6 +22001,153 @@ async fn test_completion_can_run_commands(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_kotlin_preparation_follows_editor_focus(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/project"), json!({"Main.kt": "fun main() {}"}))
+        .await;
+    let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+    let languages = project.read_with(cx, |project, _| project.languages().clone());
+    languages.add(Arc::new(language::Language::new(
+        LanguageConfig {
+            name: "Kotlin".into(),
+            matcher: LanguageMatcher {
+                path_suffixes: vec!["kt".into()],
+                ..Default::default()
+            }
+            .into(),
+            ..Default::default()
+        },
+        None,
+    )));
+    let commands = Arc::new(Mutex::new(Vec::new()));
+    let mut servers = languages.register_fake_lsp(
+        "Kotlin",
+        FakeLspAdapter {
+            name: "kotlin-lsp",
+            capabilities: lsp::ServerCapabilities {
+                text_document_sync: Some(lsp::TextDocumentSyncCapability::Kind(
+                    lsp::TextDocumentSyncKind::INCREMENTAL,
+                )),
+                execute_command_provider: Some(lsp::ExecuteCommandOptions {
+                    commands: vec!["zed.prepareKotlinFile".into()],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            initializer: Some(Box::new({
+                let commands = commands.clone();
+                move |server| {
+                    let commands = commands.clone();
+                    server.set_request_handler::<lsp::request::ExecuteCommand, _, _>(
+                        move |params, _| {
+                            commands.lock().push(params);
+                            async { Ok(None) }
+                        },
+                    );
+                }
+            })),
+            ..Default::default()
+        },
+    );
+    let (buffer, _registration) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/project/Main.kt"), cx)
+        })
+        .await
+        .expect("Kotlin buffer");
+    let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+    let (editor, cx) = cx.add_window_view(|window, cx| {
+        build_editor_with_project(project.clone(), buffer, window, cx)
+    });
+    let _server = servers.next().await.expect("Kotlin server");
+    cx.run_until_parked();
+    editor.update_in(cx, |editor, window, cx| {
+        window.activate_window();
+        window.focus(&editor.focus_handle, cx)
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.run_until_parked();
+    let first = commands
+        .lock()
+        .last()
+        .cloned()
+        .expect("focused file preparation");
+    assert_eq!(first.command, "zed.prepareKotlinFile");
+    assert_eq!(
+        first.arguments.last(),
+        Some(&json!(
+            lsp::Uri::from_file_path(path!("/project/Main.kt")).expect("file URI")
+        ))
+    );
+    let generation = first
+        .arguments
+        .first()
+        .and_then(|value| value.as_u64())
+        .expect("generation");
+    let count = commands.lock().len();
+    editor.update_in(cx, |editor, window, cx| {
+        editor.update_lsp_data(None, window, cx);
+        editor.update_lsp_data(None, window, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        commands.lock().len(),
+        count,
+        "unchanged focus must not restart preparation"
+    );
+    let other_focus = cx.update(|window, cx| {
+        let focus = cx.focus_handle();
+        window.focus(&focus, cx);
+        focus
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.run_until_parked();
+    assert_eq!(
+        commands.lock().last().expect("stop command").arguments,
+        vec![json!(generation), json!(null)]
+    );
+    editor.update_in(cx, |editor, window, cx| {
+        window.focus(&editor.focus_handle, cx)
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.run_until_parked();
+    assert!(
+        commands
+            .lock()
+            .last()
+            .expect("refocus command")
+            .arguments
+            .first()
+            .and_then(|value| value.as_u64())
+            .is_some_and(|next| next > generation)
+    );
+    cx.deactivate_window();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.run_until_parked();
+    let count = commands.lock().len();
+    assert_eq!(
+        commands
+            .lock()
+            .last()
+            .expect("inactive stop")
+            .arguments
+            .last(),
+        Some(&json!(null))
+    );
+    editor.update_in(cx, |editor, window, cx| {
+        editor.update_lsp_data(None, window, cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        commands.lock().len(),
+        count,
+        "background updates must not restart preparation"
+    );
+    drop(other_focus);
+}
+
+#[gpui::test]
 async fn test_kotlin_command_completions_refresh_after_typing_and_backspace(
     cx: &mut TestAppContext,
 ) {
@@ -22446,19 +22593,28 @@ async fn test_real_kotlin_editor_completion_and_navigation(cx: &mut TestAppConte
     let completion_refinement = config["completion_refinement"] == true;
     let started = Instant::now();
     let mut report = json!({
-        "harness": "real Kotlin subprocess, RealFs, GPUI test window, debug client",
+        "harness": "real Kotlin subprocess, RealFs, GPUI test window",
+        "debug_assertions": cfg!(debug_assertions),
         "root": root, "source": source_path, "client_pid": std::process::id(),
         "samples": [], "memory": [], "phase": "starting",
         "completion_preparation": if completion_refinement { "delete and retype only the prefix using Editor actions" } else { "replace whole function before typing each prefix" },
         "warm_samples": warm_samples, "completion_warm_samples": completion_warm_samples,
         "request_order": ["definition_after_edit", "definition_unchanged", "string", "modifier", "named_argument", "acceptance"],
     });
+    let wire_log = Arc::new(Mutex::new(Vec::new()));
     let write_report = |report: &serde_json::Value| {
         std::fs::write(
             output.join("results.json"),
             serde_json::to_vec_pretty(report).expect("serialize report"),
         )
         .expect("write report");
+        let mut wire = std::io::BufWriter::new(
+            std::fs::File::create(output.join("wire.jsonl")).expect("wire log"),
+        );
+        for entry in wire_log.lock().iter() {
+            writeln!(wire, "{entry}").expect("write wire log");
+        }
+        wire.flush().expect("flush wire log");
     };
     write_report(&report);
 
@@ -22567,10 +22723,9 @@ async fn test_real_kotlin_editor_completion_and_navigation(cx: &mut TestAppConte
     let mut import_finished = false;
     let mut saw_indexing = false;
     let mut indexing = HashSet::default();
-    let mut wire_log = std::fs::File::create(output.join("wire.jsonl")).expect("wire log");
+    let wire_log = wire_log.clone();
     let _io = server.on_io(move |kind, message| {
-        writeln!(wire_log, "{}", json!({"seconds": started.elapsed().as_secs_f64(), "kind": format!("{kind:?}"), "message": message}))
-            .expect("write wire log");
+        wire_log.lock().push(json!({"seconds": started.elapsed().as_secs_f64(), "kind": format!("{kind:?}"), "message": message}));
         let Ok(message) = serde_json::from_str::<serde_json::Value>(message) else { return; };
         if !matches!(kind, lsp::IoKind::StdOut) { return; }
         let params = &message["params"];
@@ -22597,31 +22752,6 @@ async fn test_real_kotlin_editor_completion_and_navigation(cx: &mut TestAppConte
             if let Some(ready) = ready.take() { ready.send(Ok(())).expect("readiness receiver"); }
         }
     });
-    let mut readiness = readiness.fuse();
-    let readiness_started = Instant::now();
-    loop {
-        let heartbeat = cx.executor().timer(Duration::from_secs(1)).fuse();
-        futures::pin_mut!(heartbeat);
-        futures::select_biased! {
-            result = readiness => {
-                result.expect("readiness notification").expect("import and indexing succeeded");
-                break;
-            },
-            _ = heartbeat => assert!(readiness_started.elapsed() < Duration::from_secs(180), "real Kotlin import timed out"),
-        }
-    }
-    report["ready_milliseconds"] = json!(started.elapsed().as_secs_f64() * 1000.0);
-    report["memory"]
-        .as_array_mut()
-        .expect("memory samples")
-        .push(kotlin_live_memory("ready", server.process_id().expect("server PID")).await);
-    report["phase"] = json!("editor");
-    write_report(&report);
-    eprintln!(
-        "real Kotlin import/index ready in {} ms",
-        report["ready_milliseconds"]
-    );
-
     let (multi_workspace, cx) =
         cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
     let workspace = multi_workspace.read_with(cx, |multi, _| multi.workspace().clone());
@@ -22639,8 +22769,134 @@ async fn test_real_kotlin_editor_completion_and_navigation(cx: &mut TestAppConte
     });
     editor.update_in(cx, |editor, window, cx| {
         editor.disable_word_completions();
+        window.activate_window();
         window.focus(&editor.focus_handle(cx), cx);
     });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let mut readiness = readiness.fuse();
+    let readiness_started = Instant::now();
+    loop {
+        let heartbeat = cx.executor().timer(Duration::from_secs(1)).fuse();
+        futures::pin_mut!(heartbeat);
+        futures::select_biased! {
+            result = readiness => {
+                result.expect("readiness notification").expect("import and indexing succeeded");
+                break;
+            },
+            _ = heartbeat => assert!(readiness_started.elapsed() < Duration::from_secs(180), "real Kotlin import timed out"),
+        }
+    }
+    report["ready_milliseconds"] = json!(started.elapsed().as_secs_f64() * 1000.0);
+    if config["first_navigation_only"] == true {
+        report["request_order"] = json!(["first_after_readiness", "warm"]);
+        let symbol = config["navigation_symbol"]
+            .as_str()
+            .unwrap_or("headlineSmall");
+        let position = MultiBufferOffset(
+            original_disk_text
+                .rfind(symbol)
+                .expect("first navigation symbol")
+                + 1,
+        );
+        for sample in 0..=warm_samples {
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.activate_item(&editor, true, true, window, cx);
+            });
+            editor.update_in(cx, |editor, window, cx| {
+                editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                    selections.select_ranges([position..position])
+                });
+            });
+            let sample_started = Instant::now();
+            let sample_start_seconds = started.elapsed().as_secs_f64();
+            let navigated = editor
+                .update_in(cx, |editor, window, cx| {
+                    editor.go_to_definition(&GoToDefinition::default(), window, cx)
+                })
+                .await;
+            let navigation_milliseconds = sample_started.elapsed().as_secs_f64() * 1000.0;
+            if !matches!(navigated, Ok(Navigated::Yes)) {
+                report["failure"] = json!(format!("First-navigation probe returned {navigated:?}"));
+                report["samples"]
+                    .as_array_mut()
+                    .expect("samples")
+                    .push(json!({
+                        "scenario": if sample == 0 { "first_after_readiness" } else { "warm" },
+                        "sample": sample, "start_seconds": sample_start_seconds,
+                        "navigation_milliseconds": navigation_milliseconds, "failed": true,
+                    }));
+                write_report(&report);
+                panic!("{}", report["failure"]);
+            }
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            let milliseconds = sample_started.elapsed().as_secs_f64() * 1000.0;
+            let target = workspace.read_with(cx, |workspace, cx| {
+                workspace
+                    .active_item_as::<Editor>(cx)
+                    .expect("definition editor")
+            });
+            let target = target.update(cx, |target, cx| {
+                let point = target
+                    .selections
+                    .newest::<Point>(&target.display_snapshot(cx))
+                    .start;
+                let snapshot = target.buffer.read(cx).snapshot(cx);
+                let selected = snapshot
+                    .text_for_range(
+                        point..Point::new(point.row, point.column + symbol.len() as u32),
+                    )
+                    .collect::<String>();
+                assert_eq!(
+                    selected, symbol,
+                    "the editor must land on the original declaration range"
+                );
+                let buffer = target
+                    .buffer
+                    .read(cx)
+                    .as_singleton()
+                    .expect("definition buffer");
+                let buffer = buffer.read(cx);
+                assert!(buffer.read_only());
+                let uri = buffer
+                    .language_server_document()
+                    .expect("definition owner")
+                    .uri
+                    .clone();
+                assert!(uri.as_str().ends_with(".kt"));
+                uri
+            });
+            report["samples"].as_array_mut().expect("samples").push(json!({
+                "scenario": if sample == 0 { "first_after_readiness" } else { "warm" },
+                "sample": sample, "start_seconds": sample_start_seconds,
+                "navigation_milliseconds": navigation_milliseconds, "milliseconds": milliseconds,
+                "target": target,
+            }));
+        }
+        report["phase"] = json!("complete");
+        write_report(&report);
+        lsp_store
+            .update(cx, |store, cx| {
+                store.stop_language_servers_for_buffers(vec![buffer], HashSet::default(), cx)
+            })
+            .await
+            .expect("stop real language server");
+        assert_eq!(
+            std::fs::read_to_string(&source_path).expect("source after probe"),
+            original_disk_text
+        );
+        return;
+    }
+    report["memory"]
+        .as_array_mut()
+        .expect("memory samples")
+        .push(kotlin_live_memory("ready", server.process_id().expect("server PID")).await);
+    report["phase"] = json!("editor");
+    write_report(&report);
+    eprintln!(
+        "real Kotlin import/index ready in {} ms",
+        report["ready_milliseconds"]
+    );
+
     let source = "package liveclientprobe\nimport androidx.compose.runtime.Composable\nimport androidx.compose.ui.Modifier\nimport androidx.compose.material3.Text\nimport androidx.compose.material3.MaterialTheme\n\n";
     let mut definition_editor_id = None;
     for (scenario, replace_text) in [

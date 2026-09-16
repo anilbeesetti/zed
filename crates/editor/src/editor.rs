@@ -1169,6 +1169,7 @@ pub struct Editor {
     next_review_comment_id: usize,
     hovered_diff_hunk_row: Option<DisplayRow>,
     pull_diagnostics_task: Task<()>,
+    kotlin_preparation: Option<(LanguageServerId, lsp::Uri, u64)>,
     in_project_search: bool,
     previous_search_ranges: Option<Arc<[Range<Anchor>]>>,
     breadcrumb_header: Option<String>,
@@ -2010,6 +2011,7 @@ impl Editor {
         );
 
         let full_mode = mode.is_full();
+        cx.on_release(Self::stop_kotlin_preparation).detach();
         let is_minimap = mode.is_minimap();
         let diagnostics_max_severity = if full_mode {
             EditorSettings::get_global(cx)
@@ -2546,6 +2548,7 @@ impl Editor {
                 .unwrap_or_default(),
             runnables: RunnableData::new(),
             pull_diagnostics_task: Task::ready(()),
+            kotlin_preparation: None,
             colors: None,
             code_lens: None,
             refresh_colors_task: Task::ready(()),
@@ -10876,6 +10879,7 @@ impl Editor {
 
     fn handle_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.cursor_animations.clear();
+        self.prepare_active_kotlin_file(window, cx);
         cx.emit(EditorEvent::Focused);
 
         if let Some(descendant) = self
@@ -10941,6 +10945,7 @@ impl Editor {
 
     pub fn handle_blur(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.cursor_animations.clear();
+        self.stop_kotlin_preparation(cx);
         self.blink_manager.update(cx, BlinkManager::disable);
         self.buffer
             .update(cx, |buffer, cx| buffer.remove_active_selections(cx));
@@ -11303,12 +11308,101 @@ impl Editor {
         self.enable_lsp_data && self.mode().is_full()
     }
 
+    fn stop_kotlin_preparation(&mut self, cx: &mut App) {
+        if let Some((server_id, _, generation)) = self.kotlin_preparation.take()
+            && let Some(project) = &self.project
+        {
+            project.read(cx).lsp_store().update(cx, |store, cx| {
+                if store.language_server_for_id(server_id).is_some() {
+                    store
+                        .execute_lsp_command(
+                            server_id,
+                            "zed.prepareKotlinFile".into(),
+                            vec![generation.into(), serde_json::Value::Null],
+                            cx,
+                        )
+                        .detach_and_log_err(cx);
+                }
+            });
+        }
+    }
+
+    fn prepare_active_kotlin_file(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if !window.is_window_active() || !self.is_focused(window) || !self.lsp_data_enabled() {
+            self.stop_kotlin_preparation(cx);
+            return;
+        }
+        let candidate = self.project.as_ref().and_then(|project| {
+            let buffer = self.buffer.read(cx).as_singleton()?;
+            let store = project.read(cx).lsp_store();
+            store.update(cx, |store, cx| {
+                buffer.update(cx, |buffer, cx| {
+                    if buffer.language()?.name().as_ref() != "Kotlin" {
+                        return None;
+                    }
+                    let buffer_id = buffer.remote_id();
+                    let opened = store.language_server_ids_for_opened_buffer(buffer_id)?;
+                    let server_id = store
+                        .running_language_servers_for_local_buffer(buffer, cx)
+                        .find(|(_, server)| {
+                            opened.contains(&server.server_id())
+                                && server.name().0.as_ref() == "kotlin-lsp"
+                                && server
+                                    .capabilities()
+                                    .execute_command_provider
+                                    .as_ref()
+                                    .is_some_and(|provider| {
+                                        provider
+                                            .commands
+                                            .iter()
+                                            .any(|command| command == "zed.prepareKotlinFile")
+                                    })
+                        })?
+                        .1
+                        .server_id();
+                    let path = buffer.file()?.as_local()?.abs_path(cx);
+                    let uri = project::lsp_command::file_path_to_lsp_url(&path).log_err()?;
+                    Some((server_id, uri))
+                })
+            })
+        });
+        if let Some((server_id, uri)) = &candidate
+            && self
+                .kotlin_preparation
+                .as_ref()
+                .is_some_and(|(current_server, current_uri, _)| {
+                    current_server == server_id && current_uri == uri
+                })
+        {
+            return;
+        }
+        self.stop_kotlin_preparation(cx);
+        if let Some((server_id, uri)) = candidate
+            && let Some(project) = &self.project
+        {
+            static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+            let generation = GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.kotlin_preparation = Some((server_id, uri.clone(), generation));
+            project.read(cx).lsp_store().update(cx, |store, cx| {
+                store
+                    .execute_lsp_command(
+                        server_id,
+                        "zed.prepareKotlinFile".into(),
+                        vec![generation.into(), uri.to_string().into()],
+                        cx,
+                    )
+                    .detach_and_log_err(cx);
+            });
+        }
+    }
+
     fn update_lsp_data(
         &mut self,
         for_buffer: Option<BufferId>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) {
+        self.prepare_active_kotlin_file(window, cx);
         if !self.lsp_data_enabled() {
             return;
         }
