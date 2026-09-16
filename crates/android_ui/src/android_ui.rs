@@ -852,8 +852,7 @@ impl AndroidPanel {
             show_command: true,
             ..Default::default()
         };
-        let task = template.resolve_task("android", &TaskContext { cwd: Some(root), ..Default::default() })
-            .context("Could not resolve the Android command. Check the project path and tool configuration.")?;
+        let task = resolve_android_task(template, "android", root)?;
         let panel = cx.weak_entity();
         self.workspace.update(cx, |workspace, cx| {
             workspace.schedule_resolved_task_with_completion(TaskSourceKind::UserInput, task, false, move |result, cx| {
@@ -1426,15 +1425,7 @@ impl AndroidPanel {
                 show_command: true,
                 ..Default::default()
             };
-            let task = template
-                .resolve_task(
-                    "android-logcat",
-                    &TaskContext {
-                        cwd: Some(root),
-                        ..Default::default()
-                    },
-                )
-                .context("Could not resolve the Logcat command.")?;
+            let task = resolve_android_task(template, "android-logcat", root)?;
             self.workspace.update(cx, |workspace, cx| {
                 workspace.schedule_resolved_task(TaskSourceKind::UserInput, task, false, window, cx)
             })?;
@@ -2436,6 +2427,40 @@ fn kotlin_settings(
         })
 }
 
+fn resolve_android_task(
+    mut template: TaskTemplate,
+    id: &str,
+    root: PathBuf,
+) -> Result<task::ResolvedTask> {
+    let shell = template.shell.shell_kind(cfg!(windows));
+    // Task terminals join shell fragments; Android tools supply literal paths and arguments.
+    // Escape dollars for template expansion after quoting them for the shell.
+    template.command = shell
+        .try_quote_prefix_aware(&template.command)
+        .context("The Android command contains an invalid shell character")?
+        .replace('$', "$$");
+    template.args = template
+        .args
+        .iter()
+        .map(|argument| {
+            shell
+                .try_quote(argument)
+                .map(|quoted| quoted.replace('$', "$$"))
+                .context("An Android argument contains an invalid shell character")
+        })
+        .collect::<Result<_>>()?;
+    template.label = template.label.replace('$', "$$");
+    template
+        .resolve_task(
+            id,
+            &TaskContext {
+                cwd: Some(root),
+                ..Default::default()
+            },
+        )
+        .context("Could not resolve the Android command. Check the project path and tool configuration.")
+}
+
 async fn connected_devices(
     executor: &BackgroundExecutor,
 ) -> Result<(Vec<Device>, HashMap<String, String>)> {
@@ -2550,6 +2575,62 @@ mod tests {
     };
     use serde_json::json;
     use workspace::AppState;
+
+    #[cfg(unix)]
+    #[test]
+    fn android_tasks_preserve_literal_arguments() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let program = directory.path().join("Android SDK's (test) $ZED_UNKNOWN");
+        std::os::unix::fs::symlink("/bin/sh", &program)?;
+        let arguments: Vec<String> = vec![
+            "-c".into(),
+            "printf '%s\\0' \"$@\"".into(),
+            "android-task".into(),
+            "--device=adb-test-device (2)._adb-tls-connect._tcp".into(),
+            "--apks=/project's APKs (debug)/$ZED_UNKNOWN/app*.apk".into(),
+            "--debug".into(),
+            String::new(),
+            "$HOME ${ZED_UNKNOWN} $(printf substitution) `printf command` ; & |".into(),
+        ];
+        let expected: Vec<u8> = arguments
+            .iter()
+            .skip(3)
+            .flat_map(|argument| argument.bytes().chain([0]))
+            .collect();
+        for shell in ["/bin/sh", "/bin/zsh"] {
+            if shell == "/bin/zsh" && !cfg!(target_os = "macos") {
+                continue;
+            }
+            let task = resolve_android_task(
+                TaskTemplate {
+                    label: "Android Run $ZED_UNKNOWN".into(),
+                    command: program.to_string_lossy().into_owned(),
+                    args: arguments.clone(),
+                    shell: task::Shell::Program(shell.into()),
+                    ..Default::default()
+                },
+                "android",
+                directory.path().into(),
+            )?;
+            assert_eq!(task.resolved.full_label, "Android Run $ZED_UNKNOWN");
+            let (program, arguments) = task::ShellBuilder::new(&task.resolved.shell, false)
+                .non_interactive()
+                .build_no_quote(task.resolved.command, &task.resolved.args);
+            let output = futures::executor::block_on(
+                new_command(program)
+                    .args(arguments)
+                    .current_dir(directory.path())
+                    .output(),
+            )?;
+            assert!(
+                output.status.success(),
+                "{shell}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(output.stdout, expected, "{shell}");
+        }
+        Ok(())
+    }
 
     #[test]
     fn android_model_inputs_include_build_logic_and_exclude_outputs() {
