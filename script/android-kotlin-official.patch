@@ -193,29 +193,18 @@
  private class LinkApplicationAndroidResourcesTaskReflection(val project: Project, val reflected: Reflected.Instance) {
 --- a/workspace-import/src/com/jetbrains/ls/imports/gradle/SourceSetDependencyResolver.kt
 +++ b/workspace-import/src/com/jetbrains/ls/imports/gradle/SourceSetDependencyResolver.kt
-@@ -165,7 +165,9 @@
- 
-         androidProject.dependencies.forEach { dependency ->
-             if (dependency is AndroidDependency.Library) {
+@@ -148 +148,2 @@
+-            moduleDependencies.forEach { dependency ->
++            // Gradle returns a set; unstable source-archive order otherwise invalidates an unchanged model.
++            moduleDependencies.sortedWith(compareBy({ it.file.path }, { it.sources?.path })).forEach { dependency ->
+@@ -168 +169,3 @@
 -                val libraryName = dependency.libraryName()
 +                val libraryName = dependency.libraryName().let { name ->
 +                    if (dependency.group == "android" && dependency.name == "r") "$name:${module.name}.${androidProject.activeVariant}" else name
 +                }
-                 artifacts += dependency.classpath
-                 projectLibraryIndex.add(
-                     LibraryData(
-@@ -192,6 +194,7 @@
-                 dependency.classpath.forEach { artifactFile ->
-                     val targetProject = androidProjectsByBuildTreePath[dependency.projectPath] ?: return@forEach
-                     val targetProjectFqn = project.androidProjects.entries.firstOrNull { it.value == targetProject }?.key ?: return@forEach
+@@ -194,0 +198 @@
 +                    artifacts += artifactFile
-                     dependencyFileIndex.add(
-                         artifactFile,
-                         DependencyData.Module(
-@@ -256,4 +259,4 @@
-     }
- }
- 
+@@ -259 +263 @@
 -private fun AndroidDependency.Library.libraryName(): String = "Gradle: $group:$name:$version"
 \ No newline at end of file
 +private fun AndroidDependency.Library.libraryName(): String = "Gradle: $group:$name:$version"
@@ -306,3 +295,42 @@
                  throwLspError(RenameRequestType, "This element cannot be renamed", Unit, ErrorCodes.InvalidParams)
              }
              return LSRenameProcessor(target.project, target, context.newName, false, false)
+--- a/features-impl/kotlin/src/com/jetbrains/ls/api/features/impl/kotlin/apiImpl/LLFirSessionCacheStorageComponent.kt
++++ b/features-impl/kotlin/src/com/jetbrains/ls/api/features/impl/kotlin/apiImpl/LLFirSessionCacheStorageComponent.kt
+@@ -40 +40,5 @@
+-            is WorkspaceEvent.InvalidateFiles -> state.invalidate(event.files.toList(), AnalyzerContext.current.project)
++            is WorkspaceEvent.InvalidateFiles -> {
++                val files = event.files.toList()
++                // Empty index publications must retain sessions still being prepared by concurrent readers.
++                if (files.isEmpty()) state else state.invalidate(files, AnalyzerContext.current.project)
++            }
+--- a/features-impl/kotlin/src/com/jetbrains/ls/api/features/impl/kotlin/configuration/LSKotlinLanguageConfiguration.kt
++++ b/features-impl/kotlin/src/com/jetbrains/ls/api/features/impl/kotlin/configuration/LSKotlinLanguageConfiguration.kt
+@@ -1,0 +2,2 @@
++@file:OptIn(EntityStorageInstrumentationApi::class)
++
+@@ -5,0 +8,4 @@
++import com.intellij.platform.workspace.storage.ImmutableEntityStorage
++import com.intellij.platform.workspace.storage.MutableEntityStorage
++import com.intellij.platform.workspace.storage.instrumentation.EntityStorageInstrumentationApi
++import com.intellij.platform.workspace.storage.instrumentation.MutableEntityStorageInstrumentation
+@@ -60,0 +67,2 @@
++        WorkspaceComponentEntry { KotlinPreparationComponent },
++        KotlinNavigationPreparation,
+@@ -118,0 +127 @@
++    val entities: ImmutableEntityStorage? = null,
+@@ -127,2 +136,12 @@
+-            is WorkspaceEvent.WorkspaceModelChanged ->
+-                KotlinWorkspaceState(createKotlinWorkspaceModelCaches(AnalyzerContext.current.project))
++            is WorkspaceEvent.WorkspaceModelChanged -> {
++                val current = event.workspaceModel.entityStore
++                // Re-import can publish the same model while active-file analysis is still populating these caches.
++                val unchanged = state.entities?.let { previous ->
++                    val comparison = MutableEntityStorage.from(previous)
++                    comparison.replaceBySource({ true }, current)
++                    (comparison as MutableEntityStorageInstrumentation).hasSameEntities()
++                } ?: false
++                if (unchanged) state else KotlinWorkspaceState(
++                    createKotlinWorkspaceModelCaches(AnalyzerContext.current.project), current
++                )
++            }
