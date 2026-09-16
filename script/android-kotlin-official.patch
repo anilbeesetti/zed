@@ -334,3 +334,333 @@
 +                    createKotlinWorkspaceModelCaches(AnalyzerContext.current.project), current
 +                )
 +            }
+--- /dev/null
++++ b/zed-completion/LLFirSoftLazyValue.kt
+@@ -0,0 +1,24 @@
++/*
++ * Copyright 2010-2024 JetBrains s.r.o. and Kotlin Programming Language contributors.
++ * Use of this source code is governed by the Apache 2.0 license that can be found in the license/LICENSE.txt file.
++ */
++
++// Adapted from JetBrains/kotlin@7835533005e2359b3a9d5bb767337082e6f6bcbc for the pinned 2.5.0-dev-5674 ABI.
++package org.jetbrains.kotlin.analysis.low.level.api.fir.caches
++
++import com.intellij.openapi.project.Project
++import com.intellij.openapi.util.ModificationTracker
++import com.intellij.psi.util.CachedValue
++import com.intellij.psi.util.CachedValueProvider
++import com.intellij.util.CachedValueImpl
++import org.jetbrains.kotlin.fir.caches.FirLazyValue
++
++internal class LLFirSoftLazyValue<V>(@Suppress("UNUSED_PARAMETER") project: Project, createValue: () -> V) : FirLazyValue<V>() {
++    // The server wraps CachedValuesManager values per snapshot, even with NEVER_CHANGED.
++    // FIR sessions already own invalidation; retain their soft values across document edits.
++    private val cachedValue: CachedValue<V> = CachedValueImpl {
++        CachedValueProvider.Result(createValue(), ModificationTracker.NEVER_CHANGED)
++    }
++
++    override fun getValue(): V = cachedValue.getValue()
++}
+--- /dev/null
++++ b/zed-completion/FirCompositeSymbolProvider.kt
+@@ -0,0 +1,100 @@
++/*
++ * Copyright 2010-2023 JetBrains s.r.o. and Kotlin Programming Language contributors.
++ * Use of this source code is governed by the Apache 2.0 license that can be found in the license/LICENSE.txt file.
++ */
++
++// Adapted from JetBrains/kotlin@7835533005e2359b3a9d5bb767337082e6f6bcbc for the pinned 2.5.0-dev-5674 ABI.
++package org.jetbrains.kotlin.fir.resolve.providers.impl
++
++import org.jetbrains.kotlin.fir.caches.createCache
++import org.jetbrains.kotlin.fir.caches.firCachesFactory
++import org.jetbrains.kotlin.fir.caches.getValue
++import org.jetbrains.kotlin.fir.FirSession
++import org.jetbrains.kotlin.fir.NoMutableState
++import org.jetbrains.kotlin.fir.resolve.providers.FirCompositeCachedSymbolNamesProvider
++import org.jetbrains.kotlin.fir.resolve.providers.FirSymbolNamesProvider
++import org.jetbrains.kotlin.fir.resolve.providers.FirSymbolProvider
++import org.jetbrains.kotlin.fir.resolve.providers.FirSymbolProviderInternals
++import org.jetbrains.kotlin.fir.symbols.impl.FirCallableSymbol
++import org.jetbrains.kotlin.fir.symbols.impl.FirClassLikeSymbol
++import org.jetbrains.kotlin.fir.symbols.impl.FirNamedFunctionSymbol
++import org.jetbrains.kotlin.fir.symbols.impl.FirPropertySymbol
++import org.jetbrains.kotlin.name.ClassId
++import org.jetbrains.kotlin.name.FqName
++import org.jetbrains.kotlin.name.Name
++
++@NoMutableState
++class FirCompositeSymbolProvider(session: FirSession, val providers: List<FirSymbolProvider>) : FirSymbolProvider(session) {
++    private fun indexProviders(namesForProvider: (FirSymbolProvider) -> Set<Name>?): Pair<Map<Name, List<FirSymbolProvider>>, List<FirSymbolProvider>> {
++        val providersByName = mutableMapOf<Name, MutableList<FirSymbolProvider>>()
++        val unknownProviders = mutableListOf<FirSymbolProvider>()
++        // Unknown name sets participate in every lookup, in the original provider order.
++        for (provider in providers) {
++            val names = namesForProvider(provider)
++            if (names == null) {
++                unknownProviders.add(provider)
++                providersByName.values.forEach { it.add(provider) }
++            } else {
++                names.forEach { name -> providersByName.getOrPut(name) { unknownProviders.toMutableList() }.add(provider) }
++            }
++        }
++        return providersByName to unknownProviders
++    }
++
++    private val callableNamesByPackage by session.firCachesFactory.createPossiblySoftLazyValue {
++        session.firCachesFactory.createCache { packageName: FqName ->
++            indexProviders { it.symbolNamesProvider.getTopLevelCallableNamesInPackage(packageName) }
++        }
++    }
++
++    private val classifierNamesByPackage by session.firCachesFactory.createPossiblySoftLazyValue {
++        session.firCachesFactory.createCache { packageName: FqName ->
++            indexProviders { if (it.symbolNamesProvider.mayHaveSyntheticFunctionTypes) null else it.symbolNamesProvider.getTopLevelClassifierNamesInPackage(packageName) }
++        }
++    }
++
++    private fun callableProviders(packageName: FqName, name: Name): List<FirSymbolProvider> {
++        if (name.isSpecial) return providers
++        val (providersByName, unknownProviders) = callableNamesByPackage.getValue(packageName)
++        return providersByName[name] ?: unknownProviders
++    }
++
++    override val symbolNamesProvider: FirSymbolNamesProvider = FirCompositeCachedSymbolNamesProvider.fromSymbolProviders(session, providers)
++
++    override fun getTopLevelCallableSymbols(packageFqName: FqName, name: Name): List<FirCallableSymbol<*>> {
++        return callableProviders(packageFqName, name).flatMap { it.getTopLevelCallableSymbols(packageFqName, name) }
++    }
++
++    @FirSymbolProviderInternals
++    override fun getTopLevelCallableSymbolsTo(destination: MutableList<FirCallableSymbol<*>>, packageFqName: FqName, name: Name) {
++        destination += getTopLevelCallableSymbols(packageFqName, name)
++    }
++
++    @FirSymbolProviderInternals
++    override fun getTopLevelFunctionSymbolsTo(destination: MutableList<FirNamedFunctionSymbol>, packageFqName: FqName, name: Name) {
++        callableProviders(packageFqName, name).forEach {
++            it.getTopLevelFunctionSymbolsTo(destination, packageFqName, name)
++        }
++    }
++
++    @FirSymbolProviderInternals
++    override fun getTopLevelPropertySymbolsTo(destination: MutableList<FirPropertySymbol>, packageFqName: FqName, name: Name) {
++        callableProviders(packageFqName, name).forEach {
++            it.getTopLevelPropertySymbolsTo(destination, packageFqName, name)
++        }
++    }
++
++    override fun hasPackage(fqName: FqName): Boolean {
++        return providers.any { it.hasPackage(fqName) }
++    }
++
++    override fun getClassLikeSymbolByClassId(classId: ClassId): FirClassLikeSymbol<*>? {
++        val name = classId.outermostClassId.shortClassName
++        val candidates = if (name.isSpecial) providers else {
++            val (providersByName, unknownProviders) = classifierNamesByPackage.getValue(classId.packageFqName)
++            providersByName[name] ?: unknownProviders
++        }
++        return candidates.firstNotNullOfOrNull { it.getClassLikeSymbolByClassId(classId) }
++    }
++
++}
+--- a/zed-completion/KaFirCompletionCandidateChecker.kt
++++ b/zed-completion/KaFirCompletionCandidateChecker.kt
+@@ -2,6 +2,14 @@
+  * Copyright 2010-2026 JetBrains s.r.o. and Kotlin Programming Language contributors.
+  * Use of this source code is governed by the Apache 2.0 license that can be found in the license/LICENSE.txt file.
+  */
++
++@file:OptIn(
++    org.jetbrains.kotlin.analysis.api.KaImplementationDetail::class,
++    org.jetbrains.kotlin.analysis.api.KaIdeApi::class,
++    org.jetbrains.kotlin.analysis.api.KaExperimentalApi::class,
++    org.jetbrains.kotlin.analysis.api.KaPlatformInterface::class,
++    org.jetbrains.kotlin.fir.symbols.SymbolInternals::class,
++)
+
+ package org.jetbrains.kotlin.analysis.api.fir.components
+
+@@ -39,7 +47,13 @@
+ import org.jetbrains.kotlin.fir.symbols.impl.FirCallableSymbol
+ import org.jetbrains.kotlin.fir.symbols.impl.FirVariableSymbol
+ import org.jetbrains.kotlin.fir.symbols.lazyResolveToPhase
+-import org.jetbrains.kotlin.fir.types.receiverType
++import org.jetbrains.kotlin.fir.types.*
++import org.jetbrains.kotlin.fir.resolve.toSymbol
++import org.jetbrains.kotlin.fir.symbols.impl.FirTypeParameterSymbol
++import org.jetbrains.kotlin.fir.symbols.impl.FirRegularClassSymbol
++import org.jetbrains.kotlin.fir.expressions.FirSmartCastExpression
++import org.jetbrains.kotlin.name.StandardClassIds
++import org.jetbrains.kotlin.types.AbstractTypeChecker
+ import org.jetbrains.kotlin.psi.*
+ import org.jetbrains.kotlin.psi.psiUtil.getQualifiedExpressionForReceiver
+ import org.jetbrains.kotlin.utils.exceptions.errorWithAttachment
+@@ -98,6 +112,7 @@
+
+         val firSymbol = candidate.firSymbol as FirCallableSymbol<*>
+         firSymbol.lazyResolveToPhase(FirResolvePhase.STATUS)
++        if (isDefinitelyInapplicable(firSymbol)) return NonApplicable(token)
+
+         val resolutionMode = if (containingCallableReference != null) {
+             SingleCandidateResolutionMode.CHECK_EXTENSION_CALLABlE_REFERENCE_FOR_COMPLETION
+@@ -131,6 +146,41 @@
+         return implicitReceivers.firstNotNullOfOrNull(::processReceiver)
+             ?: processReceiver(null)
+             ?: NonApplicable(token)
++    }
++
++    private val explicitReceiverType by lazy {
++        val receiver = explicitReceiverInfo?.receiverExpression
++        val type = receiver?.resolvedType as? ConeClassLikeType
++        if (receiver is FirSmartCastExpression || receiver is FirResolvedQualifier || type == null ||
++            type.lookupTag.toSymbol(firCallSiteSession) !is FirRegularClassSymbol ||
++            type.lookupTag.classId in StandardClassIds.primitiveTypes ||
++            type.lookupTag.classId in StandardClassIds.unsignedTypes
++        ) {
++            null
++        } else {
++            // Native completion also accepts unsafe calls, so nullability cannot reject a receiver here.
++            type.withNullability(false, firCallSiteSession.typeContext)
++        }
++    }
++    private val receiverClassApplicability = mutableMapOf<ConeClassLikeType, Boolean>()
++
++    // Erasure can reject unrelated receiver classes, but only native inference can confirm applicability.
++    private fun isDefinitelyInapplicable(symbol: FirCallableSymbol<*>): Boolean {
++        if (containingCallableReference != null || symbol.dispatchReceiverType != null) return false
++        val actual = explicitReceiverType ?: return false
++        fun isInapplicable(type: ConeKotlinType): Boolean {
++            val expected = (type as? ConeClassLikeType)?.replaceArgumentsWithStarProjections() ?: return false
++            return !receiverClassApplicability.getOrPut(expected) {
++                expected.lookupTag.toSymbol(firCallSiteSession) !is FirRegularClassSymbol ||
++                    AbstractTypeChecker.isSubtypeOf(firCallSiteSession.typeContext, actual, expected, stubTypesEqualToAnything = true)
++            }
++        }
++        return when (val receiver = symbol.resolvedReceiverType) {
++            is ConeTypeParameterType -> (receiver.lookupTag.toSymbol(firCallSiteSession) as? FirTypeParameterSymbol)
++                ?.resolvedBounds?.any { isInapplicable(it.coneType) } == true
++            null -> false
++            else -> isInapplicable(receiver)
++        }
+     }
+
+     private fun computeImplicitReceivers(firFakeFile: FirFile): List<ImplicitReceiverValue<*>> {
+@@ -180,8 +230,10 @@
+                 val resolver = SingleCandidateResolver(firCallSiteSession, firOriginalFile)
+                 val components = resolver.bodyResolveComponents
+                 val context = components.context
+-                context.withFile(firOriginalFile, holder = components) {
+-                    components.callableReferenceLhsResolver.resolveLhsAsType(callableReferenceFir)
++                with(components) {
++                    context.withFile(firOriginalFile) {
++                        components.callableReferenceLhsResolver.resolveLhsAsType(callableReferenceFir)
++                    }
+                 }
+             } else {
+                 null
+--- a/zed-completion/KotlinFirCompletionParameters.kt
++++ b/zed-completion/KotlinFirCompletionParameters.kt
+@@ -7,12 +7,18 @@
+ import com.intellij.psi.PsiElement
+ import org.jetbrains.kotlin.analysis.api.projectStructure.KaModule
+ import org.jetbrains.kotlin.config.LanguageVersionSettings
++import org.jetbrains.kotlin.config.LanguageFeature
+ import org.jetbrains.kotlin.idea.base.projectStructure.getKaModule
+ import org.jetbrains.kotlin.idea.base.projectStructure.languageVersionSettings
+ import org.jetbrains.kotlin.idea.completion.impl.k2.handlers.InsertRequiredTypeArgumentsInsertHandler
+ import org.jetbrains.kotlin.idea.completion.impl.k2.handlers.QualifyContextSensitiveResolutionHandler
+ import org.jetbrains.kotlin.idea.completion.implCommon.stringTemplates.StringTemplateCompletion.correctParametersForInStringTemplateCompletion
+ import org.jetbrains.kotlin.psi.KtFile
++import org.jetbrains.kotlin.psi.KtNameReferenceExpression
++import org.jetbrains.kotlin.psi.KtQualifiedExpression
++import org.jetbrains.kotlin.psi.KtCallExpression
++import org.jetbrains.kotlin.psi.KtSimpleNameExpression
++import org.jetbrains.kotlin.psi.psiUtil.getQualifiedExpressionForSelector
+
+ internal sealed class KotlinFirCompletionParameters(
+     val delegate: CompletionParameters, // delegate as much as possible; use only in corner cases/platform methods
+@@ -136,8 +142,18 @@
+             get() = originalFile.project.languageVersionSettings
+
+         fun create(parameters: CompletionParameters): KotlinFirCompletionParameters? {
+-            InsertRequiredTypeArgumentsInsertHandler.correctParametersForTypeArgumentInsertion(parameters)?.let { return it }
+-            QualifyContextSensitiveResolutionHandler.qualifyExpressionForContextSensitiveResolution(parameters)?.let { return it }
++            // The handlers create analysis sessions before checking whether their receiver can need a correction.
++            val receiver = (parameters.position.parent as? KtNameReferenceExpression)?.getQualifiedExpressionForSelector()?.receiverExpression
++            val callBeforeDot = ((receiver as? KtQualifiedExpression)?.selectorExpression ?: receiver) as? KtCallExpression
++            if (callBeforeDot != null && callBeforeDot.typeArguments.isEmpty()) {
++                InsertRequiredTypeArgumentsInsertHandler.correctParametersForTypeArgumentInsertion(parameters)?.let { return it }
++            }
++            if (receiver is KtSimpleNameExpression &&
++                parameters.originalKtFile?.languageVersionSettings
++                    ?.supportsFeature(LanguageFeature.ContextSensitiveResolutionUsingExpectedType) != false
++            ) {
++                QualifyContextSensitiveResolutionHandler.qualifyExpressionForContextSensitiveResolution(parameters)?.let { return it }
++            }
+
+             return when (val correctedParameters = correctParametersForInStringTemplateCompletion(parameters)) {
+                 null -> Original.create(parameters)
+--- a/zed-completion/K2CompletionRunner.kt
++++ b/zed-completion/K2CompletionRunner.kt
+@@ -1,4 +1,5 @@
+ // Copyright 2000-2025 JetBrains s.r.o. and contributors. Use of this source code is governed by the Apache 2.0 license.
++@file:OptIn(org.jetbrains.kotlin.analysis.api.KaExperimentalApi::class, org.jetbrains.kotlin.analysis.api.KaIdeApi::class)
+ package org.jetbrains.kotlin.idea.completion.impl.k2
+
+ import com.intellij.codeInsight.completion.CompletionResultSet
+@@ -411,9 +412,10 @@
+  */
+ private class ParallelCompletionRunner : K2CompletionRunner {
+     private companion object {
+-        // There is currently no point of using more than 4 threads due to the lack of "heavy" completion contributors.
+-        // Currently, only 2 contributors are considered "heavy".
+-        private const val MAX_CONCURRENT_COMPLETION_THREADS = 4
++        // Each worker builds an analysis context even when most member-completion sections are empty.
++        private const val MAX_CONCURRENT_COMPLETION_THREADS = 1
++        // ponytail: one shared producer bounds overlapping requests; revisit for concurrent completion throughput.
++        private val completionDispatcher = Dispatchers.Default.limitedParallelism(MAX_CONCURRENT_COMPLETION_THREADS)
+     }
+
+     private val maxCompletionThreads
+@@ -543,7 +545,7 @@
+         return try {
+             runBlockingCancellable {
+                 repeat(maxCompletionThreads.coerceAtMost(sectionsWithSinks.size)) { _ ->
+-                    launch(Dispatchers.Default) {
++                    launch(completionDispatcher) {
+                         performCompletion(completionContext, remainingSectionsQueue)
+                     }
+                 }
+--- /dev/null
++++ b/zed-completion/LSP.kt
+@@ -0,0 +1,29 @@
++// Adapted from JetBrains/intellij-community@f21a5eeb8c857a3cb23ba35e0cacf44769c86e16, fleet/lsp.protocol/srcCommonMain/com/jetbrains/lsp/protocol/LSP.kt.
++package com.jetbrains.lsp.protocol
++
++import kotlinx.serialization.json.Json
++import kotlinx.serialization.builtins.serializer
++
++object LSP {
++    val json: Json = Json {
++        encodeDefaults = true
++        explicitNulls = false
++        ignoreUnknownKeys = true
++        isLenient = true
++        // Indentation increases completion transport and parsing work without changing JSON values.
++        prettyPrint = false
++        classDiscriminator = "kind"
++    }
++
++    val ProgressNotificationType: NotificationType<ProgressParams> =
++        NotificationType("$/progress", ProgressParams.serializer())
++
++    val CancelNotificationType: NotificationType<CancelParams> =
++        NotificationType("$/cancelRequest", CancelParams.serializer())
++
++    val RegisterCapabilityRequestType: RequestType<RegistrationParams, Unit, Unit> =
++        RequestType("client/registerCapability", RegistrationParams.serializer(), Unit.serializer(), Unit.serializer())
++
++    val UnregisterCapabilityRequestType: RequestType<UnregistrationParams, Unit, Unit> =
++      RequestType("client/unregisterCapability", UnregistrationParams.serializer(), Unit.serializer(), Unit.serializer())
++}

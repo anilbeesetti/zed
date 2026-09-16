@@ -27,7 +27,7 @@ script/android-ide --release --kotlin-backend official examples/android-ide
 ```
 
 Use **Configure official Kotlin** in the Android tools panel. The pinned
-`263.4702.0+android-3` build includes a source-built native importer patch for
+`263.4702.0+android-5` build includes a source-built native importer patch for
 selected dependency variants, exact library sources, and dynamic features, plus
 semantic Compose completion and naming fixes. It prepares the focused Kotlin
 file during import and retains analysis caches when the imported model is unchanged.
