@@ -29,13 +29,20 @@ import org.jetbrains.kotlin.psi.KtImportDirective
 import org.jetbrains.kotlin.psi.KtPackageDirective
 import org.jetbrains.kotlin.psi.KtTypeReference
 import org.jetbrains.kotlin.psi.KtLambdaExpression
+import org.jetbrains.kotlin.psi.KtNameReferenceExpression
+import org.jetbrains.kotlin.psi.psiUtil.getQualifiedExpressionForSelector
 
 private val composable = ClassId.topLevel(FqName("androidx.compose.runtime.Composable"))
+
+// Compiled annotation stubs use the resolved class name; source annotations can use aliases.
+private fun KtNamedFunction.mayBeComposable(): Boolean = annotationEntries.any { annotation ->
+    !containingKtFile.isCompiled || annotation.shortName == null || annotation.shortName == composable.shortClassName
+}
 
 private fun isComposableContext(position: PsiElement): Boolean {
     for (element in generateSequence(position) { it.parent }) {
         if (element is KtNamedFunction) {
-            return element.annotationEntries.isNotEmpty() && analyze(element) { composable in element.symbol.annotations }
+            return element.mayBeComposable() && analyze(element) { composable in element.symbol.annotations }
         }
         if (element is KtLambdaExpression && analyze(element) { (element.expectedType as? KaFunctionType)?.annotations?.contains(composable) == true }) return true
     }
@@ -47,7 +54,7 @@ class ComposeSuppressor : InspectionSuppressor {
         if (toolId != "FunctionName" && toolId != "TestFunctionName") return false
         if (element.node.elementType != KtTokens.IDENTIFIER) return false
         val function = element.parent as? KtNamedFunction ?: return false
-        if (function.annotationEntries.isEmpty()) return false
+        if (!function.mayBeComposable()) return false
         return analyze(function) { composable in function.symbol.annotations }
     }
 
@@ -57,7 +64,9 @@ class ComposeSuppressor : InspectionSuppressor {
 class ComposeCompletionContributor : CompletionContributor() {
     @OptIn(KaExperimentalApi::class)
     override fun fillCompletionVariants(parameters: CompletionParameters, result: CompletionResultSet) {
-        val inComposable = isComposableContext(parameters.position)
+        // A qualified selector cannot be a named argument.
+        val qualified = (parameters.position.parent as? KtNameReferenceExpression)?.getQualifiedExpressionForSelector() != null
+        val inComposable = !qualified && isComposableContext(parameters.position)
         val sorters = mutableMapOf<CompletionSorter, CompletionSorter>()
         result.runRemainingContributors(parameters) { original ->
             val candidate = if (inComposable) {
@@ -65,7 +74,7 @@ class ComposeCompletionContributor : CompletionContributor() {
                 CompletionResult.wrap(original.lookupElement, original.prefixMatcher, sorter) ?: original
             } else original
             val function = candidate.lookupElement.psiElement as? KtNamedFunction
-            val requiredBeforeLambda = function?.takeIf { it.annotationEntries.isNotEmpty() }?.let {
+            val requiredBeforeLambda = function?.takeIf { it.mayBeComposable() }?.let {
                 analyze(it) {
                     val symbol = it.symbol
                     val last = symbol.valueParameters.lastOrNull()

@@ -453,6 +453,57 @@ def language_features(probe, source):
 
 
 def compose_features(probe, source):
+    receiver_declarations = '''
+private fun CharSequence.probeText() = length
+private fun String?.probeNullable() = this
+private fun <T> List<T>.probeList() = size
+private fun <T : CharSequence> T.probeBounded() = length
+private fun <T : Number> T.probeNumeric() = toInt()
+private fun Int.probeInt() = this
+private fun UInt.probeUnsigned() = this
+private fun probeNumber(): Number = 42
+private typealias ProbeAlias = String
+private fun ProbeAlias.probeAlias() = length
+private object ProbeReceiver
+private fun ProbeReceiver.probeObject() = Unit
+'''
+    string_extensions = {"probeText", "probeNullable", "probeBounded", "probeAlias"}
+    receiver_cases = [
+        ("string", 'val value = "hello"; value.probe|', string_extensions),
+        ("list", 'val value = listOf("hello"); value.probe|', {"probeList"}),
+        ("numeric", "val value = 42; value.probe|", {"probeNumeric", "probeInt"}),
+        ("unsigned", "val value = 42u; value.probe|", {"probeUnsigned"}),
+        ("number", "val value = probeNumber(); value.probe|", {"probeNumeric"}),
+        ("safe", "val value: String? = null; value?.probe|", string_extensions),
+        ("nullable", "val value: String? = null; value.probe|", string_extensions),
+        ("smart_cast", 'val value: Any = "hello"; if (value is String) value.probe|', string_extensions),
+        ("alias", 'val value: ProbeAlias = "hello"; value.probe|', string_extensions),
+        ("object", "ProbeReceiver.probe|", {"probeObject"}),
+        ("callable_reference", 'val value = "hello"; value::probe|', string_extensions),
+        ("implicit", 'with("hello") { probe| }', string_extensions),
+    ]
+    receiver_names = string_extensions | {"probeList", "probeNumeric", "probeInt", "probeUnsigned", "probeObject"}
+    for name, snippet, expected in receiver_cases:
+        marked = source + receiver_declarations + f"\nprivate fun receiverContract() {{ {snippet} }}\n"
+        response, items = completion(probe, marked)
+        actual = {item["label"].strip() for item in items} & receiver_names
+        probe.check("completion_receiver_" + name, actual == expected,
+                    {"outcome": outcome(response), "expected": sorted(expected), "actual": sorted(actual)})
+    for index, (value, expected, absent) in enumerate([
+        ('"hello"', "length", "inc"), ("42", "inc", "length"), ('"changed"', "length", "inc"),
+    ]):
+        response, items = completion(probe, source + f"\nprivate fun receiverFreshness() {{ val value = {value}; value.| }}\n")
+        labels = {item["label"].strip() for item in items}
+        probe.check(f"completion_receiver_freshness_{index}", expected in labels and absent not in labels,
+                    {"outcome": outcome(response), "expected": expected, "absent": absent, "labels": sorted(labels)})
+    for index, (declared, absent) in enumerate([
+        ("cacheFirst", "cacheSecond"), ("cacheSecond", "cacheFirst"), ("cacheFirst", "cacheSecond"),
+    ]):
+        marked = source + f'\nprivate fun String.{declared}() = this\nprivate fun nameFreshness() {{ "hello".cache| }}\n'
+        response, items = completion(probe, marked)
+        labels = {item["label"].strip() for item in items}
+        probe.check(f"completion_declaration_freshness_{index}", declared in labels and absent not in labels,
+                    {"outcome": outcome(response), "declared": declared, "absent": absent, "labels": sorted(labels)})
     cases = [
         ("button", "@Composable", "Button|", "Button", True),
         ("row", "@Composable", "Row|", "Row", True),
@@ -511,6 +562,19 @@ def compose_features(probe, source):
         accepted = accept_completion(probe, item)
         declaration = probe.text.split("private val callableProbe", 1)[-1]
         probe.check("callable_reference_has_no_call_or_lambda", "error" not in accepted and "::ActionButton" in declaration and "(" not in declaration and "{" not in declaration, declaration)
+    correction_cases = [("inferred_type_arguments", "", "private fun typedList(): List<String> = emptyList().also|")]
+    if probe.results["require_context_sensitive_resolution"]:
+        correction_cases.append(("context_sensitive_enum", "private enum class CsrMode { FIRST }", "private fun contextMode(): CsrMode = FIRST.also|"))
+    for name, declarations, snippet in correction_cases:
+        response, items = completion(probe, source + "\n" + declarations + "\n" + snippet + "\n")
+        item = next((item for item in items if item["label"].strip() == "also"), None)
+        probe.check(name + "_completion", item is not None, {"outcome": outcome(response)})
+        if item:
+            accepted = accept_completion(probe, item)
+            probe.check(name + "_acceptance", "error" not in accepted, {"response": accepted, "text": probe.text})
+            diagnostics = probe.request("textDocument/diagnostic", {"textDocument": {"uri": probe.uri}})
+            errors = [item for item in diagnostic_items(diagnostics) if item.get("severity") == 1]
+            probe.check(name + "_type_checks", not errors, {"errors": errors, "text": probe.text})
     probe.change(source)
 
 
@@ -795,6 +859,7 @@ def main():
     parser.add_argument("--timeout", type=int, default=240, help="Maximum import/indexing time in seconds")
     parser.add_argument("--require-original-sources", action="store_true", help="Fail the run if original Compose sources or nested navigation are unavailable")
     parser.add_argument("--require-compose", action="store_true", help="Require Compose naming and required-lambda checks; implies --extended")
+    parser.add_argument("--require-context-sensitive-resolution", action="store_true", help="Check enum completion in a fixture that enables -Xcontext-sensitive-resolution; implies --extended")
     parser.add_argument("--extended", action="store_true", help="Check references, multi-file rename, diagnostics, formatting, code actions and Compose contexts")
     parser.add_argument("--performance-samples", type=int, default=0, help="Run at least 30 samples per warm protocol scenario (0 disables)")
     parser.add_argument("--plugins", type=Path, help="Isolated IntelliJ plugin directory for engine compatibility experiments")
@@ -802,7 +867,7 @@ def main():
     parser.add_argument("--jfr", action="store_true", help="Capture a bounded server Java Flight Recorder profile; adds profiling overhead")
     parser.add_argument("--generate-resources", action="store_true", help="Run the app's exact resource-only setup on the isolated fixture before starting the server")
     args = parser.parse_args()
-    args.extended = args.extended or args.require_compose
+    args.extended = args.extended or args.require_compose or args.require_context_sensitive_resolution
     if args.self_test:
         self_test()
         return 0
@@ -838,6 +903,7 @@ def main():
     results["expected_modules"] = args.expected_module
     results["model_only"] = args.model_only
     results["require_compose"] = args.require_compose
+    results["require_context_sensitive_resolution"] = args.require_context_sensitive_resolution
     results["require_original_sources"] = args.require_original_sources
     environment = dict(os.environ, JAVA_HOME=str(args.java_home), LSP_ANDROID_MODULE=args.module, LSP_ANDROID_VARIANT=args.variant, IJ_JAVA_OPTIONS=f"-Didea.config.path={output / 'config'} -Didea.log.path={output / 'logs'} -Dintellij.server.eula.persistence=false")
     if args.generate_resources:

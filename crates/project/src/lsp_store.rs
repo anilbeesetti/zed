@@ -8769,6 +8769,8 @@ impl LspStore {
             .collect::<HashSet<_>>();
 
         cx.spawn(async move |lsp_store, cx| {
+            // Let the menu notification run before starting optional documentation requests.
+            smol::future::yield_now().await;
             let request_timeout = cx.update(|app| {
                 ProjectSettings::get_global(app)
                     .global_lsp_settings

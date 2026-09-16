@@ -811,3 +811,211 @@ p95 of 26.06 ms, and String completion p95 of 961.40 ms remain the recorded back
 baseline. Completion/first-analysis performance, longer-session memory,
 current-dependency-model archive ownership, broader import/generated-source
 coverage, and packaged-platform/distribution validation remain open promotion gates.
+
+
+### Kotlin completion cache lifetime and cancellation: android-3 baseline — 2026-09-15
+
+The `263.4702.0+android-3` baseline introduced the following changes. FIR soft lazy values use
+IntelliJ's native `CachedValueImpl`: the server's `CachedValuesManager` wrapper
+otherwise puts even `NEVER_CHANGED` values in its per-snapshot cache, rebuilding
+shared library name sets after document edits. FIR sessions retain responsibility
+for invalidation, and the values remain soft references. The composite symbol
+provider indexes provider names by package, preserving provider order and the
+fallback for unknown names, special names, and synthetic function types. It does
+not cache completion results or reuse completion session IDs. Both patched JARs
+are covered by the installer integrity manifest.
+
+Completion menus now own their documentation-resolution task. Closing or replacing
+a menu cancels its remaining batch; visible documentation still resolves normally.
+Previously, detached batches continued resolving hidden entries while the next
+completion request was running. The server's serialized completion-session guard,
+acceptance ownership, cancellation checks, and stale edit/caret rejection remain.
+
+The real editor probe also has a release integration-test entry point, so the
+editor dependency runs without `cfg(test)` wrapping invariants. It loads the Kotlin
+extension's real grammar and measures input through menu rendering in a GPUI test
+window, using RealFs and the actual server process. The IO recorder now buffers JSON
+output: its old per-fragment disk writes inflated apparent client latency. Earlier
+unbuffered measurements are superseded and are not evidence of a production client
+rendering bottleneck.
+
+A controlled larger-project run uses an isolated copy of nav3-recipes (six Android
+modules, 116 Kotlin files, about 10,000 lines), app `debug`, project JDK 21 and the
+server's bundled JBR 25. It edits a short unsaved Kotlin function within that
+project. Each scenario records its first request separately and then all 30
+immediate repeats, with no additional warm-up or excluded slow repeats. Completion
+preparation deletes and retypes the prefix through editor actions. Explicit and
+automatic dot requests are separate scenarios. These measurements include the
+editor's input, LSP, menu and GPUI draw path; they do not measure OS presentation or
+a packaged application's input pipeline.
+
+| Scenario | android-2 warm p95 | android-3 warm p95 |
+| --- | ---: | ---: |
+| String members, explicit dot | 724.95 ms | 300.38 ms |
+| String members, automatic dot | 586.95 ms | 159.30 ms |
+| String prefixes `l` / `le` / `len` | 367.10 ms | 89.05 ms |
+| Modifier prefixes `p` / `pa` | 352.62 ms | 95.19 ms |
+| Named-argument prefixes `t` / `te` | 1,138.36 ms | 556.31 ms |
+| Original Compose definition after edit | 200.25 ms | 56.33 ms |
+| Original Compose definition unchanged | 4.84 ms | 5.97 ms |
+
+The first definition after import/index readiness is still 1,301.97 ms, exceeding
+500 ms; the first explicit String completion is 1,506.63 ms. Explicit completion's
+first several repeats also remain above 200 ms, so its 30-repeat p95 gate is **not
+met**. Automatic completion and warm navigation meet their respective 200/150 ms
+targets in this run. A verified sequential-runner experiment, earlier JVM
+compilation, additional compiler threads, and a shared Compose analysis session
+did not satisfy the explicit gate and are not included. Profiles locate the
+remaining work in local extension enumeration, applicability checking, lookup
+creation and analysis-context setup; no additional semantic cache was added.
+
+The 155 baseline/candidate completion responses contain identical candidate
+multisets. String, prefix and modifier ordering matches exactly. Named-argument
+ordering varies among ties across runs; the named-argument expectation remains
+first. The full native contract passes 123 required checks, including new
+String-to-Int-to-String receiver changes and unsaved extension renames. The three
+optional `prepareRename` probes still report the server's unsupported method.
+Original source navigation, Compose trailing-lambda insertion, import handling,
+and unchanged on-disk fixtures pass. Native memory samples are editor/server RSS
+snapshots only, not peak physical-footprint or long-session leak evidence.
+
+Reproduce the release probe with `cargo test -p editor --test kotlin_latency
+--features test-support,gpui/inspector --release --no-run`, then run the resulting
+binary with `ZED_HEADLESS=1`, `ZED_KOTLIN_CLIENT_PROBE_CONFIG` pointing to an isolated
+fixture/server configuration, and `real_kotlin_latency --ignored --nocapture`.
+Editor validation passes all 57 completion tests and 100 scheduler seeds each for
+the new cancellation regression and three Kotlin stale-session guards (400 runs).
+All 27 LSP-store integration tests, focused `./script/clippy` for editor and
+android_tools, all four Android Kotlin bootstrap tests, installer checks, and
+protocol self-test pass. Detailed commands, raw samples,
+wire logs, profile summaries, and integrity fingerprints are retained in `target/kotlin-completion-latency` in the validation
+checkout. Community remains the default and official remains opt-in. At this
+checkpoint, explicit completion and first-analysis latency remained open gates.
+
+### Kotlin completion latency: android-4 — 2026-09-16
+
+The `263.4702.0+android-4` candidate retains the preceding cache and session
+ownership fixes. It rejects definitely unrelated extension receiver classes and
+generic upper bounds before native candidate inference. Unknown types, smart
+casts, callable references, dispatch receivers, primitive conversions and other
+uncertain cases continue through the native checker. Native inference still
+determines applicability, substitution and required receiver casts; completion
+results and analysis symbols are not cached across edits.
+
+Compiled annotation stubs can skip semantic analysis when their resolved short
+name is not `Composable`; source annotations still resolve aliases. Qualified
+selectors skip the Compose named-argument context check. Completion parameter
+corrections run only for syntax that can require them, and context-sensitive enum
+resolution reads the original file's module language settings. The native
+parallel runner uses one producer on a shared coroutine dispatcher, bounding
+producer work across overlapping requests while retaining ordered result
+collection, analysis mode and cancellation. Pinned upstream sources and every
+patched JAR are covered by installer integrity checks.
+
+The protocol JSON encoder uses compact output. A String response with 498
+candidates shrinks from about 752 KB to 268 KB without changing message values.
+The patch replaces only the upstream `LSP` configuration object and retains its
+public methods, serializer settings and notification/request types. The protocol
+JAR is also included in the installer's integrity manifest.
+
+Optional documentation resolution yields once so menu notifications can run
+first. The menu continues to own cancellation, and acceptance resolves the chosen
+item directly. This reduces discarded documentation requests during rapid menu
+replacement without a fixed delay.
+
+The release probe supports explicit-first and automatic-first request orders.
+Import readiness no longer reparses completion responses after import has
+completed: the unused parse cost about 3.7 ms for a 752 KB String response.
+Complete wire recording and input-to-GPUI-draw timing remain. Each order was
+measured once on the final installed package, with its first request separate
+and all 30 immediate repeats retained. There are no extra warm-ups, paced delays
+or excluded early repeats. Warm p95 is the 29th sorted value of those 30 samples.
+The preceding android-3 table is historical.
+
+**String warm p95 passes 200 ms in both request orders, and navigation after
+edits passes 150 ms. Named-argument completion and first navigation remain open.**
+
+| Scenario | Explicit-first first | Explicit-first warm p95 | Automatic-first first | Automatic-first warm p95 |
+| --- | ---: | ---: | ---: | ---: |
+| String members, explicit dot | 1395.16 ms | 188.91 ms | 111.79 ms | 128.81 ms |
+| String members, automatic dot | 114.48 ms | 121.89 ms | 1297.82 ms | 191.83 ms |
+| String prefixes `l` / `le` / `len` | 74.05 ms | 71.91 ms | 82.64 ms | 71.10 ms |
+| Modifier prefixes `p` / `pa` | 263.83 ms | 65.79 ms | 248.41 ms | 67.21 ms |
+| Named-argument prefixes `t` / `te` | 1901.63 ms | 455.93 ms | 2099.20 ms | 503.34 ms |
+| Original Compose definition after edit | 1103.93 ms | 46.17 ms | 1058.61 ms | 64.97 ms |
+| Original Compose definition unchanged | 4.85 ms | 7.04 ms | 4.44 ms | 5.46 ms |
+
+Named-argument warm p95 is 455.93/503.34 ms. First navigation after import/index
+readiness is 1103.93/1058.61 ms against 500 ms. The first String completion in each
+order takes 1395.16/1297.82 ms. Individual warm repeats can exceed 200 ms: the
+slowest explicit-first repeat is 301.27 ms and automatic-first is 282.95 ms;
+both remain in the reported sample sets. These are GPUI draw measurements,
+excluding OS presentation and packaged application input. RSS snapshots do not
+establish long-session memory behavior.
+
+The installed runtime passes 141 required native contract checks, including
+receiver changes, nullable/smart-cast/generic receivers, Int/UInt/Number cases,
+source annotation aliases, inferred type arguments and explicitly enabled
+context-sensitive enum resolution. Three optional `prepareRename` probes remain
+unsupported. Both final editor runs match all 156 candidate multisets against
+published android-3 head `f69d479263`. String, prefix, modifier and acceptance
+ordering matches; named-argument ties vary between processes, with the expected
+named argument remaining first. Native insertion/import/caret checks and the
+editor acceptance, Undo and stale-session guards pass.
+
+All 57 editor completion tests, 400 scheduler runs for cancellation/session
+guards, 27 LSP-store integration tests, four Android bootstrap tests, installer
+integrity tests, protocol self-test, focused `./script/clippy`, formatting and
+diff checks pass. Rust source fingerprints match the tested release binary's
+sources; the installed runtime manifest matches the native patch and Compose
+sources. The patch SHA-256 is
+`0ddd97a697e5b340d4e89e54394854c41a9d30d3a0193e52a2590efca6f8f3e4`.
+
+Raw reports, complete wire logs, source/runtime fingerprints and check logs are
+retained under `target/kotlin-completion-latency`, in
+`editor-android4-dispatcher-final-explicit`,
+`editor-android4-dispatcher-final-automatic` and `contract-android4-dispatcher`.
+Use the preceding release-probe command with `completion_refinement: true`,
+`warm_samples: 30` and `completion_warm_samples: 30`; set `automatic_first: true`
+for the second order. The final commit fingerprint is recorded with PR 24.
+
+<details>
+<summary>All 30 warm samples for the completion and navigation gates, in request order</summary>
+
+Explicit-first — `string_explicit` (milliseconds):
+
+```json
+[301.2685, 188.912334, 174.577791, 173.237125, 166.00175, 159.428917, 152.086208, 145.894458, 152.860083, 148.8755, 138.283208, 129.617917, 146.888709, 145.556291, 127.902042, 125.46175, 125.290084, 123.184292, 125.186917, 121.946583, 118.111541, 119.255, 118.159208, 127.356625, 116.123291, 117.240916, 116.654417, 123.454083, 127.984084, 136.918833]
+```
+
+Explicit-first — `string_triggered` (milliseconds):
+
+```json
+[114.409834, 111.691541, 112.147, 119.998792, 109.009125, 108.627417, 112.314417, 112.868542, 117.05875, 115.788083, 109.167125, 107.152875, 105.919584, 106.808833, 137.71725, 111.64, 106.522667, 104.564042, 104.885458, 111.042542, 107.626541, 104.526958, 105.849125, 99.921292, 102.428167, 121.891541, 104.071417, 101.134, 101.884916, 101.080167]
+```
+
+Explicit-first — `definition_after_edit` (milliseconds):
+
+```json
+[46.173458, 106.734417, 34.279292, 34.720958, 34.108625, 35.589583, 34.426583, 34.652833, 31.702958, 32.332708, 34.390292, 31.16975, 30.941917, 29.567458, 31.461375, 30.970833, 30.84725, 31.518667, 29.848583, 30.096875, 31.036208, 31.544292, 30.249, 28.826542, 29.541917, 28.391458, 34.644041, 32.539833, 28.761209, 29.921166]
+```
+
+Automatic-first — `string_explicit` (milliseconds):
+
+```json
+[112.370958, 114.193167, 116.020792, 128.814791, 116.779166, 111.2585, 115.8875, 110.949917, 118.250416, 116.968167, 109.438667, 109.000292, 106.358916, 118.880583, 134.747916, 110.572167, 104.574292, 106.836792, 105.638458, 115.593833, 106.848083, 106.898, 104.730708, 103.700083, 108.022459, 110.190834, 99.697208, 102.043916, 102.645667, 101.324291]
+```
+
+Automatic-first — `string_triggered` (milliseconds):
+
+```json
+[282.952334, 191.831708, 177.647625, 182.754458, 160.26775, 152.152, 147.794166, 155.363375, 158.332, 143.532541, 134.235959, 127.790708, 156.308542, 140.705042, 128.477208, 126.166334, 122.414875, 129.608125, 124.854958, 127.881667, 120.934792, 118.736333, 127.961333, 130.08875, 121.971542, 123.865167, 116.768333, 115.189917, 140.607083, 119.410875]
+```
+
+Automatic-first — `definition_after_edit` (milliseconds):
+
+```json
+[64.968042, 50.19075, 48.294958, 37.185458, 46.070625, 41.800583, 36.585375, 88.683667, 37.898833, 34.884916, 34.901208, 33.279666, 33.664542, 32.604375, 31.533209, 29.649417, 31.813542, 31.515792, 31.567417, 30.097167, 30.756459, 31.352417, 29.160292, 28.194, 27.926167, 27.804208, 28.226042, 27.411209, 26.786625, 27.023791]
+```
+
+</details>
