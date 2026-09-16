@@ -44,6 +44,7 @@ class KotlinBootstrapTests(unittest.TestCase):
                 module.write_bytes(b"patched native importer")
                 patch_path = Path(__file__).with_name("android-kotlin-official.patch")
                 compose_path = Path(__file__).with_name("android-kotlin-compose.kt")
+                navigation_path = Path(__file__).with_name("android-kotlin-navigation.kt")
                 feature = module.with_name("language-server.api.features.impl.kotlin.jar")
                 feature.write_bytes(b"patched Compose feature")
                 additional_modules = {}
@@ -57,6 +58,7 @@ class KotlinBootstrapTests(unittest.TestCase):
                     "patch_sha256": hashlib.sha256(patch_path.read_bytes()).hexdigest(),
                     "module": module_path, "module_sha256": hashlib.sha256(module.read_bytes()).hexdigest(),
                     "compose_sha256": hashlib.sha256(compose_path.read_bytes()).hexdigest(),
+                    "navigation_sha256": hashlib.sha256(navigation_path.read_bytes()).hexdigest(),
                     "feature_sha256": hashlib.sha256(feature.read_bytes()).hexdigest(),
                     "additional_modules": additional_modules,
                 }))
@@ -83,6 +85,14 @@ class KotlinBootstrapTests(unittest.TestCase):
                     with self.assertRaisesRegex(RuntimeError, "patch has changed"):
                         bootstrap["main"]("official")
                     feature.write_bytes(original_feature)
+                    manifest_path = installation / distribution.name / "zed-native-importer.json"
+                    original_manifest = manifest_path.read_text()
+                    manifest = json.loads(original_manifest)
+                    manifest["navigation_sha256"] = "outdated navigation preparation"
+                    manifest_path.write_text(json.dumps(manifest))
+                    with self.assertRaisesRegex(RuntimeError, "patch has changed"):
+                        bootstrap["main"]("official")
+                    manifest_path.write_text(original_manifest)
                     for name in (bootstrap["OFFICIAL_MODEL_MODULE"], bootstrap["OFFICIAL_JAVA_MODULE"], bootstrap["OFFICIAL_COMMON_MODULE"], bootstrap["OFFICIAL_FIR_MODULE"], bootstrap["OFFICIAL_FIR_PROVIDERS_MODULE"], bootstrap["OFFICIAL_COMPLETION_API_MODULE"], bootstrap["OFFICIAL_COMPLETION_MODULE"], bootstrap["OFFICIAL_PROTOCOL_MODULE"]):
                         additional_module = installation / distribution.name / name
                         original_module = additional_module.read_bytes()

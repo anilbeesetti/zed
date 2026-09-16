@@ -22001,6 +22001,153 @@ async fn test_completion_can_run_commands(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_kotlin_preparation_follows_editor_focus(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/project"), json!({"Main.kt": "fun main() {}"}))
+        .await;
+    let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+    let languages = project.read_with(cx, |project, _| project.languages().clone());
+    languages.add(Arc::new(language::Language::new(
+        LanguageConfig {
+            name: "Kotlin".into(),
+            matcher: LanguageMatcher {
+                path_suffixes: vec!["kt".into()],
+                ..Default::default()
+            }
+            .into(),
+            ..Default::default()
+        },
+        None,
+    )));
+    let commands = Arc::new(Mutex::new(Vec::new()));
+    let mut servers = languages.register_fake_lsp(
+        "Kotlin",
+        FakeLspAdapter {
+            name: "kotlin-lsp",
+            capabilities: lsp::ServerCapabilities {
+                text_document_sync: Some(lsp::TextDocumentSyncCapability::Kind(
+                    lsp::TextDocumentSyncKind::INCREMENTAL,
+                )),
+                execute_command_provider: Some(lsp::ExecuteCommandOptions {
+                    commands: vec!["zed.prepareKotlinFile".into()],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            initializer: Some(Box::new({
+                let commands = commands.clone();
+                move |server| {
+                    let commands = commands.clone();
+                    server.set_request_handler::<lsp::request::ExecuteCommand, _, _>(
+                        move |params, _| {
+                            commands.lock().push(params);
+                            async { Ok(None) }
+                        },
+                    );
+                }
+            })),
+            ..Default::default()
+        },
+    );
+    let (buffer, _registration) = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer_with_lsp(path!("/project/Main.kt"), cx)
+        })
+        .await
+        .expect("Kotlin buffer");
+    let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+    let (editor, cx) = cx.add_window_view(|window, cx| {
+        build_editor_with_project(project.clone(), buffer, window, cx)
+    });
+    let _server = servers.next().await.expect("Kotlin server");
+    cx.run_until_parked();
+    editor.update_in(cx, |editor, window, cx| {
+        window.activate_window();
+        window.focus(&editor.focus_handle, cx)
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.run_until_parked();
+    let first = commands
+        .lock()
+        .last()
+        .cloned()
+        .expect("focused file preparation");
+    assert_eq!(first.command, "zed.prepareKotlinFile");
+    assert_eq!(
+        first.arguments.last(),
+        Some(&json!(
+            lsp::Uri::from_file_path(path!("/project/Main.kt")).expect("file URI")
+        ))
+    );
+    let generation = first
+        .arguments
+        .first()
+        .and_then(|value| value.as_u64())
+        .expect("generation");
+    let count = commands.lock().len();
+    editor.update_in(cx, |editor, window, cx| {
+        editor.update_lsp_data(None, window, cx);
+        editor.update_lsp_data(None, window, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        commands.lock().len(),
+        count,
+        "unchanged focus must not restart preparation"
+    );
+    let other_focus = cx.update(|window, cx| {
+        let focus = cx.focus_handle();
+        window.focus(&focus, cx);
+        focus
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.run_until_parked();
+    assert_eq!(
+        commands.lock().last().expect("stop command").arguments,
+        vec![json!(generation), json!(null)]
+    );
+    editor.update_in(cx, |editor, window, cx| {
+        window.focus(&editor.focus_handle, cx)
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.run_until_parked();
+    assert!(
+        commands
+            .lock()
+            .last()
+            .expect("refocus command")
+            .arguments
+            .first()
+            .and_then(|value| value.as_u64())
+            .is_some_and(|next| next > generation)
+    );
+    cx.deactivate_window();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.run_until_parked();
+    let count = commands.lock().len();
+    assert_eq!(
+        commands
+            .lock()
+            .last()
+            .expect("inactive stop")
+            .arguments
+            .last(),
+        Some(&json!(null))
+    );
+    editor.update_in(cx, |editor, window, cx| {
+        editor.update_lsp_data(None, window, cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        commands.lock().len(),
+        count,
+        "background updates must not restart preparation"
+    );
+    drop(other_focus);
+}
+
+#[gpui::test]
 async fn test_kotlin_command_completions_refresh_after_typing_and_backspace(
     cx: &mut TestAppContext,
 ) {

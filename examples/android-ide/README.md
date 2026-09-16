@@ -27,9 +27,11 @@ script/android-ide --release --kotlin-backend official examples/android-ide
 ```
 
 Use **Configure official Kotlin** in the Android tools panel. The pinned
-`263.4702.0+android-2` build includes a source-built native importer patch for
+`263.4702.0+android-5` build includes a source-built native importer patch for
 selected dependency variants, exact library sources, and dynamic features, plus
-semantic Compose completion and naming fixes. The installer verifies the upstream
+semantic Compose completion and naming fixes. It prepares the focused Kotlin
+file during import and retains analysis caches when the imported model is unchanged.
+The installer verifies the upstream
 archive, public source, build dependencies, and installed patch. Its manifest and
 source license remain with the runtime.
 
@@ -103,6 +105,18 @@ project and its normal caches; the probe briefly exports and removes
 Required assertion failures exit nonzero. Use `--require-original-sources` and
 `--require-compose` to require the source, nested-navigation, and Compose fixes
 included in the patched installation.
+
+To measure first navigation at the original import/index readiness boundary, add
+`--navigation-only --prepare-active-file --navigation-samples 30 --buffer-wire`.
+Preparation starts after didOpen, matching the editor's active-file command.
+The first definition runs before model export or other semantic requests and is
+reported separately from warm requests. `--navigation-source <relative-file>` and
+`--navigation-symbol <name>` select a larger fixture's measured location; they do
+not change preparation. Use distinct output directories and a shared
+`--system-path <directory>` for at least 30 fresh server processes before making
+percentile claims. Measure fresh-index imports separately. Protocol timings exclude
+editor buffer creation and drawing.
+
 `--variant fullRelease` also checks that the dependent library selects `release`;
 the unmodified pinned server falls back to `greeting.debug`, which fails this gate.
 The patched native importer passes both variants and original Compose source

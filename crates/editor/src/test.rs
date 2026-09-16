@@ -332,12 +332,20 @@ pub async fn run_real_kotlin_editor_probe(cx: &mut gpui::TestAppContext) {
             if automatic_first { "string_explicit" } else { "string_triggered" },
             "string_prefix", "modifier", "named_argument", "acceptance"],
     });
+    let wire_log = Arc::new(Mutex::new(Vec::new()));
     let write_report = |report: &serde_json::Value| {
         std::fs::write(
             output.join("results.json"),
             serde_json::to_vec_pretty(report).expect("serialize report"),
         )
         .expect("write report");
+        let mut wire = std::io::BufWriter::new(
+            std::fs::File::create(output.join("wire.jsonl")).expect("wire log"),
+        );
+        for entry in wire_log.lock().iter() {
+            writeln!(wire, "{entry}").expect("write wire log");
+        }
+        wire.flush().expect("flush wire log");
     };
     write_report(&report);
 
@@ -495,15 +503,9 @@ pub async fn run_real_kotlin_editor_probe(cx: &mut gpui::TestAppContext) {
     let mut import_finished = false;
     let mut saw_indexing = false;
     let mut indexing = HashSet::default();
-    // The IO hook runs before response handling; buffering keeps JSON formatting
-    // from issuing a filesystem write for every fragment of a large response.
-    let mut wire_log = std::io::BufWriter::new(
-        std::fs::File::create(output.join("wire.jsonl")).expect("wire log"),
-    );
+    let wire_log = wire_log.clone();
     let _io = server.on_io(move |kind, message| {
-        writeln!(wire_log, "{}", json!({"seconds": started.elapsed().as_secs_f64(), "kind": format!("{kind:?}"), "message": message}))
-            .expect("write wire log");
-        wire_log.flush().expect("flush wire log");
+        wire_log.lock().push(json!({"seconds": started.elapsed().as_secs_f64(), "kind": format!("{kind:?}"), "message": message}));
         if ready.is_none() {
             return;
         }
@@ -533,31 +535,6 @@ pub async fn run_real_kotlin_editor_probe(cx: &mut gpui::TestAppContext) {
             if let Some(ready) = ready.take() { ready.send(Ok(())).expect("readiness receiver"); }
         }
     });
-    let mut readiness = readiness.fuse();
-    let readiness_started = Instant::now();
-    loop {
-        let heartbeat = cx.executor().timer(Duration::from_secs(1)).fuse();
-        futures::pin_mut!(heartbeat);
-        futures::select_biased! {
-            result = readiness => {
-                result.expect("readiness notification").expect("import and indexing succeeded");
-                break;
-            },
-            _ = heartbeat => assert!(readiness_started.elapsed() < Duration::from_secs(180), "real Kotlin import timed out"),
-        }
-    }
-    report["ready_milliseconds"] = json!(started.elapsed().as_secs_f64() * 1000.0);
-    report["memory"]
-        .as_array_mut()
-        .expect("memory samples")
-        .push(kotlin_live_memory("ready", server.process_id().expect("server PID")).await);
-    report["phase"] = json!("editor");
-    write_report(&report);
-    eprintln!(
-        "real Kotlin import/index ready in {} ms",
-        report["ready_milliseconds"]
-    );
-
     let (multi_workspace, cx) =
         cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
     let workspace = multi_workspace.read_with(cx, |multi, _| multi.workspace().clone());
@@ -575,8 +552,134 @@ pub async fn run_real_kotlin_editor_probe(cx: &mut gpui::TestAppContext) {
     });
     editor.update_in(cx, |editor, window, cx| {
         editor.word_completions_enabled = false;
+        window.activate_window();
         window.focus(&editor.focus_handle(cx), cx);
     });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let mut readiness = readiness.fuse();
+    let readiness_started = Instant::now();
+    loop {
+        let heartbeat = cx.executor().timer(Duration::from_secs(1)).fuse();
+        futures::pin_mut!(heartbeat);
+        futures::select_biased! {
+            result = readiness => {
+                result.expect("readiness notification").expect("import and indexing succeeded");
+                break;
+            },
+            _ = heartbeat => assert!(readiness_started.elapsed() < Duration::from_secs(180), "real Kotlin import timed out"),
+        }
+    }
+    report["ready_milliseconds"] = json!(started.elapsed().as_secs_f64() * 1000.0);
+    if config["first_navigation_only"] == true {
+        report["request_order"] = json!(["first_after_readiness", "warm"]);
+        let symbol = config["navigation_symbol"]
+            .as_str()
+            .unwrap_or("headlineSmall");
+        let position = MultiBufferOffset(
+            original_disk_text
+                .rfind(symbol)
+                .expect("first navigation symbol")
+                + 1,
+        );
+        for sample in 0..=warm_samples {
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.activate_item(&editor, true, true, window, cx);
+            });
+            editor.update_in(cx, |editor, window, cx| {
+                editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                    selections.select_ranges([position..position])
+                });
+            });
+            let sample_started = Instant::now();
+            let sample_start_seconds = started.elapsed().as_secs_f64();
+            let navigated = editor
+                .update_in(cx, |editor, window, cx| {
+                    editor.go_to_definition(&GoToDefinition::default(), window, cx)
+                })
+                .await;
+            let navigation_milliseconds = sample_started.elapsed().as_secs_f64() * 1000.0;
+            if !matches!(navigated, Ok(Navigated::Yes)) {
+                report["failure"] = json!(format!("First-navigation probe returned {navigated:?}"));
+                report["samples"]
+                    .as_array_mut()
+                    .expect("samples")
+                    .push(json!({
+                        "scenario": if sample == 0 { "first_after_readiness" } else { "warm" },
+                        "sample": sample, "start_seconds": sample_start_seconds,
+                        "navigation_milliseconds": navigation_milliseconds, "failed": true,
+                    }));
+                write_report(&report);
+                panic!("{}", report["failure"]);
+            }
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            let milliseconds = sample_started.elapsed().as_secs_f64() * 1000.0;
+            let target = workspace.read_with(cx, |workspace, cx| {
+                workspace
+                    .active_item_as::<Editor>(cx)
+                    .expect("definition editor")
+            });
+            let target = target.update(cx, |target, cx| {
+                let point = target
+                    .selections
+                    .newest::<Point>(&target.display_snapshot(cx))
+                    .start;
+                let snapshot = target.buffer.read(cx).snapshot(cx);
+                let selected = snapshot
+                    .text_for_range(
+                        point..Point::new(point.row, point.column + symbol.len() as u32),
+                    )
+                    .collect::<String>();
+                assert_eq!(
+                    selected, symbol,
+                    "the editor must land on the original declaration range"
+                );
+                let buffer = target
+                    .buffer
+                    .read(cx)
+                    .as_singleton()
+                    .expect("definition buffer");
+                let buffer = buffer.read(cx);
+                assert!(buffer.read_only());
+                let uri = buffer
+                    .language_server_document()
+                    .expect("definition owner")
+                    .uri
+                    .clone();
+                assert!(uri.as_str().ends_with(".kt"));
+                uri
+            });
+            report["samples"].as_array_mut().expect("samples").push(json!({
+                "scenario": if sample == 0 { "first_after_readiness" } else { "warm" },
+                "sample": sample, "start_seconds": sample_start_seconds,
+                "navigation_milliseconds": navigation_milliseconds, "milliseconds": milliseconds,
+                "target": target,
+            }));
+        }
+        report["phase"] = json!("complete");
+        write_report(&report);
+        lsp_store
+            .update(cx, |store, cx| {
+                store.stop_language_servers_for_buffers(vec![buffer], HashSet::default(), cx)
+            })
+            .await
+            .expect("stop real language server");
+        assert_eq!(
+            std::fs::read_to_string(&source_path).expect("source after probe"),
+            original_disk_text
+        );
+        return;
+    }
+    report["memory"]
+        .as_array_mut()
+        .expect("memory samples")
+        .push(kotlin_live_memory("ready", server.process_id().expect("server PID")).await);
+    report["phase"] = json!("editor");
+    write_report(&report);
+    eprintln!(
+        "real Kotlin import/index ready in {} ms",
+        report["ready_milliseconds"]
+    );
+
     let source = "package liveclientprobe\nimport androidx.compose.runtime.Composable\nimport androidx.compose.ui.Modifier\nimport androidx.compose.material3.Text\nimport androidx.compose.material3.MaterialTheme\n\n";
     let mut definition_editor_id = None;
     for (scenario, replace_text) in [
