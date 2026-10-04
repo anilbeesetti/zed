@@ -4,6 +4,8 @@ mod android_logcat;
 mod android_logcat_panel;
 mod android_preview;
 mod android_status;
+mod android_tests;
+pub use android_tests::{DiscoverTests, InstrumentationTest, TestPanel, ToggleTests};
 
 use android_build::{BuildEvent, BuildStatus, BuildTab, ProcessOutput};
 pub use android_build::{BuildPanel, ToggleBuild};
@@ -84,6 +86,7 @@ pub fn init(cx: &mut App) {
             .new(|cx| AndroidPanel::new(workspace.weak_handle(), workspace.project().clone(), cx));
         panel.update(cx, |panel, cx| panel.observe_project_open(window, cx));
         workspace.add_panel(panel.read(cx).build_panel.clone(), window, cx);
+        workspace.add_panel(panel.read(cx).test_panel.clone(), window, cx);
         android_status::register(&panel, window, cx);
         workspace.add_panel(panel, window, cx);
         let logcat_panel = cx.new(|cx| LogcatPanel::new(workspace, window, cx));
@@ -123,7 +126,38 @@ pub fn init(cx: &mut App) {
             })
             .register_action(|workspace, _: &Test, window, cx| {
                 with_panel(workspace, window, cx, |panel, window, cx| {
-                    panel.gradle(GradleOperation::Test, window, cx)
+                    panel.start_tests(
+                        android_tools::testing::TestKind::Unit,
+                        Vec::new(),
+                        false,
+                        window,
+                        cx,
+                    )
+                })
+            })
+            .register_action(|workspace, _: &ToggleTests, window, cx| {
+                workspace.toggle_panel_focus::<TestPanel>(window, cx);
+            })
+            .register_action(|workspace, _: &DiscoverTests, window, cx| {
+                with_panel(workspace, window, cx, |panel, window, cx| {
+                    panel.start_tests(
+                        android_tools::testing::TestKind::Unit,
+                        Vec::new(),
+                        true,
+                        window,
+                        cx,
+                    )
+                })
+            })
+            .register_action(|workspace, _: &InstrumentationTest, window, cx| {
+                with_panel(workspace, window, cx, |panel, window, cx| {
+                    panel.start_tests(
+                        android_tools::testing::TestKind::Device,
+                        Vec::new(),
+                        false,
+                        window,
+                        cx,
+                    )
                 })
             })
             .register_action(|workspace, _: &Lint, window, cx| {
@@ -280,6 +314,11 @@ pub struct AndroidPanel {
     project: Entity<Project>,
     toolbar: Entity<AndroidToolbar>,
     build_panel: Entity<BuildPanel>,
+    test_panel: Entity<TestPanel>,
+    test_task: Option<Task<()>>,
+    test_cancel: Option<oneshot::Sender<()>>,
+    test_operation_id: Option<u64>,
+    pending_test: Option<android_tests::TestRequest>,
     build_task: Option<Task<()>>,
     command_cancel: Option<oneshot::Sender<()>>,
     active_build_session: Option<(BuildTab, u64)>,
@@ -344,6 +383,7 @@ impl AndroidPanel {
         cx: &mut Context<Self>,
     ) -> Self {
         let build_panel = cx.new(|cx| BuildPanel::new(workspace.clone(), cx));
+        let test_panel = cx.new(TestPanel::new);
         let build_subscription =
             cx.subscribe(
                 &build_panel,
@@ -353,6 +393,13 @@ impl AndroidPanel {
                 },
             );
         let project_subscription = cx.subscribe(&project, |panel, _, event, cx| {
+            if matches!(event, project::Event::BufferEdited { .. })
+                || matches!(event, project::Event::WorktreeUpdatedEntries(_, changes) if changes.iter().any(|(path, _, change)| *change != project::PathChange::Loaded && (android_model_input(path) || path.as_unix_str().ends_with(".kt") || path.as_unix_str().ends_with(".java")) && !path.as_unix_str().split('/').any(|part| matches!(part, "build" | ".gradle"))))
+            {
+                panel
+                    .test_panel
+                    .update(cx, |tests, cx| tests.invalidate(cx));
+            }
             if let project::Event::LanguageServerAdded(id, name, worktree) = event
                 && name.0.as_ref() == "jdtls"
             {
@@ -360,6 +407,7 @@ impl AndroidPanel {
             }
         });
         let project_model_subscription = cx.observe(&project, |panel, _, cx| {
+            panel.validate_test_context(cx);
             if panel
                 .followup_model_token
                 .as_ref()
@@ -379,6 +427,11 @@ impl AndroidPanel {
             project,
             toolbar,
             build_panel,
+            test_panel,
+            test_task: None,
+            test_cancel: None,
+            test_operation_id: None,
+            pending_test: None,
             build_task: None,
             command_cancel: None,
             active_build_session: None,
@@ -436,6 +489,7 @@ impl AndroidPanel {
     }
 
     fn observe_project_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.observe_tests(window, cx);
         self._startup_subscriptions.push(cx.subscribe_in(
             &self.build_panel,
             window,
@@ -445,7 +499,11 @@ impl AndroidPanel {
                         BuildTab::Sync => panel.sync_project(window, cx),
                         BuildTab::Output => {
                             if let Some(operation) = panel.last_build_operation {
-                                panel.gradle(operation, window, cx);
+                                if matches!(operation, GradleOperation::Test) {
+                                    panel.rerun_tests(window, cx);
+                                } else {
+                                    panel.gradle(operation, window, cx);
+                                }
                             }
                         }
                     }
@@ -459,6 +517,7 @@ impl AndroidPanel {
                 if panel.take_official_kotlin_refresh(cx) {
                     panel.sync_project(window, cx);
                 } else {
+                    panel.resume_pending_tests(window, cx);
                     panel.resume_pending_gradle_operation(window, cx);
                 }
             },
@@ -498,6 +557,7 @@ impl AndroidPanel {
                         | project::Event::WorktreeUpdatedEntries(_, _)
                 ) {
                     cx.defer_in(window, |panel, window, cx| {
+                        panel.validate_test_context(cx);
                         panel.auto_sync_project(window, cx)
                     });
                 }
@@ -510,6 +570,7 @@ impl AndroidPanel {
                 |_, _, _, window, cx| {
                     // Trust events are emitted while the trust store is being updated.
                     cx.defer_in(window, |panel, window, cx| {
+                        panel.validate_test_context(cx);
                         panel.auto_sync_project(window, cx)
                     });
                 },
@@ -613,6 +674,10 @@ impl AndroidPanel {
     }
 
     fn cancel_build(&mut self, tab: BuildTab, cx: &mut Context<Self>) {
+        if tab == BuildTab::Output && self.test_operation_id.is_some() {
+            self.cancel_tests(cx);
+            return;
+        }
         let Some((active, id)) = self.active_build_session else {
             return;
         };
@@ -726,7 +791,7 @@ impl AndroidPanel {
             self.selected_target = None;
             cx.notify();
         }
-        if self.syncing || self.running {
+        if self.syncing || self.running || self.test_panel.read(cx).busy {
             return;
         }
         let Some(root) = self.auto_sync_candidate(cx) else {
@@ -791,7 +856,7 @@ impl AndroidPanel {
     }
 
     fn sync_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.syncing || self.running {
+        if self.syncing || self.running || self.test_panel.read(cx).busy {
             return;
         }
         let root = match self.trusted_root(cx) {
@@ -1075,7 +1140,17 @@ impl AndroidPanel {
     }
 
     fn gradle(&mut self, operation: GradleOperation, window: &mut Window, cx: &mut Context<Self>) {
-        if self.running || self.syncing {
+        if matches!(operation, GradleOperation::Test) {
+            self.start_tests(
+                android_tools::testing::TestKind::Unit,
+                Vec::new(),
+                false,
+                window,
+                cx,
+            );
+            return;
+        }
+        if self.running || self.syncing || self.test_panel.read(cx).busy {
             return;
         }
         let result = (|| {
@@ -1272,6 +1347,7 @@ impl AndroidPanel {
     fn resume_pending_gradle_operation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.running
             || self.syncing
+            || self.test_panel.read(cx).busy
             || self.kotlin_refresh_task.is_some()
             || self.kotlin_refresh_pending.is_some()
         {
@@ -1977,6 +2053,9 @@ impl AndroidPanel {
         cx: &mut Context<Self>,
     ) {
         use android_tools::kotlin;
+        if self.test_panel.read(cx).busy {
+            return;
+        }
         let root = match self.trusted_root(cx) {
             Ok(root) => root,
             Err(error) => {
@@ -2732,7 +2811,7 @@ impl AndroidPanel {
     }
 
     fn start_emulator(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
-        if self.running || self.syncing {
+        if self.running || self.syncing || self.test_operation_id.is_some() {
             return;
         }
         let result = (|| {
@@ -2867,7 +2946,7 @@ impl AndroidPanel {
     }
 
     fn stop_emulator(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.running || self.syncing {
+        if self.running || self.syncing || self.test_operation_id.is_some() {
             return;
         }
         let result = (|| {
